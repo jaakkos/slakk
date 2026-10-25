@@ -1,5 +1,7 @@
 # slakk
 
+[![CI](https://github.com/jaakkos/slakk/actions/workflows/ci.yml/badge.svg)](https://github.com/jaakkos/slakk/actions/workflows/ci.yml)
+
 *Slak* is Norwegian for gentle, as in a gentle slope. slakk was called
 `route-cli` before 0.5.0.
 
@@ -35,6 +37,27 @@ downloaded at run time from the providers above and is not included in this
 repository; see [Data licences](#data-licences).
 
 ## Setup
+
+### Download a binary
+
+Each [release](https://github.com/jaakkos/slakk/releases) has standalone
+executables that need no Python: `slakk-<version>-linux-x86_64`,
+`linux-arm64`, `macos-arm64`, `macos-x86_64` and `windows-x86_64.exe`. Each
+is about 30 MB because it bundles Python, NumPy and Pillow, and it takes
+about a second to start. Check the download against `SHA256SUMS`, or verify
+where it was built with
+`gh attestation verify slakk-<version>-<platform> --repo jaakkos/slakk`.
+
+```sh
+chmod +x slakk-0.5.0-linux-x86_64
+./slakk-0.5.0-linux-x86_64 --help
+```
+
+The binaries are not signed. On macOS, remove the download quarantine with
+`xattr -d com.apple.quarantine slakk-<version>-macos-arm64`; on Windows,
+SmartScreen asks you to confirm the first run.
+
+### Install from source
 
 Use Python 3.11 or later. In this directory:
 
@@ -317,7 +340,7 @@ slakk strava-login
 `127.0.0.1:8723`. It checks the OAuth `state`, exchanges the code, and saves
 only the access token, refresh token and expiry to
 `~/.config/slakk/strava-token.json` (or `$XDG_CONFIG_HOME`), readable by
-you alone. It requests `activity:read_all` so Only Me activities work; use
+you alone (on Windows the file gets your user profile's permissions). It requests `activity:read_all` so Only Me activities work; use
 `--scope activity:read` for Everyone/Followers activities only. Use
 `--no-browser` to just print the URL. Revoke access any time in Strava's
 settings and delete the file.
@@ -488,7 +511,16 @@ uses 8 bytes × 16 directions per unblocked cell, about 95 MB on that track.
 
 ```sh
 python -m unittest -v test_slakk.py
+python scripts/smoke_test.py         # end-to-end run on synthetic terrain
+ruff check .
 ```
+
+[CI](.github/workflows/ci.yml) runs the tests and the smoke test on Linux,
+macOS and Windows with Python 3.11 to 3.14. A
+[weekly job](.github/workflows/dependencies.yml) checks the locked
+dependencies for known vulnerabilities with pip-audit and checks that the
+locks still match `pyproject.toml`. None of the checks use the network for
+terrain data or need a real track. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 The tests exercise exact endpoints, steep barriers, non-jumpable elevation
 steps, hazard validation of the preserved approach, unknown map colours,

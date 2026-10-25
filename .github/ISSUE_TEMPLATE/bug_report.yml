@@ -1,0 +1,48 @@
+name: Bug report
+description: Something fails, crashes or gives a wrong result
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Don't paste private data.** Remove access tokens, client secrets and Strava activity ids, and only attach a GPX track if you are happy for it to be public.
+        For wrong or surprising routes, remember that candidates are unverified planning aids, not safe routes.
+  - type: input
+    id: version
+    attributes:
+      label: slakk version
+      description: Output of `slakk --version`
+      placeholder: slakk 0.5.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it?
+      options:
+        - Release binary
+        - From source with requirements.lock
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and Python version
+      placeholder: macOS 15 on Apple silicon, Python 3.13
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command you ran
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+      description: Include the error output. The `status`, `search` and `checks` parts of report.json often help.
+    validations:
+      required: true

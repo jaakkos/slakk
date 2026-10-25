@@ -1,0 +1,99 @@
+name: Release
+
+# Pushing a tag such as v0.6.0 builds standalone binaries and attaches them to a
+# DRAFT GitHub release. Nothing is public until a maintainer publishes the draft.
+# Pull requests that touch the build only build and smoke-test the binaries.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - requirements.lock
+      - requirements-build.in
+      - requirements-build.lock
+      - scripts/smoke_test.py
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 22.04 has an older glibc (2.35), so the Linux binaries also run on older distributions.
+          - { os: ubuntu-22.04, target: linux-x86_64 }
+          - { os: ubuntu-22.04-arm, target: linux-arm64 }
+          - { os: macos-15, target: macos-arm64 }
+          - { os: macos-15-intel, target: macos-x86_64 }
+          - { os: windows-2025, target: windows-x86_64 }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Check that the tag matches the version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          code=$(sed -n "s/^VERSION = '\(.*\)'$/\1/p" slakk.py)
+          if [ "v$code" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match slakk.VERSION $code"
+            exit 1
+          fi
+          grep -qx "version = \"$code\"" pyproject.toml || { echo "::error::pyproject.toml version differs from $code"; exit 1; }
+      - name: Install the locked dependencies and PyInstaller
+        run: python -m pip install --require-hashes -r requirements.lock -r requirements-build.lock
+      - name: Build
+        run: pyinstaller --onefile --name slakk --clean --noconfirm slakk.py
+      - name: Name the binary
+        run: |
+          version=$(python -c "import slakk; print(slakk.VERSION)")
+          ext=""; [ "$RUNNER_OS" = Windows ] && ext=".exe"
+          mkdir out
+          mv "dist/slakk$ext" "out/slakk-$version-${{ matrix.target }}$ext"
+          ls -l out
+      - name: Smoke-test the binary on synthetic terrain
+        run: python scripts/smoke_test.py out/slakk-*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: slakk-${{ matrix.target }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the draft release
+      id-token: write # sign the build provenance
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Write checksums
+        run: |
+          cd dist
+          sha256sum slakk-* > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/slakk-*
+      - name: Create a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --draft --verify-tag --generate-notes \
+            --title "slakk ${GITHUB_REF_NAME#v}"

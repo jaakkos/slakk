@@ -1,0 +1,12 @@
+# Keeps the pinned GitHub Actions current. Python dependencies are not listed
+# here: Dependabot cannot regenerate requirements.lock with uv, so the weekly
+# Dependencies workflow (pip-audit and the lock check) covers them instead.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
