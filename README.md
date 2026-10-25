@@ -200,6 +200,15 @@ for its elevation profile, with bands marking those sections; moving over the
 profile marks the point on the map. Over-limit sections are also drawn red on
 the map.
 
+The background is a separate Kartverket topo download at `--map-detail-m`
+metres per pixel (default 2), sharper than the grid's `topo.png`. It is fetched
+in tiles of at most 2048 pixels, capped at 6000 pixels per side (a larger area
+gets a coarser map, and the page states the actual detail), and cached in the
+cache directory with a checksum. Changing `--map-detail-m` downloads a new
+background; routes are unaffected. With `--offline` and no cached detailed
+background, the page falls back to `topo.png` and the log says so. The page
+grows with the detail, typically a few MB.
+
 The page embeds your recorded track, so treat it as private like the GPX
 files. The 50 m angle is an average over the next 50 m, a different
 measure from the per-edge limit used in the search.
@@ -292,6 +301,7 @@ looking like a new result. The original input is never modified.
 | `--avoid` | — | GeoJSON polygon file to exclude, repeatable |
 | `--alternatives N` | `1` | Also search for up to N-1 distinct alternatives |
 | `--html` | off | Also write the interactive `map.html` |
+| `--map-detail-m` | 2 | Ground metres per pixel of the `map.html` background |
 | `--turn-cost-m` | `0` | Cost of a full reversal in metres; 0 is off |
 | `--keep-first-m` | `0` | Follow the original approach for this distance |
 | `--corridor-m` | `600` | Search distance around the original ascent |
@@ -318,7 +328,9 @@ an avalanche-safety threshold.
 
 Each `--cache` directory represents one area and grid. It contains `dem.tiff`,
 `hazards.png`, `topo.png`, and `manifest.json`. The manifest records the extent,
-resolution, retrieval time and request URLs. An existing cache controls the
+resolution, retrieval time and request URLs. `--html` adds a detailed map
+background, `topo-WIDTHxHEIGHT.png`, recorded with its own checksum and tile
+URLs under `map_backgrounds`. An existing cache controls the
 resolution; select a new cache directory to change grid resolution or area.
 
 ```sh

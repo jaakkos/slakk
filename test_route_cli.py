@@ -221,6 +221,47 @@ class RouteTests(unittest.TestCase):
         report = json.loads((out/'report.json').read_text())
         self.assertTrue(report['landforms']['enabled'])
         self.assertIn('gully_m', report['candidate'])
+    def map_tiles(self, url, colour='green'):
+        """Fake WMS: a plain tile of the requested size."""
+        from urllib.parse import parse_qs, urlsplit
+        q = {k: v[0] for k, v in parse_qs(urlsplit(url).query).items()}
+        buffer = __import__('io').BytesIO()
+        Image.new('RGB', (int(q['width']), int(q['height'])), colour).save(buffer, 'PNG')
+        return buffer.getvalue()
+
+    def test_detailed_map_background_is_tiled_cached_and_checked(self):
+        terrain = self.terrain()
+        args = cli.parser().parse_args(['optimize','x.gpx','--out',str(self.root/'out'),'--cache',str(self.root)])
+        with patch.object(cli,'MAP_TILE_PX',64), patch.object(cli,'download',side_effect=self.map_tiles) as call:
+            image, detail = cli.map_background(terrain, args)
+        self.assertEqual(image.size, (200, 200))  # 10 m grid at 2 m per pixel
+        self.assertEqual(detail, 2)
+        self.assertEqual(call.call_count, 16)  # 4 × 4 tiles of at most 64 px
+        urls = [c.args[0] for c in call.call_args_list]
+        boxes = [[float(v) for v in u.split('bbox=')[1].split('&')[0].replace('%2C', ',').split(',')] for u in urls]
+        self.assertEqual(min(b[0] for b in boxes), 0); self.assertEqual(max(b[2] for b in boxes), 400)
+        self.assertAlmostEqual(sum((b[2]-b[0])*(b[3]-b[1]) for b in boxes), 400*400)
+        self.assertEqual(image.getpixel((150, 150)), (0, 128, 0))
+        saved = json.loads((self.root/'manifest.json').read_text())['map_backgrounds']['topo-200x200.png']
+        self.assertEqual(len(saved['requests']), 16)
+        offline = self.offline_args()
+        with patch.object(cli,'download') as call:
+            self.assertEqual(cli.map_background(terrain, offline)[0].size, (200, 200))
+        call.assert_not_called()
+        Image.new('RGB',(200,200),'black').save(self.root/'topo-200x200.png')
+        with self.assertRaisesRegex(ValueError,'checksum'):
+            cli.map_background(terrain, offline)
+
+    def test_map_background_offline_falls_back_and_bad_tiles_fail(self):
+        terrain = self.terrain()
+        image, detail = cli.map_background(terrain, self.offline_args())
+        self.assertEqual((image.size, detail), ((40, 40), 10))
+        args = cli.parser().parse_args(['optimize','x.gpx','--out',str(self.root/'out'),'--cache',str(self.root)])
+        with patch.object(cli,'download',return_value=b'<ServiceException/>'):
+            with self.assertRaisesRegex(ValueError,'invalid image'):
+                cli.map_background(terrain, args)
+        self.assertNotIn('map_backgrounds', json.loads((self.root/'manifest.json').read_text()))
+
     def add_checksums(self):
         grid = json.loads((self.root/'manifest.json').read_text())
         grid['files'] = {n: {'sha256': __import__('hashlib').sha256((self.root/n).read_bytes()).hexdigest()}

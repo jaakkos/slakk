@@ -28,6 +28,8 @@ R = 6378137.0
 DTM = 'https://hoydedata.no/arcgis/rest/services/DTM/ImageServer/exportImage'
 NVE = 'https://gis3.nve.no/arcgis/rest/services/wmts/Bratthet_med_utlop_2024/MapServer/export'
 TOPO = 'https://wms.geonorge.no/skwms1/wms.topo'
+# map.html background: fetched separately from topo.png, in WMS tiles, at most this many pixels per side.
+MAP_TILE_PX, MAP_MAX_PX = 2048, 6000
 STEEP_COLORS = {(255, 255, 0), (255, 170, 0), (255, 85, 0), (255, 0, 0), (115, 0, 0)}
 RUNOUT_COLORS = {(0, 77, 168), (76, 155, 255), (154, 177, 230)}
 ALTERNATIVE_BAND_M = 50
@@ -838,22 +840,78 @@ def png_data_url(image, kind='PNG'):
     return f'data:image/{kind.lower()};base64,' + base64.b64encode(buffer.getvalue()).decode()
 
 
+def map_background(terrain, args):
+    """Kartverket topo for map.html at about --map-detail-m per pixel, cached beside the grid with a checksum.
+    Returns (image, ground metres per pixel). Offline without a cached copy, it falls back to topo.png and says so."""
+    width = height = 0
+    if args.map_detail_m < terrain.gs:
+        k = min(terrain.gs / args.map_detail_m, MAP_MAX_PX / max(terrain.w, terrain.h))
+        width, height = round(terrain.w * k), round(terrain.h * k)
+    if width <= terrain.w:
+        with Image.open(terrain.cache / 'topo.png') as source:
+            return source.convert('RGB'), terrain.gs
+    detail = terrain.gs * terrain.w / width
+    name = f'topo-{width}x{height}.png'
+    path, manifest = terrain.cache / name, terrain.cache / 'manifest.json'
+    grid = json.loads(manifest.read_text())
+    saved = grid.get('map_backgrounds', {}).get(name)
+    if saved and path.exists():
+        if hashlib.sha256(path.read_bytes()).hexdigest() != saved['sha256']:
+            raise ValueError(f'{path} does not match its checksum in manifest.json. Delete it to download it again.')
+        with Image.open(path) as source:
+            return source.convert('RGB'), detail
+    if args.offline:
+        log(f'No {detail:.1f} m map background is cached, so map.html uses topo.png at {terrain.gs:.1f} m. '
+            'Run once without --offline to download the detailed map.')
+        with Image.open(terrain.cache / 'topo.png') as source:
+            image = source.convert('RGB')
+        image.thumbnail((1400, 1800))
+        return image, terrain.gs * terrain.w / image.width
+    # Tile edges are exact fractions of the cache bounds, so the stitched image registers with the grid.
+    x0, y0, x1, y1 = terrain.bbox
+    image, requests = Image.new('RGB', (width, height)), []
+    for top in range(0, height, MAP_TILE_PX):
+        for left in range(0, width, MAP_TILE_PX):
+            w, h = min(MAP_TILE_PX, width - left), min(MAP_TILE_PX, height - top)
+            box = [x0 + (x1 - x0) * left / width, y1 - (y1 - y0) * (top + h) / height,
+                   x0 + (x1 - x0) * (left + w) / width, y1 - (y1 - y0) * top / height]
+            url = TOPO + '?' + urlencode({'service': 'WMS', 'request': 'GetMap', 'version': '1.3.0',
+                'crs': 'EPSG:3857', 'bbox': ','.join(map(str, box)), 'layers': 'topo', 'styles': '',
+                'width': w, 'height': h, 'format': 'image/png'})
+            log(f'Downloading map background tile {len(requests) + 1} ({w} × {h})…')
+            data = download(url)
+            try:
+                with Image.open(io.BytesIO(data)) as tile:
+                    tile = tile.convert('RGB')
+            except Exception:
+                tile = None
+            if tile is None or tile.size != (w, h):
+                raise ValueError('Map background: service returned an invalid image. Check provider availability.')
+            image.paste(tile, (left, top))
+            requests.append(url)
+    image.save(path)
+    grid.setdefault('map_backgrounds', {})[name] = {
+        'sha256': hashlib.sha256(path.read_bytes()).hexdigest(), 'bytes': path.stat().st_size,
+        'ground_m_per_px': round(detail, 3), 'requests': requests,
+        'retrieved_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+    manifest.write_text(json.dumps(grid, indent=2))
+    return image, detail
+
+
 def write_html(args, terrain, report, baseline, baseline_label, found, output):
     """Self-contained interactive map: no network access, no external scripts."""
-    with Image.open(terrain.cache / 'topo.png') as source:
-        topo = source.convert('RGB')
-    topo.thumbnail((1400, 1800))
+    topo, detail = map_background(terrain, args)
     sx, sy = topo.width / terrain.w, topo.height / terrain.h
     hazard = np.zeros((terrain.h, terrain.w, 4), np.uint8)
     hazard[terrain.runout] = [40, 90, 220, 110]
     hazard[terrain.steep] = [220, 30, 30, 140]
-    hazard = Image.fromarray(hazard).resize(topo.size, Image.NEAREST)
+    hazard = Image.fromarray(hazard)
     shape = np.zeros((terrain.h, terrain.w, 4), np.uint8)
     land = getattr(terrain, 'landform', None)
     if land is not None:
         shape[land == RIDGE] = [230, 150, 0, 120]
         shape[land == GULLY] = [130, 40, 190, 120]
-    shape = Image.fromarray(shape).resize(topo.size, Image.NEAREST)
+    shape = Image.fromarray(shape)
     routes = [{'label': baseline_label, 'color': '#087f8c', **route_profile(terrain, baseline, args.max_uphill_deg, sx, sy)}]
     for number, (q, _) in enumerate(found, 1):
         label = 'Candidate (best cost)' if number == 1 else f'Alternative {number}'
@@ -862,7 +920,8 @@ def write_html(args, terrain, report, baseline, baseline_label, found, output):
     areas = [[[round(float((c + .5) * sx), 1), round(float((r + .5) * sy), 1)] for r, c in terrain.rc(ring)]
              for areas in getattr(args, 'areas', []) for ring in areas]
     data = {'width': topo.width, 'height': topo.height, 'limit': args.max_uphill_deg, 'routes': routes,
-            'areas': areas, 'disclaimer': DISCLAIMER, 'status': report['status'], 'landforms': land is not None}
+            'areas': areas, 'disclaimer': DISCLAIMER, 'status': report['status'], 'landforms': land is not None,
+            'map_m_per_px': round(detail, 2)}
     page = (MAP_HTML.replace('__TOPO__', png_data_url(topo, 'JPEG')).replace('__HAZARD__', png_data_url(hazard))
             .replace('__LANDFORM__', png_data_url(shape))
             .replace('__DATA__', json.dumps(data, allow_nan=False).replace('</', '<\\/')))
@@ -906,7 +965,7 @@ tr.sel{outline:2px solid var(--fg)}
  <div id="viewport"><div id="stage">
   <img src="__TOPO__" alt="Topographic map, Kartverket"><img id="hazimg" src="__HAZARD__" alt="" style="image-rendering:pixelated"><img id="landimg" src="__LANDFORM__" alt="" style="image-rendering:pixelated;display:none">
   <svg id="map"></svg></div></div>
- <div style="color:var(--muted)">Map: Kartverket CC BY 4.0. Hazard layer: NVE, NLOD. Unmarked terrain is not safety clearance.</div>
+ <div style="color:var(--muted)">Map: Kartverket CC BY 4.0, <span id="detail"></span> m per pixel. Hazard layer: NVE, NLOD. Unmarked terrain is not safety clearance.</div>
 </section>
 <section>
  <table id="table"><thead><tr><th>Route</th><th>km</th><th>Ascent m</th><th>Max 50 m°</th><th>Over limit m</th><th>Steep m</th><th>Runout m</th><th>Ridge m</th><th>Gully m</th><th>Kick turns</th></tr></thead><tbody></tbody></table>
@@ -923,10 +982,11 @@ const D = __DATA__;
 const NS = 'http://www.w3.org/2000/svg';
 const el = (n, a, p) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); if (p) p.appendChild(e); return e; };
 document.getElementById('disclaimer').textContent = D.disclaimer;
+document.getElementById('detail').textContent = D.map_m_per_px;
 const stage = document.getElementById('stage'), map = document.getElementById('map');
 map.setAttribute('viewBox', `0 0 ${D.width} ${D.height}`);
 let zoom = (document.getElementById('viewport').clientWidth || D.width) / D.width;  // fit width
-const setZoom = z => { zoom = Math.max(.2, Math.min(6, z)); stage.style.width = D.width * zoom + 'px'; stage.style.height = D.height * zoom + 'px'; };
+const setZoom = z => { zoom = Math.max(.05, Math.min(6, z)); stage.style.width = D.width * zoom + 'px'; stage.style.height = D.height * zoom + 'px'; };
 setZoom(zoom);
 document.getElementById('zin').onclick = () => setZoom(zoom * 1.4);
 document.getElementById('zout').onclick = () => setZoom(zoom / 1.4);
@@ -990,6 +1050,8 @@ def optimize(args):
         raise ValueError('Numeric options must be finite.')
     if not 2 <= args.resolution_m <= 30 or not 20 <= args.corridor_m <= 3000:
         raise ValueError('Use resolution 2–30 m and corridor 20–3000 m.')
+    if not 0.5 <= args.map_detail_m <= 30:
+        raise ValueError('Use --map-detail-m 0.5–30.')
     if not 0 < args.max_uphill_deg < 45 or not 0 < args.max_downhill_deg < 45 or not 0 < args.max_terrain_deg < 80:
         raise ValueError('Invalid angle limit.')
     if min(args.keep_first_m,args.steep_buffer_m,args.runout_buffer_m,args.runout_cost,args.side_tolerance_m,args.turn_cost_m,
@@ -1159,6 +1221,7 @@ def parser():
     opt.add_argument('--turn-cost-m',type=float,default=0,help='Search cost of a full reversal, in metres of travel; sharper turns cost more (0 = off; slower when on)')
     opt.add_argument('--alternatives',type=int,default=1,choices=range(1,6),metavar='N',help='Also search for up to N-1 distinct alternatives (1-5) under the same constraints')
     opt.add_argument('--html',action='store_true',help='Also write map.html: interactive map, elevation profiles and highlighted limit violations')
+    opt.add_argument('--map-detail-m',type=float,default=2,help='Ground metres per pixel of the map.html background, downloaded separately from the grid (default 2; capped at %d px per side)' % MAP_MAX_PX)
     opt.add_argument('--offline',action='store_true',help='Require an existing terrain cache; make no downloads')
     opt.add_argument('--goal',choices=['highest','last'],help='End at the highest GPX elevation or the final point (GPX only; default: highest)')
     opt.add_argument('--start',type=latlon,metavar='LAT,LON',help='Plan without a GPX: exact start point')
