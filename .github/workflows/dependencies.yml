@@ -1,0 +1,50 @@
+name: Dependencies
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays, so new advisories show up within a week
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lockfiles:
+    name: lockfiles match pyproject.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.11.32"
+          enable-cache: false
+      # uv keeps the pins already in the output file, so this changes nothing
+      # unless the lock no longer satisfies pyproject.toml or requirements-build.in.
+      - name: Recompile the locks
+        run: |
+          uv pip compile pyproject.toml --universal --python-version 3.11 --generate-hashes -o requirements.lock
+          uv pip compile requirements-build.in --universal --python-version 3.11 --generate-hashes -o requirements-build.lock
+      - name: Fail if a lock changed
+        run: |
+          if ! git diff --exit-code -I '^#' -- requirements.lock requirements-build.lock; then
+            echo "::error::A lock file is out of date. Regenerate it as described in CONTRIBUTING.md and commit it."
+            exit 1
+          fi
+
+  audit:
+    name: known vulnerabilities (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.11.32"
+          enable-cache: false
+      - run: uvx pip-audit@2.10.1 --strict --disable-pip --require-hashes -r requirements.lock -r requirements-build.lock
