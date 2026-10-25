@@ -143,6 +143,64 @@ class RouteTests(unittest.TestCase):
     def test_bad_coordinate_text_is_a_usage_error(self):
         with self.assertRaises(SystemExit):
             cli.parser().parse_args(['optimize','--start','61.2','--end','61,7','--out','o','--cache','c'])
+
+    def test_utm_matches_reference_transform(self):
+        # Reference values from PROJ (EPSG:4326 -> EPSG:326zz).
+        for zone, east, north, lat, lon in [(33,653210.089,7731796.83,69.65,18.95),(32,297230.22,6700510.175,60.39,5.32),
+                                            (35,456054.042,7896799.854,71.17,25.78)]:
+            got = cli.utm_to_latlon(zone,east,north)
+            np.testing.assert_allclose(got,(lat,lon),atol=1e-7)  # about 1 cm
+            for text in (f'{zone}:{east},{north}', f'{zone}W {east} {north}', f'{zone}n: {east}, {north}'):
+                np.testing.assert_allclose(cli.latlon(text),got,atol=1e-12)
+        lat, _ = cli.latlon('33K:500000,7787000')  # bands before N are south of the equator
+        self.assertAlmostEqual(lat,-20,1)
+        self.assertEqual(cli.latlon('61.2,7.6'),(61.2,7.6))
+        for bad in ('61:900001,7000000','0:500000,7000000','33:500000'):
+            with self.assertRaises(cli.argparse.ArgumentTypeError):
+                cli.latlon(bad)
+
+    def write_points(self, body, name='points.gpx'):
+        path = self.root/name
+        path.write_text('<gpx version="1.1" xmlns="http://www.topografix.com/GPX/1/1">'+body+'</gpx>')
+        return path
+
+    def test_points_file_reads_waypoints_or_one_route_in_order(self):
+        wpt = self.write_points('<wpt lat="69.1" lon="18.1"/><rte><rtept lat="1" lon="1"/><rtept lat="2" lon="2"/></rte>'
+                                '<wpt lat="69.2" lon="18.2"><name>End</name></wpt>')
+        self.assertEqual(cli.read_points(wpt),[(69.1,18.1),(69.2,18.2)])
+        rte = self.write_points('<rte><rtept lat="69.1" lon="18.1"/><rtept lat="69.15" lon="18.3"/><rtept lat="69.2" lon="18.2"/></rte>')
+        self.assertEqual(cli.read_points(rte),[(69.1,18.1),(69.15,18.3),(69.2,18.2)])
+        for body in ('<trk><trkseg><trkpt lat="69.1" lon="18.1"/><trkpt lat="69.2" lon="18.2"/></trkseg></trk>',
+                     '<wpt lat="69.1" lon="18.1"/>', '<wpt lat="91" lon="18.1"/><wpt lat="69.2" lon="18.2"/>'):
+            with self.assertRaises(ValueError):
+                cli.read_points(self.write_points(body,'bad.gpx'))
+
+    def test_points_file_plans_like_start_via_end(self):
+        terrain = self.terrain()
+        (start,), (via,), (end,) = (terrain.lonlat(np.array([p])) for p in ([8.,8.],[20.,25.],[32.,10.]))
+        fmt = lambda p: f'{p[1]:.9f},{p[0]:.9f}'
+        points = self.write_points(''.join(f'<wpt lat="{p[1]:.9f}" lon="{p[0]:.9f}"/>' for p in (start,via,end)))
+        common = ['--cache',str(self.root),'--offline','--corridor-m','500']
+        self.assertEqual(cli.main(['optimize','--start',fmt(start),'--via',fmt(via),'--end',fmt(end),'--out',str(self.root/'a'),*common]),0)
+        self.assertEqual(cli.main(['optimize','--points',str(points),'--out',str(self.root/'b'),*common]),0)
+        a, b = (json.loads((self.root/d/'report.json').read_text()) for d in 'ab')
+        self.assertEqual(a['candidate'],b['candidate'])
+        self.assertEqual((b['mode'],b['search']['waypoints'],b['options']['via']),('coordinates',1,[[float(fmt(via).split(',')[0]),float(fmt(via).split(',')[1])]]))
+        self.assertEqual(len(b['points_sha256']),64)
+        self.assertNotIn('points_sha256',a)
+        self.assertEqual((self.root/'a'/'candidate-DRAFT.gpx').read_bytes(),(self.root/'b'/'candidate-DRAFT.gpx').read_bytes())
+        for extra in (['--start',fmt(start)],['--via',fmt(via)],[str(points)]):
+            self.assertEqual(cli.main(['optimize','--points',str(points),*extra,'--out',str(self.root/'c'),*common]),2)
+
+    def test_pick_writes_a_page_with_the_given_points(self):
+        points = self.write_points('<wpt lat="69.1" lon="18.1"/><wpt lat="69.2" lon="18.2"/>')
+        page = self.root/'pick.html'
+        self.assertEqual(cli.main(['pick','-o',str(page),'--points',str(points),'--corridor-m','900','--no-browser']),0)
+        text = page.read_text(encoding='utf-8')
+        data = json.loads(text.split('const D = ',1)[1].split(';\n',1)[0])
+        self.assertEqual((data['points'],data['corridor'],data['topo']),([[69.1,18.1],[69.2,18.2]],900,cli.TOPO))
+        self.assertNotIn('<script src',text)
+        self.assertEqual(cli.main(['pick','-o',str(page),'--no-browser']),2)  # never overwrites
     def write_area(self, terrain, corners, name='avoid.geojson'):
         ring = terrain.lonlat(np.array(corners,float)).tolist()
         path = self.root/name

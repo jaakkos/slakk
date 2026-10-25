@@ -9,6 +9,7 @@ import io
 import json
 import math
 import os
+import re
 from pathlib import Path
 import sys
 import time
@@ -136,6 +137,28 @@ def resample(q, spacing, scale):
         raise ValueError('Track has no horizontal extent.')
     positions = np.r_[np.arange(0, distance[-1], spacing), distance[-1]]
     return positions, np.column_stack([np.interp(positions, distance[keep], q[keep, i]) for i in range(2)])
+
+
+def read_points(path):
+    """Planning points from a GPX: waypoints in file order, else one route's points. First = start, last = end."""
+    if path.stat().st_size > 1024 * 1024:
+        raise ValueError(f'{path}: a points file over 1 MiB is unlikely to be a few planning points.')
+    root = ET.parse(path).getroot()
+    nodes = root.findall('{*}wpt')
+    if not nodes:
+        routes = [r for r in root.findall('{*}rte') if r.findall('{*}rtept')]
+        if len(routes) != 1:
+            raise ValueError(f'{path}: expected GPX waypoints, or one GPX route; a recorded track goes in as the input GPX instead.')
+        nodes = routes[0].findall('{*}rtept')
+    if not 2 <= len(nodes) <= 100:
+        raise ValueError(f'{path}: expected 2–100 points (start, optional vias, end); found {len(nodes)}.')
+    points = []
+    for node in nodes:
+        lat, lon = float(node.attrib['lat']), float(node.attrib['lon'])
+        if not (math.isfinite(lat) and math.isfinite(lon)) or abs(lat) > 80 or abs(lon) > 180:
+            raise ValueError(f'{path}: invalid coordinates or location outside the supported latitude range.')
+        points.append((lat, lon))
+    return points
 
 
 def write_gpx(path, lonlat, elevations, name, description):
@@ -1126,6 +1149,288 @@ select(D.routes.length > 1 ? 1 : 0);
 """
 
 
+def pick(args):
+    """Write a page for placing start, vias and end on a live Kartverket map; it saves a points GPX."""
+    if args.output.exists():
+        raise ValueError(f'{args.output} already exists; choose a new file.')
+    points = read_points(args.points) if args.points else []
+    if args.center:
+        center, zoom = args.center, 13
+    elif points:
+        center, zoom = tuple(np.mean(points, axis=0).tolist()), 13
+    else:
+        center, zoom = (65.0, 14.0), 5
+    data = {'points': points, 'center': center, 'zoom': zoom, 'topo': TOPO, 'nve': NVE,
+            'corridor': args.corridor_m, 'resolution': args.resolution_m, 'maxCells': MAX_CELLS, 'maxSide': 4096,
+            'maxSpan': 25000, 'disclaimer': DISCLAIMER, 'version': VERSION}
+    args.output.write_text(PICK_HTML.replace('__DATA__', json.dumps(data, allow_nan=False).replace('</', '<\\/')), encoding='utf-8')
+    log(f'Wrote {args.output}. Click to place start, vias and end, then save the points GPX and run: '
+        'slakk optimize --points <file> --out <dir> --cache <dir>')
+    if not args.no_browser:
+        import webbrowser
+        webbrowser.open(args.output.resolve().as_uri())
+
+
+PICK_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pick route points</title>
+<style>
+:root{--bg:#fff;--fg:#162b32;--muted:#5b6b70;--line:#d7dee0;--warn:#b00020;--accent:#087f8c;--point:#e8590c}
+@media (prefers-color-scheme:dark){:root{--bg:#121719;--fg:#e4ecee;--muted:#9aa9ad;--line:#2d383b;--warn:#ff6b7f;--accent:#3cc1cf}}
+body{margin:0;font:14px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+header{padding:12px 16px;border-bottom:1px solid var(--line)}
+header h1{font-size:17px;margin:0 0 4px}
+.warn{color:var(--warn);font-weight:600}
+main{display:grid;grid-template-columns:minmax(0,3fr) minmax(280px,1fr);gap:16px;padding:16px}
+@media (max-width:820px){main{grid-template-columns:1fr}}
+#map{position:relative;height:72vh;min-height:320px;overflow:hidden;border:1px solid var(--line);background:#dfe6e8;touch-action:none;cursor:crosshair}
+#map img{position:absolute;width:256px;height:256px;user-select:none;pointer-events:none}
+#map svg{position:absolute;inset:0;width:100%;height:100%;overflow:visible}
+.tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px}
+button{font:inherit;padding:4px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+input[type=number],input[type=text]{font:inherit;width:7em;padding:3px 6px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+ol{padding-left:0;list-style:none;margin:8px 0}
+li{display:flex;gap:6px;align-items:center;padding:3px 0;border-bottom:1px solid var(--line)}
+li b{min-width:3.4em}
+li code{flex:1;font-size:12px}
+li button{padding:0 6px}
+pre{white-space:pre-wrap;word-break:break-all;background:color-mix(in srgb,var(--fg) 7%,transparent);padding:8px;border-radius:6px;font-size:12px}
+.muted{color:var(--muted)}
+#grid.bad{color:var(--warn);font-weight:600}
+</style></head><body>
+<header><h1>Pick route points <span class="warn">PLANNING INPUT ONLY</span></h1>
+<div class="muted">Click the map to add points in order: the first is the start, the last is the destination, the rest are mandatory waypoints. Drag a point to move it; right-click it to remove it. The shaded band is the search corridor <code>slakk optimize</code> will use. Placing points does not check the terrain; every route slakk finds is an unverified planning candidate.</div></header>
+<main>
+<section>
+ <div class="tools">
+  <button id="zin" title="Zoom in">Zoom +</button><button id="zout" title="Zoom out">Zoom −</button>
+  <label><input type="checkbox" id="nve"> NVE steep (red–yellow) and runout (blue)</label>
+  <form id="goto"><input type="text" id="where" placeholder="LAT,LON" style="width:11em"> <button>Go</button></form>
+ </div>
+ <div id="map" aria-label="Map; click to add a point"><div id="tiles"></div><svg id="overlay"></svg></div>
+ <div class="muted">Map: Kartverket, CC BY 4.0. Hazard layer: NVE, NLOD. Unmarked terrain is not safety clearance. Tiles load from Kartverket and NVE while this page is open.</div>
+</section>
+<aside>
+ <h2 style="font-size:15px;margin:0">Points</h2>
+ <ol id="list"></ol>
+ <div class="tools"><button id="undo">Remove last</button><button id="reverse">Reverse</button><button id="clear">Clear</button></div>
+ <div class="tools"><label>Corridor <input type="number" id="corridor" min="20" max="3000" step="50"> m</label>
+  <label>Cell <input type="number" id="resolution" min="1" max="30" step="1" style="width:4em"> m</label></div>
+ <div id="grid" class="muted"></div>
+ <div class="tools"><label>File <input type="text" id="name" value="slakk-points.gpx" style="width:12em"></label></div>
+ <div class="tools"><button id="save">Save points GPX</button><button id="copy">Copy command</button></div>
+ <pre id="cmd"></pre>
+ <div id="disclaimer" class="muted" style="font-size:12px"></div>
+</aside>
+</main>
+<script>
+const D = __DATA__;
+const R = 6378137, TILE = 256, MINZ = 4, MAXZ = 18;
+const $ = id => document.getElementById(id);
+const map = $('map'), tiles = $('tiles'), svg = $('overlay');
+let points = D.points.map(p => p.slice()), zoom = D.zoom, cx, cy, drag = null;
+$('corridor').value = D.corridor; $('resolution').value = D.resolution; $('disclaimer').textContent = D.disclaimer;
+
+const world = z => TILE * 2 ** z;
+const project = ([lat, lon], z) => {
+  const s = Math.sin(lat * Math.PI / 180);
+  return [(lon + 180) / 360 * world(z), (0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)) * world(z)];
+};
+const unproject = ([x, y], z) => [
+  Math.atan(Math.sinh(Math.PI * (1 - 2 * y / world(z)))) * 180 / Math.PI, x / world(z) * 360 - 180];
+const mercator = ([lat, lon]) => [R * lon * Math.PI / 180, R * Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360))];
+const size = () => [map.clientWidth, map.clientHeight];
+const toScreen = ll => { const [x, y] = project(ll, zoom), [w, h] = size(); return [x - cx + w / 2, y - cy + h / 2]; };
+const toLatLon = (sx, sy) => { const [w, h] = size(); return unproject([cx + sx - w / 2, cy + sy - h / 2], zoom); };
+const local = e => { const b = map.getBoundingClientRect(); return [e.clientX - b.left, e.clientY - b.top]; };
+function centerOn(ll, z) { zoom = z; [cx, cy] = project(ll, zoom); render(); }
+
+function tileUrl(base, tx, ty, z, nve) {
+  const span = 2 * Math.PI * R / 2 ** z, x0 = -Math.PI * R + tx * span, y1 = Math.PI * R - ty * span;
+  const bbox = [x0, y1 - span, x0 + span, y1].map(v => v.toFixed(2)).join(',');
+  const q = nve ? {bbox, bboxSR: 3857, imageSR: 3857, size: '256,256', format: 'png32', transparent: 'true', layers: 'show:1,2,3,4', f: 'image'}
+                : {service: 'WMS', request: 'GetMap', version: '1.3.0', crs: 'EPSG:3857', bbox, layers: 'topo', styles: '',
+                   width: 256, height: 256, format: 'image/png'};
+  return base + '?' + new URLSearchParams(q);
+}
+const cache = new Map();
+function drawTiles() {
+  const [w, h] = size(), n = 2 ** zoom, keep = new Set();
+  const layers = $('nve').checked ? [[D.topo, false], [D.nve, true]] : [[D.topo, false]];
+  for (let ty = Math.floor((cy - h / 2) / TILE); ty <= Math.floor((cy + h / 2) / TILE); ty++) {
+    if (ty < 0 || ty >= n) continue;
+    for (let tx = Math.floor((cx - w / 2) / TILE); tx <= Math.floor((cx + w / 2) / TILE); tx++) {
+      if (tx < 0 || tx >= n) continue;
+      for (const [base, nve] of layers) {
+        const key = `${nve}/${zoom}/${tx}/${ty}`;
+        keep.add(key);
+        let img = cache.get(key);
+        if (!img) {
+          img = new Image(); img.alt = ''; img.src = tileUrl(base, tx, ty, zoom, nve);
+          if (nve) img.style.opacity = .7;
+          cache.set(key, img); tiles.appendChild(img);
+        }
+        img.style.left = (tx * TILE - cx + w / 2) + 'px'; img.style.top = (ty * TILE - cy + h / 2) + 'px';
+      }
+    }
+  }
+  for (const [key, img] of cache) if (!keep.has(key)) { img.remove(); cache.delete(key); }
+}
+
+// Mirrors get_terrain in slakk.py, so the estimate matches the grid a new cache would download.
+function grid() {
+  const corridor = +$('corridor').value, res = +$('resolution').value;
+  if (points.length < 2) return null;
+  const xy = points.map(mercator), lat = points.reduce((a, p) => a + p[0], 0) / points.length;
+  const scale = Math.cos(lat * Math.PI / 180), r = res / scale, m = (corridor + 150) / scale;
+  const xs = xy.map(p => p[0]), ys = xy.map(p => p[1]);
+  const low = [Math.floor((Math.min(...xs) - m) / r) * r, Math.floor((Math.min(...ys) - m) / r) * r];
+  const high = [Math.ceil((Math.max(...xs) + m) / r) * r, Math.ceil((Math.max(...ys) + m) / r) * r];
+  const span = Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)) * scale;
+  return {low, high, w: Math.round((high[0] - low[0]) / r), h: Math.round((high[1] - low[1]) / r), span, corridor, res};
+}
+const fromMercator = ([x, y]) => [(2 * Math.atan(Math.exp(y / R)) - Math.PI / 2) * 180 / Math.PI, x / R * 180 / Math.PI];
+
+function el(name, attrs, parent) {
+  const e = document.createElementNS('http://www.w3.org/2000/svg', name);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  return parent.appendChild(e);
+}
+const role = i => i === 0 ? 'Start' : i === points.length - 1 ? 'End' : `Via ${i}`;
+function drawOverlay() {
+  svg.replaceChildren();
+  const g = grid(), screen = points.map(toScreen);
+  if (g) {
+    const [a, b] = [toScreen(fromMercator([g.low[0], g.high[1]])), toScreen(fromMercator([g.high[0], g.low[1]]))];
+    el('rect', {x: a[0], y: a[1], width: b[0] - a[0], height: b[1] - a[1], fill: 'none', stroke: '#162b32', 'stroke-dasharray': '6 4', 'stroke-width': 1.5}, svg);
+    const lat = points.reduce((s, p) => s + p[0], 0) / points.length;
+    const mpp = 2 * Math.PI * R * Math.cos(lat * Math.PI / 180) / world(zoom);
+    const line = screen.map(p => p.join(',')).join(' ');
+    el('polyline', {points: line, fill: 'none', stroke: '#087f8c', 'stroke-opacity': .18, 'stroke-width': 2 * g.corridor / mpp, 'stroke-linecap': 'round', 'stroke-linejoin': 'round'}, svg);
+    el('polyline', {points: line, fill: 'none', stroke: '#087f8c', 'stroke-width': 2.5, 'stroke-dasharray': '8 5'}, svg);
+  }
+  screen.forEach(([x, y], i) => {
+    const c = el('circle', {cx: x, cy: y, r: 9, fill: i === 0 ? '#2b8a3e' : i === points.length - 1 && i ? '#c92a2a' : '#e8590c',
+                            stroke: '#fff', 'stroke-width': 2, 'data-i': i, style: 'cursor:grab'}, svg);
+    el('title', {}, c).textContent = role(i);
+    el('text', {x, y: y + 4, 'text-anchor': 'middle', 'font-size': 11, 'font-weight': 700, fill: '#fff', 'pointer-events': 'none'}, svg)
+      .textContent = i === 0 ? 'S' : i === points.length - 1 ? 'E' : i;
+  });
+}
+
+const fmt = p => `${p[0].toFixed(6)},${p[1].toFixed(6)}`;
+function command() {
+  const name = $('name').value.trim() || 'slakk-points.gpx', g = grid();
+  return `slakk optimize --points ${/^[\w.\/-]+$/.test(name) ? name : JSON.stringify(name)} --corridor-m ${g ? g.corridor : $('corridor').value}`
+    + ` --resolution-m ${g ? g.res : $('resolution').value} --out draft --cache area-cache --html`;
+}
+function drawPanel() {
+  const list = $('list'); list.replaceChildren();
+  points.forEach((p, i) => {
+    const li = document.createElement('li');
+    li.innerHTML = '<b></b><code></code><button title="Move up">↑</button><button title="Move down">↓</button><button title="Remove">✕</button>';
+    li.children[0].textContent = role(i); li.children[1].textContent = fmt(p);
+    const [up, down, del] = li.querySelectorAll('button');
+    up.disabled = i === 0; down.disabled = i === points.length - 1;
+    up.onclick = () => { [points[i - 1], points[i]] = [points[i], points[i - 1]]; render(); };
+    down.onclick = () => { [points[i + 1], points[i]] = [points[i], points[i + 1]]; render(); };
+    del.onclick = () => { points.splice(i, 1); render(); };
+    list.appendChild(li);
+  });
+  if (!points.length) list.innerHTML = '<li class="muted">No points yet. Click the map to place the start.</li>';
+  const g = grid(), box = $('grid'), problems = [];
+  if (g) {
+    if (g.span > D.maxSpan) problems.push('points span more than 25 km; split the trip');
+    if (g.w > D.maxSide || g.h > D.maxSide || g.w * g.h > D.maxCells) problems.push('grid too large; use a coarser cell or a narrower corridor');
+    if (!(g.corridor >= 20 && g.corridor <= 3000)) problems.push('corridor must be 20–3000 m');
+    if (!(g.res >= 1 && g.res <= 30)) problems.push('cell must be 1–30 m');
+    box.textContent = `New terrain grid: about ${g.w} × ${g.h} cells (${(g.w * g.h / 1e6).toFixed(1)} M), dashed box on the map.`
+      + (problems.length ? ' Problem: ' + problems.join('; ') + '.' : '');
+  } else box.textContent = 'Place at least a start and a destination.';
+  box.classList.toggle('bad', problems.length > 0);
+  const ok = points.length >= 2 && !problems.length;
+  $('save').disabled = $('copy').disabled = !ok;
+  $('cmd').textContent = ok ? command() : '';
+  $('undo').disabled = $('clear').disabled = !points.length; $('reverse').disabled = points.length < 2;
+}
+function render() { drawTiles(); drawOverlay(); drawPanel(); }
+
+function gpx() {
+  const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  return '<?xml version="1.0" encoding="UTF-8"?>\n'
+    + `<gpx version="1.1" creator="slakk pick ${esc(D.version)}" xmlns="http://www.topografix.com/GPX/1/1">\n`
+    + '<metadata><desc>Planning points for slakk optimize --points, in order. Not a route.</desc></metadata>\n'
+    + points.map((p, i) => `<wpt lat="${p[0].toFixed(7)}" lon="${p[1].toFixed(7)}"><name>${role(i)}</name></wpt>\n`).join('')
+    + '</gpx>\n';
+}
+$('save').onclick = () => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([gpx()], {type: 'application/gpx+xml'}));
+  a.download = $('name').value.trim() || 'slakk-points.gpx';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+};
+$('copy').onclick = () => navigator.clipboard.writeText(command()).then(() => { $('copy').textContent = 'Copied'; setTimeout(() => { $('copy').textContent = 'Copy command'; }, 1500); });
+$('undo').onclick = () => { points.pop(); render(); };
+$('clear').onclick = () => { if (confirm('Remove all points?')) { points = []; render(); } };
+$('reverse').onclick = () => { points.reverse(); render(); };
+for (const id of ['corridor', 'resolution', 'name']) $(id).oninput = () => { drawOverlay(); drawPanel(); };
+$('nve').onchange = drawTiles;
+const zoomAt = (z, sx, sy) => {
+  z = Math.max(MINZ, Math.min(MAXZ, z));
+  if (z === zoom) return;
+  const ll = toLatLon(sx, sy), [w, h] = size();
+  zoom = z; const [x, y] = project(ll, zoom); cx = x - sx + w / 2; cy = y - sy + h / 2; render();
+};
+$('zin').onclick = () => zoomAt(zoom + 1, ...size().map(v => v / 2));
+$('zout').onclick = () => zoomAt(zoom - 1, ...size().map(v => v / 2));
+map.addEventListener('wheel', e => { e.preventDefault(); zoomAt(zoom + (e.deltaY < 0 ? 1 : -1), ...local(e)); }, {passive: false});
+$('goto').onsubmit = e => {
+  e.preventDefault();
+  const m = $('where').value.trim().match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/);
+  if (m && Math.abs(+m[1]) <= 80 && Math.abs(+m[2]) <= 180) centerOn([+m[1], +m[2]], Math.max(zoom, 13));
+  else alert('Use LAT,LON in decimal degrees, e.g. 69.6500,18.9500');
+};
+
+map.addEventListener('pointerdown', e => {
+  if (e.button !== 0) return;
+  const i = e.target.dataset && e.target.dataset.i;
+  drag = {i: i === undefined ? null : +i, start: local(e), cx, cy, moved: false};
+  map.setPointerCapture(e.pointerId);
+});
+map.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const [x, y] = local(e), dx = x - drag.start[0], dy = y - drag.start[1];
+  if (Math.hypot(dx, dy) > 4) drag.moved = true;
+  if (!drag.moved) return;
+  if (drag.i === null) { cx = drag.cx - dx; cy = drag.cy - dy; drawTiles(); drawOverlay(); }
+  else { points[drag.i] = toLatLon(x, y); drawOverlay(); }
+});
+map.addEventListener('pointerup', e => {
+  if (!drag) return;
+  const d = drag; drag = null;
+  if (!d.moved && d.i === null) points.push(toLatLon(...local(e)));
+  render();
+});
+map.addEventListener('pointercancel', () => { drag = null; render(); });
+map.addEventListener('contextmenu', e => {
+  const i = e.target.dataset && e.target.dataset.i;
+  if (i === undefined) return;
+  e.preventDefault(); points.splice(+i, 1); render();
+});
+addEventListener('resize', render);
+
+if (points.length >= 2) {
+  // Fit the given points into view.
+  const fit = z => { const xy = points.map(p => project(p, z)), [w, h] = size();
+    return Math.max(...xy.map(p => p[0])) - Math.min(...xy.map(p => p[0])) < w * .8 && Math.max(...xy.map(p => p[1])) - Math.min(...xy.map(p => p[1])) < h * .8; };
+  let z = MAXZ; while (z > MINZ && !fit(z)) z--;
+  centerOn(D.center, Math.min(z, 15));
+} else centerOn(D.center, zoom);
+</script></body></html>"""
+
+
 def optimize(args):
     if args.out.exists() and any(args.out.iterdir()):
         raise ValueError('Output directory is not empty; choose a new directory to avoid stale/overwritten GPX files.')
@@ -1150,6 +1455,10 @@ def optimize(args):
     if min(args.keep_first_m,args.steep_buffer_m,args.runout_buffer_m,args.runout_cost,args.side_tolerance_m,args.turn_cost_m,
            args.gully_cost,args.ridge_cost) < 0:
         raise ValueError('Distances, buffers and cost must be nonnegative.')
+    if args.points:
+        if args.input or args.start or args.end or args.via:
+            raise ValueError('--points replaces the input GPX and --start/--end/--via; give only one of them.')
+        args.start, *args.via, args.end = read_points(args.points)
     if args.input and (args.start or args.end):
         raise ValueError('Give either a recorded GPX or --start and --end, not both.')
     if not args.input and not (args.start and args.end):
@@ -1268,6 +1577,7 @@ def plan_between(args, vias):
     terrain.sample(reference)
     report = {'status': 'unverified_candidate', 'disclaimer': DISCLAIMER, 'mode': 'coordinates',
               'options': options(args), 'avoid_sha256': {str(f): hashlib.sha256(f.read_bytes()).hexdigest() for f in args.avoid or []},
+              **({'points_sha256': hashlib.sha256(args.points.read_bytes()).hexdigest()} if args.points else {}),
               'terrain': terrain.grid, 'hazard_coverage': coverage, 'landforms': land, 'reference_line': metrics(terrain, reference, args.angle_window_m, pitch_limit(args)),
               'limits': ['Norwegian map-service coverage only.', 'NVE transparent pixels may be unmarked or unmapped; they are not safety clearance.',
                          'No snowpack, live forecast, vegetation, water-crossing or land-access model.',
@@ -1287,14 +1597,46 @@ def plan_between(args, vias):
     return write_candidates(args, terrain, report, found, reference, 'reference_line', 'Teal: straight reference line | Orange: candidate')
 
 
+UTM_TEXT = re.compile(r'\s*(\d{1,2})([C-HJ-NP-X]?)\s*[:\s]\s*(\d+(?:\.\d*)?)\s*[,\s]\s*(\d+(?:\.\d*)?)\s*', re.I)
+
+
 def latlon(text):
-    try:
-        lat, lon = (float(v) for v in text.split(','))
-    except ValueError:
-        raise argparse.ArgumentTypeError('use LAT,LON in decimal degrees, e.g. 61.2345,7.6543') from None
+    """LAT,LON in decimal degrees, or UTM as ZONE[BAND]:EASTING,NORTHING (e.g. 33W:652000,7720000)."""
+    utm = UTM_TEXT.fullmatch(text)
+    if utm:
+        zone, band, east, north = utm.groups()
+        if not 1 <= int(zone) <= 60 or not 100000 <= float(east) <= 900000 or not 0 <= float(north) <= 10000000:
+            raise argparse.ArgumentTypeError('UTM zone or easting/northing out of range')
+        lat, lon = utm_to_latlon(int(zone), float(east), float(north), south=bool(band) and band.upper() < 'N')
+    else:
+        try:
+            lat, lon = (float(v) for v in text.split(','))
+        except ValueError:
+            raise argparse.ArgumentTypeError('use LAT,LON in decimal degrees, e.g. 61.2345,7.6543, '
+                                             'or UTM as ZONE:EASTING,NORTHING, e.g. 33:652000,7720000') from None
     if not (math.isfinite(lat) and math.isfinite(lon)) or abs(lat) > 80 or abs(lon) > 180:
         raise argparse.ArgumentTypeError('coordinates out of range')
     return (lat, lon)
+
+
+def utm_to_latlon(zone, east, north, south=False):
+    """Inverse transverse Mercator on WGS84 (Krüger series; sub-millimetre within a zone).
+    EUREF89/ETRS89 UTM, as used by Kartverket, matches WGS84 to well under a metre."""
+    f = 1 / 298.257223563
+    n = f / (2 - f)
+    a = R / (1 + n) * (1 + n**2/4 + n**4/64)
+    beta = (n/2 - 2*n**2/3 + 37*n**3/96, n**2/48 + n**3/15, 17*n**3/480)
+    delta = (2*n - 2*n**2/3 - 2*n**3, 7*n**2/3 - 8*n**3/5, 56*n**3/15)
+    xi = (north - (10000000 if south else 0)) / (0.9996 * a)
+    eta = (east - 500000) / (0.9996 * a)
+    xi_, eta_ = xi, eta
+    for j, b in enumerate(beta, 1):
+        xi_ -= b * math.sin(2*j*xi) * math.cosh(2*j*eta)
+        eta_ -= b * math.cos(2*j*xi) * math.sinh(2*j*eta)
+    chi = math.asin(math.sin(xi_) / math.cosh(eta_))
+    lat = chi + sum(d * math.sin(2*j*chi) for j, d in enumerate(delta, 1))
+    lon = zone * 6 - 183 + math.degrees(math.atan2(math.sinh(eta_), math.cos(xi_)))
+    return math.degrees(lat), lon
 
 
 def parser():
@@ -1313,9 +1655,17 @@ def parser():
     login.add_argument('--timeout',type=float,default=300,help='Seconds to wait for the browser (default: %(default)s)')
     login.add_argument('--no-browser',action='store_true',help='Only print the authorization URL')
     login.set_defaults(handler=strava_login)
+    picker = sub.add_parser('pick',help='Write a map page for clicking start, vias and end; it saves a points GPX for optimize --points')
+    picker.add_argument('-o','--output',type=Path,default=Path('pick.html'),help='HTML file to create; must not exist (default: %(default)s)')
+    picker.add_argument('--center',type=latlon,metavar='LAT,LON',help='Where the map opens (or UTM ZONE:EASTING,NORTHING); default: the --points, else all of Norway')
+    picker.add_argument('--points',type=Path,metavar='GPX',help='Points GPX to load for editing (waypoints or one route)')
+    picker.add_argument('--corridor-m',type=float,default=600,help='Corridor shown on the map and put in the command (default: %(default)s)')
+    picker.add_argument('--resolution-m',type=float,default=2,help='Cell size for the grid estimate and the command (default: %(default)s)')
+    picker.add_argument('--no-browser',action='store_true',help='Only write the page')
+    picker.set_defaults(handler=pick)
     opt = sub.add_parser('optimize',help='Search Norwegian terrain for an unverified ascent candidate',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    opt.add_argument('input',type=Path,nargs='?',help='Recorded GPX with one continuous track segment or one route; omit when using --start/--end')
+    opt.add_argument('input',type=Path,nargs='?',help='Recorded GPX with one continuous track segment or one route; omit when using --start/--end or --points')
     opt.add_argument('--out',type=Path,required=True,help='Output directory; must be new or empty')
     opt.add_argument('--cache',type=Path,required=True,help='Area-specific terrain cache; existing cache controls grid/resolution')
     opt.add_argument('--avoid',type=Path,action='append',metavar='GEOJSON',help='GeoJSON Polygon/MultiPolygon areas to exclude; repeatable')
@@ -1325,9 +1675,10 @@ def parser():
     opt.add_argument('--map-detail-m',type=float,default=2,help='Ground metres per pixel of the map.html background, downloaded separately from the grid (default 2; capped at %d px per side)' % MAP_MAX_PX)
     opt.add_argument('--offline',action='store_true',help='Require an existing terrain cache; make no downloads')
     opt.add_argument('--goal',choices=['highest','last'],help='End at the highest GPX elevation or the final point (GPX only; default: highest)')
-    opt.add_argument('--start',type=latlon,metavar='LAT,LON',help='Plan without a GPX: exact start point')
-    opt.add_argument('--end',type=latlon,metavar='LAT,LON',help='Plan without a GPX: exact destination')
-    opt.add_argument('--via',type=latlon,metavar='LAT,LON',action='append',help='Mandatory waypoint, visited in the order given; repeat for more')
+    opt.add_argument('--start',type=latlon,metavar='LAT,LON',help='Plan without a GPX: exact start point (or UTM ZONE:EASTING,NORTHING)')
+    opt.add_argument('--end',type=latlon,metavar='LAT,LON',help='Plan without a GPX: exact destination (or UTM ZONE:EASTING,NORTHING)')
+    opt.add_argument('--via',type=latlon,metavar='LAT,LON',action='append',help='Mandatory waypoint, visited in the order given; repeat for more (or UTM ZONE:EASTING,NORTHING)')
+    opt.add_argument('--points',type=Path,metavar='GPX',help='Plan without a recorded track: GPX waypoints (or one route) in order; first = start, last = end, the rest are --via points')
     opt.add_argument('--keep-first-m',type=float,default=0,help='Follow the recorded approach for this distance (m)')
     opt.add_argument('--corridor-m',type=float,default=600,help='Search distance around the recorded ascent, or the straight reference line in coordinate mode (m)')
     opt.add_argument('--resolution-m',type=float,default=2,help='Approximate ground cell size for a new cache (m)')

@@ -301,21 +301,60 @@ bank or icy patch that needs bootpacking.
 
 ## Plan without a recorded track
 
-Give `--start` and `--end` instead of a GPX. The corridor then follows straight
-lines from start through each `--via` point to the end, so `--corridor-m` must
-be wide enough to contain a sensible route; a larger corridor means a larger
-download and slower search.
+You only need a few points: a start, a destination and, if you like, waypoints
+in between. There are three ways to give them.
+
+**Click them on a map.** `slakk pick` writes `pick.html` and opens it:
+
+```sh
+slakk pick --center 69.65,18.95
+```
+
+Click to add points in order (the first is the start, the last the
+destination), drag a point to move it and right-click it to remove it. The page
+shows the search corridor and the terrain area a new cache would download, warns
+when that grid would be too large, and can overlay the NVE steep and runout
+layers. **Save points GPX** writes `slakk-points.gpx` (to your downloads folder)
+and the page shows the matching command. The map tiles load live from Kartverket
+and NVE while the page is open; nothing is sent anywhere else. `--points` loads
+an existing points file for editing, and `--corridor-m` and `--resolution-m` set
+the starting values.
+
+**Use a points file.** `--points` takes a GPX with waypoints, in file order, or
+one GPX route, such as points dropped and exported from Norgeskart, Gaia or
+Caltopo. The first point is the start, the last the destination and the rest
+are `--via` points:
+
+```sh
+slakk optimize --points slakk-points.gpx --out coord-draft --cache area-cache --corridor-m 1200
+```
+
+A recorded track is refused here; give it as the input GPX instead. The report
+records `points_sha256`, and `options` holds the start, via and end read from the
+file.
+
+**Type them.** Give `--start` and `--end` (and `--via`) as `LAT,LON` in decimal
+degrees or as UTM `ZONE:EASTING,NORTHING`, as Norgeskart shows it (EUREF89, which
+matches WGS84 to well under a metre here). A latitude band letter is allowed,
+`33W:653210,7731797`; bands before N are south of the equator.
 
 ```sh
 slakk optimize --start 61.2100,7.6000 --end 61.2350,7.6400 \
   --via 61.2200,7.6250 --out coord-draft --cache area-cache --corridor-m 1200
+slakk optimize --start 33:653210,7731797 --end 33:655800,7733900 \
+  --out utm-draft --cache tromso-cache
 ```
+
+In all three cases the corridor follows straight lines from start through each
+via point to the end, so `--corridor-m` must be wide enough to contain a sensible
+route. Add a via point to bend the corridor rather than widening it: a larger
+corridor means a larger download and slower search.
 
 This writes `candidate-DRAFT.gpx`, `comparison.png` (teal is the straight
 reference line, not a route) and `report.json` with `"mode": "coordinates"` and
 `reference_line` metrics in place of `original`. There is no
 `recorded-ascent.gpx`. `--goal` and `--keep-first-m` need a recorded GPX, and a
-GPX cannot be combined with `--start`/`--end`.
+GPX cannot be combined with `--start`/`--end` or `--points`.
 
 ## Optional: import from Strava
 
@@ -382,8 +421,9 @@ looking like a new result. The original input is never modified.
 | Option | Default | Meaning |
 |---|---:|---|
 | `--goal highest\|last` | `highest` | End at the highest GPX elevation or the final point (GPX only) |
-| `--start`, `--end` | — | `LAT,LON`; plan without a GPX |
-| `--via` | — | `LAT,LON`; mandatory waypoint, repeatable, visited in order |
+| `--start`, `--end` | — | `LAT,LON` or UTM `ZONE:E,N`; plan without a GPX |
+| `--via` | — | `LAT,LON` or UTM `ZONE:E,N`; mandatory waypoint, repeatable, visited in order |
+| `--points` | — | GPX of waypoints or one route: start, vias, end |
 | `--avoid` | — | GeoJSON polygon file to exclude, repeatable |
 | `--alternatives N` | `1` | Also search for up to N-1 distinct alternatives |
 | `--html` | off | Also write the interactive `map.html` |
@@ -526,7 +566,7 @@ The tests exercise exact endpoints, steep barriers, non-jumpable elevation
 steps, hazard validation of the preserved approach, unknown map colours,
 disconnected GPX segments, Strava coordinate conversion with a mocked API,
 mandatory waypoints (exact pass-through, masked or unreachable waypoints), and
-coordinate-only planning, GeoJSON exclusion areas, distinct alternatives, the self-contained HTML map, cache checksums, the
+coordinate-only planning (points files, UTM against PROJ reference values, the `pick` page data), GeoJSON exclusion areas, distinct alternatives, the self-contained HTML map, cache checksums, the
 hazard coverage check, turn costs, ridge and gully detection and their search cost, and Strava login and token refresh (mocked).
 The optimizer was also run end-to-end on the downloaded activity and cached
 Kartverket/NVE data. Live Strava API authentication was not tested.
