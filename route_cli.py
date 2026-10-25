@@ -48,20 +48,21 @@ def log(message):
     print(message, file=sys.stderr, flush=True)
 
 
-def download(url, token=None):
-    """Bounded HTTPS download. Tokens are headers only, never persisted or logged."""
+def download(url, token=None, form=None):
+    """Bounded HTTPS download, or a form POST when form is given. Tokens are headers only, never logged."""
     headers = {'User-Agent': 'route-cli/' + VERSION, 'Accept': '*/*'}
     if token:
         headers['Authorization'] = 'Bearer ' + token
     for attempt in range(3):
         try:
-            with urlopen(Request(url, headers=headers), timeout=45) as response:
+            body = urlencode(form).encode() if form is not None else None
+            with urlopen(Request(url, data=body, headers=headers), timeout=45) as response:
                 data = response.read(64 * 1024 * 1024 + 1)
             if len(data) > 64 * 1024 * 1024:
                 raise ValueError('Service response exceeds 64 MiB; use a smaller area.')
             return data
         except HTTPError as exc:
-            if exc.code in (429, 502, 503, 504) and attempt < 2:
+            if exc.code in (429, 502, 503, 504) and attempt < 2 and form is None:
                 time.sleep(2 ** attempt)
                 continue
             if exc.code in (401, 403):
@@ -140,12 +141,108 @@ def write_gpx(path, lonlat, elevations, name, description):
     ET.ElementTree(root).write(path, encoding='utf-8', xml_declaration=True)
 
 
+STRAVA_OAUTH = 'https://www.strava.com/oauth'
+
+
+def token_file():
+    base = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
+    return base / 'route-cli' / 'strava-token.json'
+
+
+def app_credentials():
+    client_id, secret = os.environ.get('STRAVA_CLIENT_ID'), os.environ.get('STRAVA_CLIENT_SECRET')
+    if not client_id or not secret:
+        raise ValueError('Set STRAVA_CLIENT_ID and STRAVA_CLIENT_SECRET from your Strava API application settings.')
+    return client_id, secret
+
+
+def save_tokens(response):
+    """Keep only what refresh needs; no athlete profile. The file is readable by you alone."""
+    try:
+        tokens = {k: response[k] for k in ('access_token', 'refresh_token', 'expires_at')}
+    except (KeyError, TypeError):
+        raise ValueError('Strava returned an unexpected token response.') from None
+    if 'scope' in response:
+        tokens['scope'] = response['scope']
+    path = token_file()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, 'w') as handle:
+        json.dump(tokens, handle)
+    os.chmod(path, 0o600)
+    return tokens
+
+
+def strava_login(args):
+    """Authorization-code flow with a one-shot local callback on 127.0.0.1."""
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from urllib.parse import parse_qs, urlparse
+    import secrets
+    import webbrowser
+    client_id, secret = app_credentials()
+    state = secrets.token_urlsafe(24)
+    redirect = f'http://localhost:{args.port}/exchange'
+    url = f'{STRAVA_OAUTH}/authorize?' + urlencode({'client_id': client_id, 'redirect_uri': redirect, 'response_type': 'code',
+                                                     'approval_prompt': 'auto', 'scope': args.scope, 'state': state})
+    result = {}
+
+    class Callback(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if urlparse(self.path).path == '/exchange':
+                result.update({k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()})
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(b'route-cli received the Strava response. You can close this tab.')
+
+        def log_message(self, *_):
+            pass
+
+    server = HTTPServer(('127.0.0.1', args.port), Callback)
+    server.timeout = 1
+    deadline = time.monotonic() + args.timeout
+    print('Open this URL to authorize route-cli (read-only):\n' + url, file=sys.stderr)
+    if not args.no_browser:
+        webbrowser.open(url)
+    with server:
+        while not result and time.monotonic() < deadline:
+            server.handle_request()
+    if not result:
+        raise ValueError('No response from Strava before the timeout.')
+    if not secrets.compare_digest(result.get('state', ''), state):
+        raise ValueError('OAuth state mismatch; ignoring the response.')
+    if 'error' in result or 'code' not in result:
+        raise ValueError(f"Strava authorization was not granted ({result.get('error', 'no code')}).")
+    granted = set(result.get('scope', '').split(','))
+    if not granted & {'activity:read', 'activity:read_all'}:
+        raise ValueError('Strava did not grant activity read access; tick it on the authorization page.')
+    response = json.loads(download(f'{STRAVA_OAUTH}/token', form={'client_id': client_id, 'client_secret': secret,
+                                                               'code': result['code'], 'grant_type': 'authorization_code'}))
+    save_tokens(response)
+    print(f'Saved Strava tokens to {token_file()} (readable only by you). Revoke access any time in Strava settings.', file=sys.stderr)
+
+
+def stored_access_token():
+    path = token_file()
+    if not path.exists():
+        return None
+    tokens = json.loads(path.read_text())
+    if tokens.get('expires_at', 0) < time.time() + 120:
+        client_id, secret = app_credentials()
+        log('Refreshing the Strava access token…')
+        response = json.loads(download(f'{STRAVA_OAUTH}/token', form={'client_id': client_id, 'client_secret': secret,
+                                                                   'refresh_token': tokens['refresh_token'], 'grant_type': 'refresh_token'}))
+        tokens = save_tokens(response)
+    return tokens['access_token']
+
+
 def fetch_strava(args):
     if args.output.exists():
         raise ValueError('Output already exists; choose another file.')
-    token = os.environ.get(args.token_env)
+    token = os.environ.get(args.token_env) or stored_access_token()
     if not token:
-        raise ValueError(f'Set {args.token_env} to a Strava access token. Do not pass the token as a command argument.')
+        raise ValueError(f'Run "route-cli strava-login" first, or set {args.token_env} to a Strava access token. '
+                         'Do not pass the token as a command argument.')
     url = f'https://www.strava.com/api/v3/activities/{args.activity_id}/streams?'
     streams = json.loads(download(url + urlencode({'keys': 'latlng,altitude', 'key_by_type': 'true'}), token))
     latlng = streams.get('latlng', {}).get('data', [])
@@ -941,8 +1038,14 @@ def parser():
     fetch = sub.add_parser('fetch-strava',help='Reconstruct GPX from your activity streams using an existing API token')
     fetch.add_argument('activity_id',type=int,help='Numeric Strava activity id')
     fetch.add_argument('-o','--output',type=Path,required=True,help='GPX file to create; must not exist')
-    fetch.add_argument('--token-env',default='STRAVA_ACCESS_TOKEN',help='Environment variable holding the access token (default: %(default)s)')
+    fetch.add_argument('--token-env',default='STRAVA_ACCESS_TOKEN',help='Environment variable holding an access token; if unset, the token saved by strava-login is used (default: %(default)s)')
     fetch.set_defaults(handler=fetch_strava)
+    login = sub.add_parser('strava-login',help='Authorize read-only Strava access once; tokens are stored and refreshed automatically')
+    login.add_argument('--scope',default='activity:read_all',choices=['activity:read','activity:read_all'],help='activity:read_all also covers Only Me activities (default: %(default)s)')
+    login.add_argument('--port',type=int,default=8723,help='Local callback port on 127.0.0.1 (default: %(default)s)')
+    login.add_argument('--timeout',type=float,default=300,help='Seconds to wait for the browser (default: %(default)s)')
+    login.add_argument('--no-browser',action='store_true',help='Only print the authorization URL')
+    login.set_defaults(handler=strava_login)
     opt = sub.add_parser('optimize',help='Search Norwegian terrain for an unverified ascent candidate',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     opt.add_argument('input',type=Path,nargs='?',help='Recorded GPX with one continuous track segment or one route; omit when using --start/--end')

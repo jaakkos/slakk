@@ -196,15 +196,30 @@ and reconstructs a GPX from `latlng` and `altitude`. It is **not** a byte-for-by
 download of the original device file; timestamps and fitness telemetry are
 not included.
 
-You need your own Strava OAuth access token in `STRAVA_ACCESS_TOKEN`. Supply
-it through your shell environment or secret manager; do not put it in command
-arguments or commit it to a file. The CLI does not perform the OAuth login,
-register an application, or refresh tokens. See
-[Strava authentication](https://developers.strava.com/docs/authentication/).
-Use `activity:read` for Everyone/Followers activities, or `activity:read_all`
-where needed for Only Me activities/privacy-zone data.
+**One-time setup.** Create an API application at
+[strava.com/settings/api](https://www.strava.com/settings/api) and set its
+*Authorization Callback Domain* to `localhost`. Put its id and secret in your
+environment (from a secret manager or a shell profile you don't commit):
 
-Once the environment variable is set:
+```sh
+export STRAVA_CLIENT_ID=12345
+export STRAVA_CLIENT_SECRET=...      # never commit this
+route-cli strava-login
+```
+
+`strava-login` opens Strava's authorization page and waits for the redirect on
+`127.0.0.1:8723`. It checks the OAuth `state`, exchanges the code, and saves
+only the access token, refresh token and expiry to
+`~/.config/route-cli/strava-token.json` (or `$XDG_CONFIG_HOME`), readable by
+you alone. It requests `activity:read_all` so Only Me activities work; use
+`--scope activity:read` for Everyone/Followers activities only. Use
+`--no-browser` to just print the URL. Revoke access any time in Strava's
+settings and delete the file.
+
+After that, `fetch-strava` refreshes an expired token by itself (this needs
+the two `STRAVA_CLIENT_*` variables). A `STRAVA_ACCESS_TOKEN` variable, if set,
+still takes precedence, as in earlier versions. See
+[Strava authentication](https://developers.strava.com/docs/authentication/).
 
 ```sh
 route-cli fetch-strava 1234567890 -o activity.gpx
@@ -214,7 +229,9 @@ route-cli optimize activity.gpx \
 
 Strava import is read-only. The token is sent in an Authorization header and
 is not saved in the GPX, cache, or report. HTTP 401/403 and rate-limit failures
-produce an error rather than prompting for credentials.
+produce an error rather than prompting for credentials. The login and refresh
+flows are tested with mocked Strava responses only; they have not yet been run
+against the live API.
 
 ## Outputs
 
@@ -333,7 +350,7 @@ steps, hazard validation of the preserved approach, unknown map colours,
 disconnected GPX segments, Strava coordinate conversion with a mocked API,
 mandatory waypoints (exact pass-through, masked or unreachable waypoints), and
 coordinate-only planning, GeoJSON exclusion areas, distinct alternatives, the self-contained HTML map, cache checksums, the
-hazard coverage check, and turn costs.
+hazard coverage check, turn costs, and Strava login and token refresh (mocked).
 The optimizer was also run end-to-end on the downloaded activity and cached
 Kartverket/NVE data. Live Strava API authentication was not tested; the original
 GPX download used the browser.

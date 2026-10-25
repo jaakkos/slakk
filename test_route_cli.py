@@ -90,7 +90,7 @@ class RouteTests(unittest.TestCase):
     def test_strava_latlon_order_and_elevations(self):
         streams = {'latlng':{'data':[[69,19],[69.001,19.002]]},'altitude':{'data':[100,120]}}
         args = cli.parser().parse_args(['fetch-strava','123','-o',str(self.root/'activity.gpx')])
-        with patch.dict('os.environ',{'STRAVA_ACCESS_TOKEN':'test-token'}), patch.object(cli,'download',return_value=json.dumps(streams).encode()) as call:
+        with patch.dict('os.environ',{'STRAVA_ACCESS_TOKEN':'test-token','XDG_CONFIG_HOME':str(self.root)}), patch.object(cli,'download',return_value=json.dumps(streams).encode()) as call:
             cli.fetch_strava(args)
         q = cli.read_gpx(args.output)
         np.testing.assert_array_equal(q,[[19,69,100],[19.002,69.001,120]])
@@ -258,6 +258,37 @@ class RouteTests(unittest.TestCase):
             np.testing.assert_array_equal(q[[0,-1]],reference)
         dense = lambda q: cli.resample(q,5/10,1)[1]
         self.assertLess(cli.kick_turns(dense(turned),10),cli.kick_turns(dense(plain),10))
+    def test_strava_login_saves_only_tokens_privately(self):
+        import threading, time, urllib.request
+        response = {'access_token':'a1','refresh_token':'r1','expires_at':2**40,'athlete':{'firstname':'Private'}}
+        env = {'STRAVA_CLIENT_ID':'42','STRAVA_CLIENT_SECRET':'s3cret','XDG_CONFIG_HOME':str(self.root)}
+        with patch.dict('os.environ',env), patch('secrets.token_urlsafe',return_value='fixed'), \
+             patch.object(cli,'download',return_value=json.dumps(response).encode()) as call:
+            worker = threading.Thread(target=cli.main,args=(['strava-login','--no-browser','--port','8791','--timeout','20'],))
+            worker.start()
+            for _ in range(100):
+                try:
+                    urllib.request.urlopen('http://127.0.0.1:8791/exchange?state=fixed&code=c0de&scope=read,activity:read_all').read()
+                    break
+                except OSError:
+                    time.sleep(.05)
+            worker.join(20)
+            self.assertEqual(call.call_args.kwargs['form']['code'],'c0de')
+            path = cli.token_file()
+            self.assertEqual(json.loads(path.read_text()),{'access_token':'a1','refresh_token':'r1','expires_at':2**40})
+            self.assertEqual(path.stat().st_mode & 0o777,0o600)
+            self.assertEqual(cli.stored_access_token(),'a1')
+
+    def test_expired_stored_token_is_refreshed(self):
+        env = {'STRAVA_CLIENT_ID':'42','STRAVA_CLIENT_SECRET':'s3cret','XDG_CONFIG_HOME':str(self.root)}
+        with patch.dict('os.environ',env):
+            cli.save_tokens({'access_token':'old','refresh_token':'r1','expires_at':1})
+            fresh = {'access_token':'new','refresh_token':'r2','expires_at':2**40}
+            with patch.object(cli,'download',return_value=json.dumps(fresh).encode()) as call:
+                self.assertEqual(cli.stored_access_token(),'new')
+            self.assertEqual(call.call_args.kwargs['form']['grant_type'],'refresh_token')
+            self.assertEqual(call.call_args.kwargs['form']['refresh_token'],'r1')
+            self.assertEqual(json.loads(cli.token_file().read_text())['refresh_token'],'r2')
 
 if __name__ == '__main__':
     unittest.main()
