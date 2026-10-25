@@ -211,7 +211,7 @@ class RouteTests(unittest.TestCase):
         code = cli.main(['optimize',str(gpx),'--goal','last','--html','--cache',str(self.root),
                          '--out',str(out),'--offline','--max-terrain-deg','79','--corridor-m','500'])
         self.assertEqual(code,0)
-        page = (out/'map.html').read_text()
+        page = (out/'map.html').read_text(encoding='utf-8')
         self.assertNotRegex(page,r'(src|href)="https?:')
         data = json.loads(page.split('const D = ',1)[1].split(';\n',1)[0])
         recorded, candidate = data['routes'][:2]
@@ -267,7 +267,7 @@ class RouteTests(unittest.TestCase):
             self.assertEqual(cli.main(['optimize',str(gpx),'--goal','last','--html','--angle-window-m',window,
                                        '--cache',str(self.root),'--out',str(out),'--offline']), 0)
             files[window] = (out/'candidate-DRAFT.gpx').read_bytes()
-            page, report = (out/'map.html').read_text(), json.loads((out/'report.json').read_text())
+            page, report = (out/'map.html').read_text(encoding='utf-8'), json.loads((out/'report.json').read_text())
             self.assertIn(f'Max {window} m°', page)
             self.assertIn(f'max_{window}m_deg', report['candidate'])
         self.assertEqual(files['50'], files['15'])  # the window never changes the route
