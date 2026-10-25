@@ -35,8 +35,12 @@ MAP_TILE_PX, MAP_MAX_PX = 2048, 6000
 STEEP_COLORS = {(255, 255, 0), (255, 170, 0), (255, 85, 0), (255, 0, 0), (115, 0, 0)}
 RUNOUT_COLORS = {(0, 77, 168), (76, 155, 255), (154, 177, 230)}
 ALTERNATIVE_BAND_M = 50
-# Largest terrain grid, in cells; a single DEM request is also limited to 4096 px per side.
-MAX_CELLS = 6_000_000
+# Largest terrain grid, in cells; a single DEM request is also limited to MAX_SIDE px per side.
+MAX_CELLS, MAX_SIDE = 6_000_000, 4096
+# Widest extent of the points or track, in ground metres.
+MAX_SPAN_M = 25000
+# Most points a --points file may hold.
+MAX_POINTS = 100
 # With --pitch-deg, over-limit stretches separated by less than this are counted as one pitch.
 PITCH_GAP_M = 3
 # NVE marks terrain from 30 degrees; check a little above that to tolerate model differences.
@@ -144,17 +148,21 @@ def read_points(path):
     if path.stat().st_size > 1024 * 1024:
         raise ValueError(f'{path}: a points file over 1 MiB is unlikely to be a few planning points.')
     root = ET.parse(path).getroot()
+    if root.findall('.//{*}trkpt'):
+        raise ValueError(f'{path}: holds a recorded track; give a track as the input GPX instead, or remove it from the points file.')
     nodes = root.findall('{*}wpt')
-    if not nodes:
-        routes = [r for r in root.findall('{*}rte') if r.findall('{*}rtept')]
-        if len(routes) != 1:
-            raise ValueError(f'{path}: expected GPX waypoints, or one GPX route; a recorded track goes in as the input GPX instead.')
-        nodes = routes[0].findall('{*}rtept')
-    if not 2 <= len(nodes) <= 100:
-        raise ValueError(f'{path}: expected 2–100 points (start, optional vias, end); found {len(nodes)}.')
+    routes = [r for r in root.findall('{*}rte') if r.findall('{*}rtept')]
+    if nodes and routes or len(routes) > 1 or not nodes and not routes:
+        raise ValueError(f'{path}: expected only waypoints, or one GPX route, so the order of the points is clear.')
+    nodes = nodes or routes[0].findall('{*}rtept')
+    if not 2 <= len(nodes) <= MAX_POINTS:
+        raise ValueError(f'{path}: expected 2–{MAX_POINTS} points (start, optional vias, end); found {len(nodes)}.')
     points = []
-    for node in nodes:
-        lat, lon = float(node.attrib['lat']), float(node.attrib['lon'])
+    for number, node in enumerate(nodes, 1):
+        try:
+            lat, lon = float(node.attrib['lat']), float(node.attrib['lon'])
+        except (KeyError, ValueError):
+            raise ValueError(f'{path}: point {number} needs numeric lat and lon attributes.') from None
         if not (math.isfinite(lat) and math.isfinite(lon)) or abs(lat) > 80 or abs(lon) > 180:
             raise ValueError(f'{path}: invalid coordinates or location outside the supported latitude range.')
         points.append((lat, lon))
@@ -315,15 +323,15 @@ def get_terrain(points, args):
         raise ValueError('No terrain cache. Run once online without --offline.')
     xy = mercator(points[:, :2])
     scale = math.cos(math.radians(float(points[:, 1].mean())))
-    if np.ptp(xy, axis=0).max() * scale > 25000:
-        raise ValueError('Use a local route spanning at most 25 km; split longer routes first.')
+    if np.ptp(xy, axis=0).max() * scale > MAX_SPAN_M:
+        raise ValueError(f'Use a local route spanning at most {MAX_SPAN_M / 1000:g} km; split longer routes first.')
     resolution = args.resolution_m / scale
     margin = (args.corridor_m + 150) / scale
     low = np.floor((xy.min(axis=0) - margin) / resolution) * resolution
     high = np.ceil((xy.max(axis=0) + margin) / resolution) * resolution
     width, height = np.rint((high - low) / resolution).astype(int)
-    if width * height > MAX_CELLS or max(width, height) > 4096:
-        raise ValueError(f'Requested grid is too large ({width} × {height} cells; at most {MAX_CELLS:,} and 4096 per side). '
+    if width * height > MAX_CELLS or max(width, height) > MAX_SIDE:
+        raise ValueError(f'Requested grid is too large ({width} × {height} cells; at most {MAX_CELLS:,} and {MAX_SIDE} per side). '
                          'Pass a coarser --resolution-m (e.g. 3 or 6) or reduce --corridor-m.')
     grid = {'provider': 'kartverket-nve-v1', 'bbox': [*low.tolist(), *high.tolist()],
             'width': int(width), 'height': int(height), 'resolution': resolution,
@@ -1004,6 +1012,11 @@ def map_background(terrain, args):
     return image, detail
 
 
+def script_json(data):
+    """JSON safe to place inside an inline <script>."""
+    return json.dumps(data, allow_nan=False).replace('</', '<\\/')
+
+
 def write_html(args, terrain, report, baseline, baseline_label, found, output):
     """Self-contained interactive map: no network access, no external scripts."""
     topo, detail = map_background(terrain, args)
@@ -1030,7 +1043,7 @@ def write_html(args, terrain, report, baseline, baseline_label, found, output):
             'map_m_per_px': round(detail, 2)}
     page = (MAP_HTML.replace('__TOPO__', png_data_url(topo, 'JPEG')).replace('__HAZARD__', png_data_url(hazard))
             .replace('__LANDFORM__', png_data_url(shape))
-            .replace('__WINDOW__', data['window']).replace('__DATA__', json.dumps(data, allow_nan=False).replace('</', '<\\/')))
+            .replace('__WINDOW__', data['window']).replace('__DATA__', script_json(data)))
     output.write_text(page, encoding='utf-8')
 
 
@@ -1161,9 +1174,10 @@ def pick(args):
     else:
         center, zoom = (65.0, 14.0), 5
     data = {'points': points, 'center': center, 'zoom': zoom, 'topo': TOPO, 'nve': NVE,
-            'corridor': args.corridor_m, 'resolution': args.resolution_m, 'maxCells': MAX_CELLS, 'maxSide': 4096,
-            'maxSpan': 25000, 'disclaimer': DISCLAIMER, 'version': VERSION}
-    args.output.write_text(PICK_HTML.replace('__DATA__', json.dumps(data, allow_nan=False).replace('</', '<\\/')), encoding='utf-8')
+            'corridor': args.corridor_m, 'resolution': args.resolution_m, 'maxCells': MAX_CELLS, 'maxSide': MAX_SIDE,
+            'maxSpan': MAX_SPAN_M, 'maxPoints': MAX_POINTS, 'disclaimer': DISCLAIMER, 'version': VERSION}
+    with open(args.output, 'x', encoding='utf-8') as f:  # never overwrite
+        f.write(PICK_HTML.replace('__DATA__', script_json(data)))
     log(f'Wrote {args.output}. Click to place start, vias and end, then save the points GPX and run: '
         'slakk optimize --points <file> --out <dir> --cache <dir>')
     if not args.no_browser:
@@ -1221,6 +1235,7 @@ pre{white-space:pre-wrap;word-break:break-all;background:color-mix(in srgb,var(-
  <div class="tools"><label>File <input type="text" id="name" value="slakk-points.gpx" style="width:12em"></label></div>
  <div class="tools"><button id="save">Save points GPX</button><button id="copy">Copy command</button></div>
  <pre id="cmd"></pre>
+ <div class="muted" style="font-size:12px">The browser saves the file to its downloads folder; run the command there, or give the file's full path.</div>
  <div id="disclaimer" class="muted" style="font-size:12px"></div>
 </aside>
 </main>
@@ -1320,9 +1335,10 @@ function drawOverlay() {
 }
 
 const fmt = p => `${p[0].toFixed(6)},${p[1].toFixed(6)}`;
+const quote = s => /^[\w.\/-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
 function command() {
   const name = $('name').value.trim() || 'slakk-points.gpx', g = grid();
-  return `slakk optimize --points ${/^[\w.\/-]+$/.test(name) ? name : JSON.stringify(name)} --corridor-m ${g ? g.corridor : $('corridor').value}`
+  return `slakk optimize --points ${quote(name)} --corridor-m ${g ? g.corridor : $('corridor').value}`
     + ` --resolution-m ${g ? g.res : $('resolution').value} --out draft --cache area-cache --html`;
 }
 function drawPanel() {
@@ -1341,7 +1357,9 @@ function drawPanel() {
   if (!points.length) list.innerHTML = '<li class="muted">No points yet. Click the map to place the start.</li>';
   const g = grid(), box = $('grid'), problems = [];
   if (g) {
-    if (g.span > D.maxSpan) problems.push('points span more than 25 km; split the trip');
+    if (g.span > D.maxSpan) problems.push(`points span more than ${D.maxSpan / 1000} km; split the trip`);
+    if (points.length > D.maxPoints) problems.push(`at most ${D.maxPoints} points`);
+    if (points.some(([lat, lon]) => Math.abs(lat) > 80 || Math.abs(lon) > 180)) problems.push('a point is outside the supported area');
     if (g.w > D.maxSide || g.h > D.maxSide || g.w * g.h > D.maxCells) problems.push('grid too large; use a coarser cell or a narrower corridor');
     if (!(g.corridor >= 20 && g.corridor <= 3000)) problems.push('corridor must be 20–3000 m');
     if (!(g.res >= 1 && g.res <= 30)) problems.push('cell must be 1–30 m');
@@ -1371,7 +1389,11 @@ $('save').onclick = () => {
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 };
-$('copy').onclick = () => navigator.clipboard.writeText(command()).then(() => { $('copy').textContent = 'Copied'; setTimeout(() => { $('copy').textContent = 'Copy command'; }, 1500); });
+$('copy').onclick = () => {
+  const done = text => { $('copy').textContent = text; setTimeout(() => { $('copy').textContent = 'Copy command'; }, 2000); };
+  const manual = () => { getSelection().selectAllChildren($('cmd')); done('Selected: copy it'); };
+  if (navigator.clipboard) navigator.clipboard.writeText(command()).then(() => done('Copied'), manual); else manual();
+};
 $('undo').onclick = () => { points.pop(); render(); };
 $('clear').onclick = () => { if (confirm('Remove all points?')) { points = []; render(); } };
 $('reverse').onclick = () => { points.reverse(); render(); };
@@ -1385,7 +1407,14 @@ const zoomAt = (z, sx, sy) => {
 };
 $('zin').onclick = () => zoomAt(zoom + 1, ...size().map(v => v / 2));
 $('zout').onclick = () => zoomAt(zoom - 1, ...size().map(v => v / 2));
-map.addEventListener('wheel', e => { e.preventDefault(); zoomAt(zoom + (e.deltaY < 0 ? 1 : -1), ...local(e)); }, {passive: false});
+// Trackpads send many small wheel events; zoom one level per 100 px of scrolling.
+let wheel = 0;
+map.addEventListener('wheel', e => {
+  e.preventDefault();
+  wheel += e.deltaY * (e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 400 : 1);
+  if (Math.abs(wheel) < 100) return;
+  zoomAt(zoom + (wheel < 0 ? 1 : -1), ...local(e)); wheel = 0;
+}, {passive: false});
 $('goto').onsubmit = e => {
   e.preventDefault();
   const m = $('where').value.trim().match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/);

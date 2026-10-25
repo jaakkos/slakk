@@ -165,13 +165,16 @@ class RouteTests(unittest.TestCase):
         return path
 
     def test_points_file_reads_waypoints_or_one_route_in_order(self):
-        wpt = self.write_points('<wpt lat="69.1" lon="18.1"/><rte><rtept lat="1" lon="1"/><rtept lat="2" lon="2"/></rte>'
-                                '<wpt lat="69.2" lon="18.2"><name>End</name></wpt>')
+        wpt = self.write_points('<wpt lat="69.1" lon="18.1"/><wpt lat="69.2" lon="18.2"><name>End</name></wpt>')
         self.assertEqual(cli.read_points(wpt),[(69.1,18.1),(69.2,18.2)])
         rte = self.write_points('<rte><rtept lat="69.1" lon="18.1"/><rtept lat="69.15" lon="18.3"/><rtept lat="69.2" lon="18.2"/></rte>')
         self.assertEqual(cli.read_points(rte),[(69.1,18.1),(69.15,18.3),(69.2,18.2)])
         for body in ('<trk><trkseg><trkpt lat="69.1" lon="18.1"/><trkpt lat="69.2" lon="18.2"/></trkseg></trk>',
-                     '<wpt lat="69.1" lon="18.1"/>', '<wpt lat="91" lon="18.1"/><wpt lat="69.2" lon="18.2"/>'):
+                     '<wpt lat="69.1" lon="18.1"/>', '<wpt lat="91" lon="18.1"/><wpt lat="69.2" lon="18.2"/>',
+                     '<wpt lat="69.1" lon="18.1"/><wpt lat="69.2" lon="18.2"/><trk><trkseg><trkpt lat="69" lon="18"/></trkseg></trk>',
+                     '<wpt lat="69.1" lon="18.1"/><rte><rtept lat="1" lon="1"/><rtept lat="2" lon="2"/></rte><wpt lat="69.2" lon="18.2"/>',
+                     '<wpt lon="18.1"/><wpt lat="69.2" lon="18.2"/>', '<wpt lat="x" lon="18.1"/><wpt lat="69.2" lon="18.2"/>',
+                     ''.join(f'<wpt lat="69.{i:03d}" lon="18"/>' for i in range(101))):
             with self.assertRaises(ValueError):
                 cli.read_points(self.write_points(body,'bad.gpx'))
 
