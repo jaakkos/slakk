@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
-import route_cli as cli
+import slakk as cli
 
 
 class RouteTests(unittest.TestCase):

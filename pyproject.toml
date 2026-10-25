@@ -3,8 +3,8 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "route-cli"
-version = "0.4.0"
+name = "slakk"
+version = "0.5.0"
 description = "Norwegian terrain-based ascent planning. Generates unverified GPX candidates."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-route-cli = "route_cli:main"
+slakk = "slakk:main"
 
 [tool.setuptools]
-py-modules = ["route_cli"]
+py-modules = ["slakk"]

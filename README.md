@@ -1,4 +1,7 @@
-# route-cli
+# slakk
+
+*Slak* is Norwegian for gentle, as in a gentle slope. slakk was called
+`route-cli` before 0.5.0.
 
 A small Python CLI for **unverified winter-ascent route planning in Norway**.
 It can import a Strava activity, read a local GPX, download terrain/map layers,
@@ -40,7 +43,7 @@ python3 -m venv .venv
 source .venv/bin/activate              # Windows: .venv\Scripts\activate
 python -m pip install --require-hashes -r requirements.lock
 python -m pip install --no-deps -e .
-route-cli --help
+slakk --help
 ```
 
 `requirements.lock` pins the exact NumPy and Pillow versions, with hashes, for
@@ -52,8 +55,8 @@ those ranges, regenerate the lock with
 uv pip compile pyproject.toml --universal --python-version 3.11 --generate-hashes -o requirements.lock
 ```
 
-`route-cli` and `python route_cli.py` are the same program; examples below use
-the command. `route-cli optimize --help` lists every option with its default.
+`slakk` and `python slakk.py` are the same program; examples below use
+the command. `slakk optimize --help` lists every option with its default.
 
 The `.gitignore` excludes `temp/`, terrain caches and virtual environments, so
 private tracks and downloaded map data stay out of version control.
@@ -61,7 +64,7 @@ private tracks and downloaded map data stay out of version control.
 ## Start with a GPX
 
 ```sh
-route-cli optimize walk.gpx \
+slakk optimize walk.gpx \
   --out result \
   --cache terrain-cache \
   --goal highest \
@@ -77,7 +80,7 @@ It does not silently loosen the limits.
 For the same type of exploratory search as the earlier analysis:
 
 ```sh
-route-cli optimize walk.gpx \
+slakk optimize walk.gpx \
   --out eastern-draft \
   --cache terrain-cache \
   --keep-first-m 2400 \
@@ -102,7 +105,7 @@ such as a known stream crossing or bridge. Repeat it for more points; they are
 visited in the order given. The candidate passes through each exact point.
 
 ```sh
-route-cli optimize walk.gpx --out via-draft --cache terrain-cache \
+slakk optimize walk.gpx --out via-draft --cache terrain-cache \
   --via 61.23456,7.65432 --via 61.24010,7.66120
 ```
 
@@ -117,7 +120,7 @@ in any GeoJSON editor (for example [geojson.io](https://geojson.io)) and save
 them as Polygon or MultiPolygon features. Pass each file with `--avoid`:
 
 ```sh
-route-cli optimize walk.gpx --out draft --cache terrain-cache \
+slakk optimize walk.gpx --out draft --cache terrain-cache \
   --avoid gorge.geojson --avoid farmland.geojson
 ```
 
@@ -281,7 +284,7 @@ be wide enough to contain a sensible route; a larger corridor means a larger
 download and slower search.
 
 ```sh
-route-cli optimize --start 61.2100,7.6000 --end 61.2350,7.6400 \
+slakk optimize --start 61.2100,7.6000 --end 61.2350,7.6400 \
   --via 61.2200,7.6250 --out coord-draft --cache area-cache --corridor-m 1200
 ```
 
@@ -307,13 +310,13 @@ environment (from a secret manager or a shell profile you don't commit):
 ```sh
 export STRAVA_CLIENT_ID=12345
 export STRAVA_CLIENT_SECRET=...      # never commit this
-route-cli strava-login
+slakk strava-login
 ```
 
 `strava-login` opens Strava's authorization page and waits for the redirect on
 `127.0.0.1:8723`. It checks the OAuth `state`, exchanges the code, and saves
 only the access token, refresh token and expiry to
-`~/.config/route-cli/strava-token.json` (or `$XDG_CONFIG_HOME`), readable by
+`~/.config/slakk/strava-token.json` (or `$XDG_CONFIG_HOME`), readable by
 you alone. It requests `activity:read_all` so Only Me activities work; use
 `--scope activity:read` for Everyone/Followers activities only. Use
 `--no-browser` to just print the URL. Revoke access any time in Strava's
@@ -325,8 +328,8 @@ still takes precedence, as in earlier versions. See
 [Strava authentication](https://developers.strava.com/docs/authentication/).
 
 ```sh
-route-cli fetch-strava 1234567890 -o activity.gpx
-route-cli optimize activity.gpx \
+slakk fetch-strava 1234567890 -o activity.gpx
+slakk optimize activity.gpx \
   --out draft --cache terrain-cache --runout penalize
 ```
 
@@ -400,7 +403,7 @@ URLs under `map_backgrounds`. An existing cache controls the
 resolution; select a new cache directory to change grid resolution or area.
 
 ```sh
-route-cli optimize walk.gpx \
+slakk optimize walk.gpx \
   --out second-draft --cache terrain-cache --offline \
   --keep-first-m 2400 --side east --runout penalize
 ```
@@ -484,7 +487,7 @@ uses 8 bytes × 16 directions per unblocked cell, about 95 MB on that track.
 ## Checks
 
 ```sh
-python -m unittest -v test_route_cli.py
+python -m unittest -v test_slakk.py
 ```
 
 The tests exercise exact endpoints, steep barriers, non-jumpable elevation
@@ -512,8 +515,12 @@ terms. If you share outputs (PNG, HTML map, GPX), keep the attributions.
   Geovekst partnership and that other reuse of it needs the rights holders'
   permission, so check before publishing detailed map backgrounds.
 - **NVE** (steepness and runout map, Bratthet med utløp): Norwegian Licence
-  for Open Government Data ([NLOD](https://data.norge.no/nlod/en/2.0)),
-  credited as "NVE". See NVE's terms for its open data and map services.
+  for Open Government Data ([NLOD](https://data.norge.no/nlod/)), which NVE
+  describes as compatible with Creative Commons Attribution 3.0 Norway
+  ([CC BY 3.0 NO](https://creativecommons.org/licenses/by/3.0/no/)), credited
+  as "NVE". NVE provides the data "as is", may contain errors and omissions,
+  and asks users to link to the relevant service where possible; see
+  [Open data and API from NVE](https://www.nve.no/om-nve/aapne-data-og-api-fra-nve/).
 - **Strava**: imported tracks are your own activity data, subject to
   [Strava's API agreement](https://www.strava.com/legal/api). This tool does not
   upload anything to Strava.

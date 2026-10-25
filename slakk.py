@@ -18,12 +18,12 @@ from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
 if sys.version_info < (3, 11):
-    sys.exit('route-cli needs Python 3.11 or later.')
+    sys.exit('slakk needs Python 3.11 or later.')
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-VERSION = '0.4.0'
+VERSION = '0.5.0'
 
 R = 6378137.0
 DTM = 'https://hoydedata.no/arcgis/rest/services/DTM/ImageServer/exportImage'
@@ -66,7 +66,7 @@ def log(message):
 
 def download(url, token=None, form=None):
     """Bounded HTTPS download, or a form POST when form is given. Tokens are headers only, never logged."""
-    headers = {'User-Agent': 'route-cli/' + VERSION, 'Accept': '*/*'}
+    headers = {'User-Agent': 'slakk/' + VERSION, 'Accept': '*/*'}
     if token:
         headers['Authorization'] = 'Bearer ' + token
     for attempt in range(3):
@@ -141,7 +141,7 @@ def resample(q, spacing, scale):
 def write_gpx(path, lonlat, elevations, name, description):
     ns = 'http://www.topografix.com/GPX/1/1'
     ET.register_namespace('', ns)
-    root = ET.Element('{' + ns + '}gpx', version='1.1', creator='route-cli/' + VERSION)
+    root = ET.Element('{' + ns + '}gpx', version='1.1', creator='slakk/' + VERSION)
     metadata = ET.SubElement(root, 'metadata')
     ET.SubElement(metadata, 'name').text = name
     ET.SubElement(metadata, 'desc').text = description
@@ -162,7 +162,7 @@ STRAVA_OAUTH = 'https://www.strava.com/oauth'
 
 def token_file():
     base = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
-    return base / 'route-cli' / 'strava-token.json'
+    return base / 'slakk' / 'strava-token.json'
 
 
 def app_credentials():
@@ -209,7 +209,7 @@ def strava_login(args):
             self.send_response(200)
             self.send_header('Content-Type', 'text/plain; charset=utf-8')
             self.end_headers()
-            self.wfile.write(b'route-cli received the Strava response. You can close this tab.')
+            self.wfile.write(b'slakk received the Strava response. You can close this tab.')
 
         def log_message(self, *_):
             pass
@@ -217,7 +217,7 @@ def strava_login(args):
     server = HTTPServer(('127.0.0.1', args.port), Callback)
     server.timeout = 1
     deadline = time.monotonic() + args.timeout
-    print('Open this URL to authorize route-cli (read-only):\n' + url, file=sys.stderr)
+    print('Open this URL to authorize slakk (read-only):\n' + url, file=sys.stderr)
     if not args.no_browser:
         webbrowser.open(url)
     with server:
@@ -257,7 +257,7 @@ def fetch_strava(args):
         raise ValueError('Output already exists; choose another file.')
     token = os.environ.get(args.token_env) or stored_access_token()
     if not token:
-        raise ValueError(f'Run "route-cli strava-login" first, or set {args.token_env} to a Strava access token. '
+        raise ValueError(f'Run "slakk strava-login" first, or set {args.token_env} to a Strava access token. '
                          'Do not pass the token as a command argument.')
     url = f'https://www.strava.com/api/v3/activities/{args.activity_id}/streams?'
     streams = json.loads(download(url + urlencode({'keys': 'latlng,altitude', 'key_by_type': 'true'}), token))
@@ -329,7 +329,7 @@ def get_terrain(points, args):
     grid['requests'] = requests
     grid['files'] = {name: {'sha256': hashlib.sha256((cache / name).read_bytes()).hexdigest(),
                             'bytes': (cache / name).stat().st_size} for name in requests}
-    grid['created_by'] = 'route-cli/' + VERSION
+    grid['created_by'] = 'slakk/' + VERSION
     # Commit the cache manifest only after all files are usable.
     terrain = Terrain(cache, grid)
     manifest.write_text(json.dumps(grid, indent=2))
@@ -1300,7 +1300,7 @@ def latlon(text):
 
 
 def parser():
-    p = argparse.ArgumentParser(prog='route-cli', description=__doc__,
+    p = argparse.ArgumentParser(prog='slakk', description=__doc__,
         epilog='Angles are degrees, not percentages. Exit codes: 0 success, 2 input/provider error, 3 no feasible route.')
     p.add_argument('--version', action='version', version='%(prog)s ' + VERSION)
     sub = p.add_subparsers(dest='command',required=True)
