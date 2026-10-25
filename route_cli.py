@@ -15,8 +15,13 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
+if sys.version_info < (3, 11):
+    sys.exit('route-cli needs Python 3.11 or later.')
+
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+
+VERSION = '0.2.0'
 
 R = 6378137.0
 DTM = 'https://hoydedata.no/arcgis/rest/services/DTM/ImageServer/exportImage'
@@ -40,7 +45,7 @@ def log(message):
 
 def download(url, token=None):
     """Bounded HTTPS download. Tokens are headers only, never persisted or logged."""
-    headers = {'User-Agent': 'route-cli/0.1', 'Accept': '*/*'}
+    headers = {'User-Agent': 'route-cli/' + VERSION, 'Accept': '*/*'}
     if token:
         headers['Authorization'] = 'Bearer ' + token
     for attempt in range(3):
@@ -114,7 +119,7 @@ def resample(q, spacing, scale):
 def write_gpx(path, lonlat, elevations, name, description):
     ns = 'http://www.topografix.com/GPX/1/1'
     ET.register_namespace('', ns)
-    root = ET.Element('{' + ns + '}gpx', version='1.1', creator='route-cli/0.1')
+    root = ET.Element('{' + ns + '}gpx', version='1.1', creator='route-cli/' + VERSION)
     metadata = ET.SubElement(root, 'metadata')
     ET.SubElement(metadata, 'name').text = name
     ET.SubElement(metadata, 'desc').text = description
@@ -481,31 +486,34 @@ def optimize(args):
 
 
 def parser():
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(prog='route-cli', description=__doc__,
+        epilog='Angles are degrees, not percentages. Exit codes: 0 success, 2 input/provider error, 3 no feasible route.')
+    p.add_argument('--version', action='version', version='%(prog)s ' + VERSION)
     sub = p.add_subparsers(dest='command',required=True)
     fetch = sub.add_parser('fetch-strava',help='Reconstruct GPX from your activity streams using an existing API token')
-    fetch.add_argument('activity_id',type=int)
-    fetch.add_argument('-o','--output',type=Path,required=True)
-    fetch.add_argument('--token-env',default='STRAVA_ACCESS_TOKEN')
+    fetch.add_argument('activity_id',type=int,help='Numeric Strava activity id')
+    fetch.add_argument('-o','--output',type=Path,required=True,help='GPX file to create; must not exist')
+    fetch.add_argument('--token-env',default='STRAVA_ACCESS_TOKEN',help='Environment variable holding the access token (default: %(default)s)')
     fetch.set_defaults(handler=fetch_strava)
-    opt = sub.add_parser('optimize',help='Search Norwegian terrain for an unverified ascent candidate')
-    opt.add_argument('input',type=Path)
-    opt.add_argument('--out',type=Path,required=True)
+    opt = sub.add_parser('optimize',help='Search Norwegian terrain for an unverified ascent candidate',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    opt.add_argument('input',type=Path,help='Recorded GPX with one continuous track segment or one route')
+    opt.add_argument('--out',type=Path,required=True,help='Output directory; must be new or empty')
     opt.add_argument('--cache',type=Path,required=True,help='Area-specific terrain cache; existing cache controls grid/resolution')
-    opt.add_argument('--offline',action='store_true')
-    opt.add_argument('--goal',choices=['highest','last'],default='highest')
-    opt.add_argument('--keep-first-m',type=float,default=0)
-    opt.add_argument('--corridor-m',type=float,default=600)
-    opt.add_argument('--resolution-m',type=float,default=6)
-    opt.add_argument('--side',choices=['any','east','west'],default='any')
-    opt.add_argument('--side-tolerance-m',type=float,default=20)
-    opt.add_argument('--max-uphill-deg',type=float,default=15)
-    opt.add_argument('--max-downhill-deg',type=float,default=10)
-    opt.add_argument('--max-terrain-deg',type=float,default=35)
-    opt.add_argument('--steep-buffer-m',type=float,default=6)
-    opt.add_argument('--runout-buffer-m',type=float,default=10)
-    opt.add_argument('--runout',choices=['avoid','penalize'],default='avoid')
-    opt.add_argument('--runout-cost',type=float,default=12)
+    opt.add_argument('--offline',action='store_true',help='Require an existing terrain cache; make no downloads')
+    opt.add_argument('--goal',choices=['highest','last'],default='highest',help='End at the highest GPX elevation or the final point')
+    opt.add_argument('--keep-first-m',type=float,default=0,help='Follow the recorded approach for this distance (m)')
+    opt.add_argument('--corridor-m',type=float,default=600,help='Search distance around the recorded ascent (m)')
+    opt.add_argument('--resolution-m',type=float,default=6,help='Approximate ground cell size for a new cache (m)')
+    opt.add_argument('--side',choices=['any','east','west'],default='any',help='Constrain the route relative to the nearest recorded-route sample')
+    opt.add_argument('--side-tolerance-m',type=float,default=20,help='Allowance across the --side boundary (m)')
+    opt.add_argument('--max-uphill-deg',type=float,default=15,help='Along-route uphill angle limit, checked within search edges')
+    opt.add_argument('--max-downhill-deg',type=float,default=10,help='Limit for small descending sections during the ascent')
+    opt.add_argument('--max-terrain-deg',type=float,default=35,help='Exclude cells whose terrain-model slope exceeds this')
+    opt.add_argument('--steep-buffer-m',type=float,default=6,help='Buffer around NVE steep-slope pixels (m)')
+    opt.add_argument('--runout-buffer-m',type=float,default=10,help='Buffer around NVE runout pixels (m)')
+    opt.add_argument('--runout',choices=['avoid','penalize'],default='avoid',help='Exclude mapped runout, or explicitly allow it with a cost')
+    opt.add_argument('--runout-cost',type=float,default=12,help='Added distance-cost multiplier inside runout with --runout penalize (not a risk score)')
     opt.set_defaults(handler=optimize)
     return p
 

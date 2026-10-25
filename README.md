@@ -30,17 +30,31 @@ Use Python 3.11 or later. In this directory:
 
 ```sh
 python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-python route_cli.py --help
+source .venv/bin/activate              # Windows: .venv\Scripts\activate
+python -m pip install --require-hashes -r requirements.lock
+python -m pip install --no-deps -e .
+route-cli --help
 ```
 
-On Windows, activate with `.venv\Scripts\activate` instead.
+`requirements.lock` pins the exact NumPy and Pillow versions, with hashes, for
+every platform. `pyproject.toml` holds the allowed version ranges. After changing
+those ranges, regenerate the lock with
+[uv](https://docs.astral.sh/uv/) and commit both files:
+
+```sh
+uv pip compile pyproject.toml --universal --python-version 3.11 --generate-hashes -o requirements.lock
+```
+
+`route-cli` and `python route_cli.py` are the same program; examples below use
+the command. `route-cli optimize --help` lists every option with its default.
+
+The `.gitignore` excludes `temp/`, terrain caches and virtual environments, so
+private tracks and downloaded map data stay out of version control.
 
 ## Start with a GPX
 
 ```sh
-python route_cli.py optimize walk.gpx \
+route-cli optimize walk.gpx \
   --out result \
   --cache terrain-cache \
   --goal highest \
@@ -56,7 +70,7 @@ It does not silently loosen the limits.
 For the same type of exploratory search as the earlier analysis:
 
 ```sh
-python route_cli.py optimize walk.gpx \
+route-cli optimize walk.gpx \
   --out eastern-draft \
   --cache terrain-cache \
   --keep-first-m 2400 \
@@ -93,8 +107,8 @@ where needed for Only Me activities/privacy-zone data.
 Once the environment variable is set:
 
 ```sh
-python route_cli.py fetch-strava 1234567890 -o activity.gpx
-python route_cli.py optimize activity.gpx \
+route-cli fetch-strava 1234567890 -o activity.gpx
+route-cli optimize activity.gpx \
   --out draft --cache terrain-cache --runout penalize
 ```
 
@@ -144,7 +158,7 @@ resolution, retrieval time and request URLs. An existing cache controls the
 resolution; select a new cache directory to change grid resolution or area.
 
 ```sh
-python route_cli.py optimize walk.gpx \
+route-cli optimize walk.gpx \
   --out second-draft --cache terrain-cache --offline \
   --keep-first-m 2400 --side east --runout penalize
 ```

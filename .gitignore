@@ -1,0 +1,11 @@
+# Environments and build output
+.venv/
+__pycache__/
+*.egg-info/
+build/
+dist/
+
+# Private tracks, terrain caches and run outputs: never commit these.
+temp/
+*-cache/
+terrain-cache*/

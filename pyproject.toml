@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "route-cli"
+version = "0.2.0"
+description = "Norwegian terrain-based ascent planning. Generates unverified GPX candidates."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.0,<3",
+    "Pillow>=10.4,<13",
+]
+
+[project.scripts]
+route-cli = "route_cli:main"
+
+[tool.setuptools]
+py-modules = ["route_cli"]
