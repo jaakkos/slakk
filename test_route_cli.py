@@ -216,6 +216,37 @@ class RouteTests(unittest.TestCase):
         recorded, candidate = data['routes'][:2]
         self.assertTrue(any(recorded['over']))
         self.assertFalse(any(candidate['over']))
+    def add_checksums(self):
+        grid = json.loads((self.root/'manifest.json').read_text())
+        grid['files'] = {n: {'sha256': __import__('hashlib').sha256((self.root/n).read_bytes()).hexdigest()}
+                         for n in ('dem.tiff','hazards.png','topo.png')}
+        (self.root/'manifest.json').write_text(json.dumps(grid))
+
+    def offline_args(self):
+        return cli.parser().parse_args(['optimize','x.gpx','--out',str(self.root/'out'),'--cache',str(self.root),'--offline'])
+
+    def test_modified_cache_is_refused(self):
+        self.terrain()
+        self.add_checksums()
+        terrain = cli.get_terrain(np.zeros((2,3)),self.offline_args())
+        self.assertTrue(terrain.grid['verified'])
+        Image.new('RGB',(40,40),'black').save(self.root/'topo.png')
+        with self.assertRaisesRegex(ValueError,'checksum'):
+            cli.get_terrain(np.zeros((2,3)),self.offline_args())
+
+    def test_cache_without_checksums_is_flagged(self):
+        self.terrain()
+        self.assertFalse(cli.get_terrain(np.zeros((2,3)),self.offline_args()).grid['verified'])
+
+    def test_steep_terrain_without_nve_marking_fails_closed(self):
+        z = np.full((40,40),100,dtype=np.float32)
+        z[:,20:] += np.arange(20,dtype=np.float32)*8  # ~39 degrees, but NVE layer is empty
+        with self.assertRaisesRegex(ValueError,'missing or unmapped'):
+            cli.hazard_coverage(self.terrain(z=z))
+        colors = np.zeros((40,40,4),np.uint8)
+        colors[:,20:] = [255,170,0,255]
+        coverage = cli.hazard_coverage(self.terrain(colors,z))
+        self.assertEqual(coverage['fraction_near_nve_steep'],1.0)
 
 if __name__ == '__main__':
     unittest.main()

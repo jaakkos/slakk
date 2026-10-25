@@ -262,6 +262,20 @@ Public service availability and formats can change. Unknown NVE palette
 colours, invalid images, absent elevation coverage and inconsistent raster
 registration are rejected.
 
+New caches (0.2.0 and later) store each file's SHA-256 and size in
+`manifest.json`, plus the `created_by` version. Every run re-checks them and
+refuses a cache whose files changed. Older caches still work but print a
+warning and are reported with `"verified": false`; use a new `--cache`
+directory to get checksums.
+
+**Hazard coverage check.** NVE marks terrain from 30°. Each run counts DEM
+cells steeper than 33° and how many lie within 20 m of an NVE steep marking,
+and records both under `hazard_coverage` in `report.json`. If there are at
+least 50 such cells and fewer than half are near a marking, the NVE layer may
+be missing or unmapped there, and the run stops with exit code **2** instead
+of treating the area as clear. These thresholds are a first estimate and have
+not yet been checked against real tracks.
+
 ## Algorithm and scope
 
 The search uses a 16-neighbour raster graph. Its cost combines distance,
@@ -301,7 +315,8 @@ The tests exercise exact endpoints, steep barriers, non-jumpable elevation
 steps, hazard validation of the preserved approach, unknown map colours,
 disconnected GPX segments, Strava coordinate conversion with a mocked API,
 mandatory waypoints (exact pass-through, masked or unreachable waypoints), and
-coordinate-only planning, GeoJSON exclusion areas, distinct alternatives, and the self-contained HTML map.
+coordinate-only planning, GeoJSON exclusion areas, distinct alternatives, the self-contained HTML map, cache checksums, and the
+hazard coverage check.
 The optimizer was also run end-to-end on the downloaded activity and cached
 Kartverket/NVE data. Live Strava API authentication was not tested; the original
 GPX download used the browser.

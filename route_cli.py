@@ -31,6 +31,8 @@ TOPO = 'https://wms.geonorge.no/skwms1/wms.topo'
 STEEP_COLORS = {(255, 255, 0), (255, 170, 0), (255, 85, 0), (255, 0, 0), (115, 0, 0)}
 RUNOUT_COLORS = {(0, 77, 168), (76, 155, 255), (154, 177, 230)}
 ALTERNATIVE_BAND_M = 50
+# NVE marks terrain from 30 degrees; check a little above that to tolerate model differences.
+COVERAGE_SLOPE_DEG, COVERAGE_MIN_CELLS, COVERAGE_MIN_AGREEMENT = 33, 50, 0.5
 ROUTE_COLORS = ['#c44300', '#7b3fa0', '#2b59c3', '#2e7d32', '#8d6e00']
 DISCLAIMER = ('UNVERIFIED WINTER PLANNING DRAFT. Bare-ground model only; no snow or '
               'forecast assessment. Streams, vegetation, access and turns need field checks. '
@@ -171,6 +173,7 @@ def get_terrain(points, args):
         if grid.get('provider') != 'kartverket-nve-v1':
             raise ValueError('Unsupported terrain-cache format.')
         log(f'Using cached terrain: {grid["ground_resolution"]:.2f} m cells (cache controls resolution).')
+        verify_cache(cache, grid)
         return Terrain(cache, grid)
     if args.offline:
         raise ValueError('No terrain cache. Run once online without --offline.')
@@ -210,10 +213,40 @@ def get_terrain(points, args):
             raise ValueError(f'{name}: service returned an invalid image. Check provider availability/coverage.') from None
         (cache / name).write_bytes(data)
     grid['requests'] = requests
+    grid['files'] = {name: {'sha256': hashlib.sha256((cache / name).read_bytes()).hexdigest(),
+                            'bytes': (cache / name).stat().st_size} for name in requests}
+    grid['created_by'] = 'route-cli/' + VERSION
     # Commit the cache manifest only after all files are usable.
     terrain = Terrain(cache, grid)
     manifest.write_text(json.dumps(grid, indent=2))
     return terrain
+
+
+def verify_cache(cache, grid):
+    """Refuse a cache whose files changed after download. Older caches have no checksums and are flagged."""
+    if 'files' not in grid:
+        log('Warning: this cache predates checksums, so its files cannot be verified. Use a new --cache to get checksums.')
+        grid['verified'] = False
+        return
+    for name, expected in grid['files'].items():
+        if hashlib.sha256((cache / name).read_bytes()).hexdigest() != expected['sha256']:
+            raise ValueError(f'{cache / name} does not match its checksum in manifest.json. Refusing a modified or corrupt cache; use a new --cache.')
+    grid['verified'] = True
+
+
+def hazard_coverage(terrain):
+    """Cross-check NVE steepness against the DEM: steep DEM terrain with no NVE marking suggests missing coverage."""
+    steep_dem = terrain.slope >= COVERAGE_SLOPE_DEG
+    steep_dem &= ~dilate(terrain.invalid, 2)
+    cells = int(steep_dem.sum())
+    near_nve = dilate(terrain.steep, max(1, math.ceil(20 / terrain.gs)))
+    agreement = float(near_nve[steep_dem].mean()) if cells else None
+    result = {'dem_cells_over_%d_deg' % COVERAGE_SLOPE_DEG: cells,
+              'fraction_near_nve_steep': None if agreement is None else round(agreement, 3)}
+    if cells >= COVERAGE_MIN_CELLS and agreement < COVERAGE_MIN_AGREEMENT:
+        raise ValueError(f'NVE steepness marks only {agreement:.0%} of the {cells} DEM cells steeper than '
+                         f'{COVERAGE_SLOPE_DEG}°. The hazard layer may be missing or unmapped here; refusing to treat it as clear.')
+    return result
 
 
 class Terrain:
@@ -736,13 +769,14 @@ def optimize(args):
         stop = len(track)-1
     selected = track[:stop+1]
     terrain = get_terrain(np.vstack([selected, vias]), args)
+    coverage = hazard_coverage(terrain)
     original = terrain.rc(selected[:,:2])
     terrain.sample(original)
     terrain.sample(terrain.rc(vias[:,:2]))
     report = {'status': 'unverified_candidate', 'disclaimer': DISCLAIMER, 'mode': 'gpx',
               'input_sha256': hashlib.sha256(args.input.read_bytes()).hexdigest(),
               'goal_index_zero_based': stop, 'options': options(args), 'avoid_sha256': {str(f): hashlib.sha256(f.read_bytes()).hexdigest() for f in args.avoid or []},
-              'terrain': terrain.grid, 'original': metrics(terrain, original),
+              'terrain': terrain.grid, 'hazard_coverage': coverage, 'original': metrics(terrain, original),
               'limits': ['Norwegian map-service coverage only.', 'NVE transparent pixels may be unmarked or unmapped; they are not safety clearance.',
                          'No snowpack, live forecast, vegetation, water-crossing or land-access model.',
                          'NVE classifications are decoded from a version-specific rendered palette; unknown colours fail closed.',
@@ -807,11 +841,12 @@ def plan_between(args, vias):
     (slat, slon), (elat, elon) = args.start, args.end
     points = np.vstack([[slon, slat, np.nan], vias, [elon, elat, np.nan]])
     terrain = get_terrain(points, args)
+    coverage = hazard_coverage(terrain)
     reference = terrain.rc(points[:, :2])
     terrain.sample(reference)
     report = {'status': 'unverified_candidate', 'disclaimer': DISCLAIMER, 'mode': 'coordinates',
               'options': options(args), 'avoid_sha256': {str(f): hashlib.sha256(f.read_bytes()).hexdigest() for f in args.avoid or []},
-              'terrain': terrain.grid, 'reference_line': metrics(terrain, reference),
+              'terrain': terrain.grid, 'hazard_coverage': coverage, 'reference_line': metrics(terrain, reference),
               'limits': ['Norwegian map-service coverage only.', 'NVE transparent pixels may be unmarked or unmapped; they are not safety clearance.',
                          'No snowpack, live forecast, vegetation, water-crossing or land-access model.',
                          'NVE classifications are decoded from a version-specific rendered palette; unknown colours fail closed.',
