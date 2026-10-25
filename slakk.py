@@ -428,7 +428,7 @@ class Terrain:
 
 def read_areas(path):
     """Outer rings of GeoJSON Polygon/MultiPolygon features as [lon, lat] arrays. Holes are ignored, so they stay excluded."""
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding='utf-8'))
     features = data.get('features', [data]) if data.get('type') == 'FeatureCollection' else [data]
     rings = []
     for feature in features:
@@ -748,7 +748,7 @@ def solve_many(terrain, reference, args, waypoints=(), avoid=None, count=1):
     transitions = list(edge_options(limit, blocked, usable, args, terrain if args.pitch_deg else None))
     land = landform_cost(terrain, args)
     band = max(1, math.ceil(ALTERNATIVE_BAND_M / terrain.gs))
-    extra, found, notes = np.zeros(terrain.z.shape), [], []
+    extra, found, notes, bands = np.zeros(terrain.z.shape), [], [], []
     for attempt in range(1 if count == 1 else 2 * count):
         try:
             candidate, info = route_legs(terrain, reference, keep, distance, start, goal, stops, waypoints,
@@ -771,9 +771,7 @@ def solve_many(terrain, reference, args, waypoints=(), avoid=None, count=1):
                 extra += near
                 continue
             info['shared_with_earlier'] = round(shared, 3)
-            bands.append(near)
-        else:
-            bands = [near]
+        bands.append(near)
         found.append((candidate, info))
         extra += near
         if len(found) == count:

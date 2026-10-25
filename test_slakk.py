@@ -1,5 +1,6 @@
 """Offline checks for route continuity, masks, constraints and Strava conversion."""
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -290,7 +291,8 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(call.call_count, 16)  # 4 × 4 tiles of at most 64 px
         urls = [c.args[0] for c in call.call_args_list]
         boxes = [[float(v) for v in u.split('bbox=')[1].split('&')[0].replace('%2C', ',').split(',')] for u in urls]
-        self.assertEqual(min(b[0] for b in boxes), 0); self.assertEqual(max(b[2] for b in boxes), 400)
+        self.assertEqual(min(b[0] for b in boxes), 0)
+        self.assertEqual(max(b[2] for b in boxes), 400)
         self.assertAlmostEqual(sum((b[2]-b[0])*(b[3]-b[1]) for b in boxes), 400*400)
         self.assertEqual(image.getpixel((150, 150)), (0, 128, 0))
         saved = json.loads((self.root/'manifest.json').read_text())['map_backgrounds']['topo-200x200.png']
@@ -356,7 +358,9 @@ class RouteTests(unittest.TestCase):
         dense = lambda q: cli.resample(q,5/10,1)[1]
         self.assertLess(cli.kick_turns(dense(turned),10),cli.kick_turns(dense(plain),10))
     def test_strava_login_saves_only_tokens_privately(self):
-        import threading, time, urllib.request
+        import threading
+        import time
+        import urllib.request
         response = {'access_token':'a1','refresh_token':'r1','expires_at':2**40,'athlete':{'firstname':'Private'}}
         env = {'STRAVA_CLIENT_ID':'42','STRAVA_CLIENT_SECRET':'s3cret','XDG_CONFIG_HOME':str(self.root)}
         with patch.dict('os.environ',env), patch('secrets.token_urlsafe',return_value='fixed'), \
@@ -373,7 +377,8 @@ class RouteTests(unittest.TestCase):
             self.assertEqual(call.call_args.kwargs['form']['code'],'c0de')
             path = cli.token_file()
             self.assertEqual(json.loads(path.read_text()),{'access_token':'a1','refresh_token':'r1','expires_at':2**40})
-            self.assertEqual(path.stat().st_mode & 0o777,0o600)
+            if os.name == 'posix':  # Windows has no POSIX file modes
+                self.assertEqual(path.stat().st_mode & 0o777,0o600)
             self.assertEqual(cli.stored_access_token(),'a1')
 
     def test_expired_stored_token_is_refreshed(self):
