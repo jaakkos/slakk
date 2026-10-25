@@ -200,6 +200,22 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(files[0],'candidate-2-DRAFT.gpx')
         self.assertIn('candidate-DRAFT.gpx',files)
         self.assertEqual(len(files),1+len(report['alternatives']))
+    def test_html_map_is_self_contained_and_flags_violations(self):
+        z = np.full((40,40),100,dtype=np.float32)
+        z[:,20:] += np.arange(20,dtype=np.float32)*3  # recorded line climbs ~17 degrees
+        terrain = self.terrain(z=z)
+        gpx = self.root/'input.gpx'
+        cli.write_gpx(gpx,terrain.lonlat(np.array([[20,5],[20,35]])),[100,145],'test','test')
+        out = self.root/'out'
+        code = cli.main(['optimize',str(gpx),'--goal','last','--html','--cache',str(self.root),
+                         '--out',str(out),'--offline','--max-terrain-deg','79','--corridor-m','500'])
+        self.assertEqual(code,0)
+        page = (out/'map.html').read_text()
+        self.assertNotRegex(page,r'(src|href)="https?:')
+        data = json.loads(page.split('const D = ',1)[1].split(';\n',1)[0])
+        recorded, candidate = data['routes'][:2]
+        self.assertTrue(any(recorded['over']))
+        self.assertFalse(any(candidate['over']))
 
 if __name__ == '__main__':
     unittest.main()

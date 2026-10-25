@@ -139,6 +139,21 @@ have a steeper maximum gradient than an alternative; that is the tradeoff to
 read. Fewer than N-1 alternatives can be found; `search.alternative_notes`
 says why.
 
+## Interactive map
+
+Add `--html` to also write `map.html`, a single self-contained file that opens
+in any browser without network access. It shows the Kartverket background, an
+NVE steep/runout overlay you can toggle, exclusion areas, and every route. A
+table compares distance, ascent, maximum 50 m angle and the distance over the
+`--max-uphill-deg` limit, in NVE steep terrain and in NVE runout. Click a row
+for its elevation profile, with bands marking those sections; moving over the
+profile marks the point on the map. Over-limit sections are also drawn red on
+the map.
+
+The page embeds your recorded track, so treat it as private like the GPX
+files. The 50 m angle is an average over the next 50 m, a different
+measure from the per-edge limit used in the search.
+
 ## Plan without a recorded track
 
 Give `--start` and `--end` instead of a GPX. The corridor then follows straight
@@ -191,6 +206,7 @@ produce an error rather than prompting for credentials.
   terrain-model elevations, no timestamps.
 - `recorded-ascent.gpx`: original ascent geometry with the same elevation model.
 - `comparison.png`: teal recorded route, orange candidate, Kartverket background.
+- `map.html`: interactive map and profiles, only with `--html`.
 - `candidate-2-DRAFT.gpx` …: alternatives, only with `--alternatives`.
 - `report.json`: settings, provenance, cache metadata, search outcome and metrics.
   Since 0.2.0 it also records `mode` (`gpx` or `coordinates`), the `start`,
@@ -208,6 +224,7 @@ looking like a new result. The original input is never modified.
 | `--via` | — | `LAT,LON`; mandatory waypoint, repeatable, visited in order |
 | `--avoid` | — | GeoJSON polygon file to exclude, repeatable |
 | `--alternatives N` | `1` | Also search for up to N-1 distinct alternatives |
+| `--html` | off | Also write the interactive `map.html` |
 | `--keep-first-m` | `0` | Follow the original approach for this distance |
 | `--corridor-m` | `600` | Search distance around the original ascent |
 | `--resolution-m` | `6` | Approximate ground cell size for a **new** cache |
@@ -284,7 +301,7 @@ The tests exercise exact endpoints, steep barriers, non-jumpable elevation
 steps, hazard validation of the preserved approach, unknown map colours,
 disconnected GPX segments, Strava coordinate conversion with a mocked API,
 mandatory waypoints (exact pass-through, masked or unreachable waypoints), and
-coordinate-only planning, GeoJSON exclusion areas, and distinct alternatives.
+coordinate-only planning, GeoJSON exclusion areas, distinct alternatives, and the self-contained HTML map.
 The optimizer was also run end-to-end on the downloaded activity and cached
 Kartverket/NVE data. Live Strava API authentication was not tested; the original
 GPX download used the browser.

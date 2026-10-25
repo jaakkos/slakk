@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Norwegian terrain-based ascent planning. Generates unverified GPX candidates."""
 import argparse
+import base64
 import hashlib
 import heapq
 import io
@@ -30,6 +31,7 @@ TOPO = 'https://wms.geonorge.no/skwms1/wms.topo'
 STEEP_COLORS = {(255, 255, 0), (255, 170, 0), (255, 85, 0), (255, 0, 0), (115, 0, 0)}
 RUNOUT_COLORS = {(0, 77, 168), (76, 155, 255), (154, 177, 230)}
 ALTERNATIVE_BAND_M = 50
+ROUTE_COLORS = ['#c44300', '#7b3fa0', '#2b59c3', '#2e7d32', '#8d6e00']
 DISCLAIMER = ('UNVERIFIED WINTER PLANNING DRAFT. Bare-ground model only; no snow or '
               'forecast assessment. Streams, vegetation, access and turns need field checks. '
               'Mapped or unmodelled avalanche runout may affect the route. '
@@ -530,9 +532,8 @@ def draw_map(terrain, original, candidate, output, legend='Teal: recorded | Oran
     draw = ImageDraw.Draw(image)
     if isinstance(candidate, np.ndarray):
         candidate = [candidate]
-    colors = ['#c44300', '#7b3fa0', '#2b59c3', '#2e7d32', '#8d6e00']
     # Draw alternatives first so the best candidate stays on top.
-    for q, color in [(original, '#087f8c'), *reversed(list(zip(candidate, colors)))]:
+    for q, color in [(original, '#087f8c'), *reversed(list(zip(candidate, ROUTE_COLORS)))]:
         line = [(float((c+.5)*sx),float((r+.5)*sy)) for r,c in q]
         draw.line(line, fill='white', width=7)
         draw.line(line, fill=color, width=4)
@@ -544,6 +545,162 @@ def draw_map(terrain, original, candidate, output, legend='Teal: recorded | Oran
     draw.text((10,31),legend,font=font,fill='#162b32')
     draw.text((10,image.height+82),'Map: Kartverket CC BY 4.0',font=font,fill='#162b32')
     canvas.save(output)
+
+
+def route_profile(terrain, q, limit, sx, sy):
+    """5 m samples with elevation, forward 50 m angle and NVE flags, in map-image pixels."""
+    positions, dense = resample(q, 5, terrain.gs)
+    height = terrain.sample(dense)
+    ij = np.rint(dense).astype(int)
+    full = positions <= positions[-1] - 50
+    ahead = np.interp(positions + 50, positions, height)
+    angle = np.where(full, np.degrees(np.arctan((ahead - height) / 50)), np.nan)
+    return {'d': np.round(positions, 1).tolist(), 'z': np.round(height, 1).tolist(),
+            'a': [None if not np.isfinite(v) else round(float(v), 2) for v in angle],
+            'over': (full & (angle > limit)).astype(int).tolist(),
+            'steep': terrain.steep[ij[:, 0], ij[:, 1]].astype(int).tolist(),
+            'runout': terrain.runout[ij[:, 0], ij[:, 1]].astype(int).tolist(),
+            'x': np.round((dense[:, 1] + .5) * sx, 1).tolist(), 'y': np.round((dense[:, 0] + .5) * sy, 1).tolist()}
+
+
+def png_data_url(image, kind='PNG'):
+    buffer = io.BytesIO()
+    image.save(buffer, kind, optimize=True) if kind == 'PNG' else image.save(buffer, kind, quality=85)
+    return f'data:image/{kind.lower()};base64,' + base64.b64encode(buffer.getvalue()).decode()
+
+
+def write_html(args, terrain, report, baseline, baseline_label, found, output):
+    """Self-contained interactive map: no network access, no external scripts."""
+    with Image.open(terrain.cache / 'topo.png') as source:
+        topo = source.convert('RGB')
+    topo.thumbnail((1400, 1800))
+    sx, sy = topo.width / terrain.w, topo.height / terrain.h
+    hazard = np.zeros((terrain.h, terrain.w, 4), np.uint8)
+    hazard[terrain.runout] = [40, 90, 220, 110]
+    hazard[terrain.steep] = [220, 30, 30, 140]
+    hazard = Image.fromarray(hazard).resize(topo.size, Image.NEAREST)
+    routes = [{'label': baseline_label, 'color': '#087f8c', **route_profile(terrain, baseline, args.max_uphill_deg, sx, sy)}]
+    for number, (q, _) in enumerate(found, 1):
+        label = 'Candidate (best cost)' if number == 1 else f'Alternative {number}'
+        routes.append({'label': label, 'color': ROUTE_COLORS[number - 1],
+                       **route_profile(terrain, q, args.max_uphill_deg, sx, sy)})
+    areas = [[[round(float((c + .5) * sx), 1), round(float((r + .5) * sy), 1)] for r, c in terrain.rc(ring)]
+             for areas in getattr(args, 'areas', []) for ring in areas]
+    data = {'width': topo.width, 'height': topo.height, 'limit': args.max_uphill_deg, 'routes': routes,
+            'areas': areas, 'disclaimer': DISCLAIMER, 'status': report['status']}
+    page = (MAP_HTML.replace('__TOPO__', png_data_url(topo, 'JPEG')).replace('__HAZARD__', png_data_url(hazard))
+            .replace('__DATA__', json.dumps(data, allow_nan=False).replace('</', '<\\/')))
+    output.write_text(page, encoding='utf-8')
+
+
+MAP_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ascent candidates</title>
+<style>
+:root{--bg:#fff;--fg:#162b32;--muted:#5b6b70;--line:#d7dee0;--warn:#b00020}
+@media (prefers-color-scheme:dark){:root{--bg:#121719;--fg:#e4ecee;--muted:#9aa9ad;--line:#2d383b;--warn:#ff6b7f}}
+body{margin:0;font:14px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+header{padding:12px 16px;border-bottom:1px solid var(--line)}
+header h1{font-size:17px;margin:0 0 4px}
+.warn{color:var(--warn);font-weight:600}
+main{display:grid;grid-template-columns:minmax(0,3fr) minmax(300px,2fr);gap:16px;padding:16px}
+@media (max-width:900px){main{grid-template-columns:1fr}}
+#viewport{overflow:auto;border:1px solid var(--line);max-height:78vh;background:#eee}
+#stage{position:relative;transform-origin:0 0}
+#stage img,#stage svg{position:absolute;left:0;top:0;width:100%;height:100%}
+.tools{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+button{font:inherit;padding:2px 10px}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+td,th{padding:4px 6px;border-bottom:1px solid var(--line);text-align:right}
+td:first-child,th:first-child{text-align:left}
+tr.sel{outline:2px solid var(--fg)}
+.swatch{display:inline-block;width:12px;height:12px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+#profile{width:100%;height:220px;display:block}
+#readout{min-height:2.8em;color:var(--muted)}
+.key span{margin-right:12px}
+</style></head><body>
+<header><h1>Ascent candidates <span class="warn">UNVERIFIED</span></h1><div id="disclaimer"></div></header>
+<main>
+<section>
+ <div class="tools">
+  <button id="zin">Zoom +</button><button id="zout">Zoom −</button>
+  <label><input type="checkbox" id="haz" checked> NVE steep (red) and runout (blue)</label>
+ </div>
+ <div id="viewport"><div id="stage">
+  <img src="__TOPO__" alt="Topographic map, Kartverket"><img id="hazimg" src="__HAZARD__" alt="" style="image-rendering:pixelated">
+  <svg id="map"></svg></div></div>
+ <div style="color:var(--muted)">Map: Kartverket CC BY 4.0. Hazard layer: NVE, NLOD. Unmarked terrain is not safety clearance.</div>
+</section>
+<section>
+ <table id="table"><thead><tr><th>Route</th><th>km</th><th>Ascent m</th><th>Max 50 m°</th><th>Over limit m</th><th>Steep m</th><th>Runout m</th></tr></thead><tbody></tbody></table>
+ <p style="color:var(--muted)">Click a row to show its elevation profile and violations. Shaded profile bands:
+ <span class="key"><span><i class="swatch" style="background:#e53935"></i>50 m angle over limit</span>
+ <span><i class="swatch" style="background:#6d1b1b"></i>NVE steep</span><span><i class="swatch" style="background:#2b6cd8"></i>NVE runout</span></span></p>
+ <svg id="profile"></svg>
+ <div id="readout">Move over the profile to locate a point on the map.</div>
+</section>
+</main>
+<script>
+const D = __DATA__;
+const NS = 'http://www.w3.org/2000/svg';
+const el = (n, a, p) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); if (p) p.appendChild(e); return e; };
+document.getElementById('disclaimer').textContent = D.disclaimer;
+const stage = document.getElementById('stage'), map = document.getElementById('map');
+map.setAttribute('viewBox', `0 0 ${D.width} ${D.height}`);
+let zoom = (document.getElementById('viewport').clientWidth || D.width) / D.width;  // fit width
+const setZoom = z => { zoom = Math.max(.2, Math.min(6, z)); stage.style.width = D.width * zoom + 'px'; stage.style.height = D.height * zoom + 'px'; };
+setZoom(zoom);
+document.getElementById('zin').onclick = () => setZoom(zoom * 1.4);
+document.getElementById('zout').onclick = () => setZoom(zoom / 1.4);
+document.getElementById('haz').onchange = e => document.getElementById('hazimg').style.display = e.target.checked ? '' : 'none';
+for (const a of D.areas) el('polygon', {points: a.map(p => p.join(',')).join(' '), fill: 'rgba(0,0,0,.25)', stroke: '#000', 'stroke-dasharray': '4 3', 'vector-effect': 'non-scaling-stroke'}, map);
+const lines = D.routes.map((r, i) => {
+  const pts = r.x.map((x, k) => x + ',' + r.y[k]).join(' ');
+  const g = el('g', {}, map);
+  el('polyline', {points: pts, fill: 'none', stroke: '#fff', 'stroke-width': 6, 'vector-effect': 'non-scaling-stroke'}, g);
+  const line = el('polyline', {points: pts, fill: 'none', stroke: r.color, 'stroke-width': 3, 'vector-effect': 'non-scaling-stroke'}, g);
+  r.x.forEach((x, k) => { if (r.over[k] && k + 1 < r.x.length) el('line', {x1: x, y1: r.y[k], x2: r.x[k+1], y2: r.y[k+1], stroke: '#e53935', 'stroke-width': 3, 'vector-effect': 'non-scaling-stroke'}, g); });
+  return g;
+});
+const marker = el('circle', {r: 7, fill: 'none', stroke: '#000', 'stroke-width': 3, 'vector-effect': 'non-scaling-stroke', visibility: 'hidden'}, map);
+const sum = (r, key) => r.d.slice(1).reduce((s, d, k) => s + (r[key][k] ? d - r.d[k] : 0), 0);
+const tbody = document.querySelector('#table tbody');
+const rows = D.routes.map((r, i) => {
+  const asc = r.z.slice(1).reduce((s, z, k) => s + Math.max(0, z - r.z[k]), 0);
+  const maxA = Math.max(...r.a.filter(a => a !== null));
+  const tr = tbody.insertRow();
+  const cells = [r.label, (r.d[r.d.length-1] / 1000).toFixed(2), asc.toFixed(0), isFinite(maxA) ? maxA.toFixed(1) : '–', sum(r, 'over').toFixed(0), sum(r, 'steep').toFixed(0), sum(r, 'runout').toFixed(0)];
+  cells.forEach((c, k) => { const td = tr.insertCell(); if (!k) { const s = document.createElement('i'); s.className = 'swatch'; s.style.background = r.color; td.appendChild(s); } td.appendChild(document.createTextNode(c)); });
+  tr.style.cursor = 'pointer'; tr.onclick = () => select(i);
+  return tr;
+});
+const prof = document.getElementById('profile'), readout = document.getElementById('readout');
+function select(i) {
+  rows.forEach((tr, k) => tr.classList.toggle('sel', k === i));
+  lines.forEach((g, k) => { g.style.opacity = k === i ? 1 : .45; if (k === i) map.insertBefore(g, marker); });
+  const r = D.routes[i], W = prof.clientWidth || 400, H = 220, L = 44, B = 24, T = 8;
+  prof.setAttribute('viewBox', `0 0 ${W} ${H}`); prof.innerHTML = '';
+  const dmax = r.d[r.d.length-1], zmin = Math.min(...r.z), zmax = Math.max(...r.z) + 1;
+  const X = d => L + (W - L - 8) * d / dmax, Y = z => T + (H - T - B) * (1 - (z - zmin) / (zmax - zmin));
+  [['over', '#e53935', 0], ['steep', '#6d1b1b', 1], ['runout', '#2b6cd8', 2]].forEach(([key, color, lane]) => r.d.forEach((d, k) => {
+    if (r[key][k] && k + 1 < r.d.length) el('rect', {x: X(d), width: Math.max(1, X(r.d[k+1]) - X(d)), y: H - B + 2 + lane * 6 - 22, height: 5, fill: color}, prof);
+  }));
+  for (let t = 0; t <= 4; t++) { const z = zmin + (zmax - zmin) * t / 4; el('line', {x1: L, x2: W - 8, y1: Y(z), y2: Y(z), stroke: 'currentColor', opacity: .12}, prof); el('text', {x: L - 4, y: Y(z) + 4, 'text-anchor': 'end', 'font-size': 11, fill: 'currentColor'}, prof).textContent = z.toFixed(0); }
+  el('text', {x: W - 8, y: H - 4, 'text-anchor': 'end', 'font-size': 11, fill: 'currentColor'}, prof).textContent = (dmax / 1000).toFixed(2) + ' km';
+  el('polyline', {points: r.d.map((d, k) => X(d) + ',' + Y(r.z[k])).join(' '), fill: 'none', stroke: r.color, 'stroke-width': 2}, prof);
+  const cursor = el('line', {y1: T, y2: H - B, stroke: 'currentColor', visibility: 'hidden'}, prof);
+  prof.onmousemove = e => {
+    const box = prof.getBoundingClientRect(), d = (e.clientX - box.left) * W / box.width;
+    let k = r.d.findIndex(v => X(v) >= d); if (k < 0) k = r.d.length - 1;
+    cursor.setAttribute('x1', X(r.d[k])); cursor.setAttribute('x2', X(r.d[k])); cursor.setAttribute('visibility', 'visible');
+    marker.setAttribute('cx', r.x[k]); marker.setAttribute('cy', r.y[k]); marker.setAttribute('visibility', 'visible');
+    const flags = [r.over[k] && `over ${D.limit}° limit`, r.steep[k] && 'NVE steep', r.runout[k] && 'NVE runout'].filter(Boolean).join(', ');
+    readout.textContent = `${r.label}: ${(r.d[k] / 1000).toFixed(2)} km, ${r.z[k].toFixed(0)} m, next 50 m ${r.a[k] === null ? 'n/a' : r.a[k].toFixed(1) + '°'}${flags ? ' — ' + flags : ''}`;
+  };
+}
+select(D.routes.length > 1 ? 1 : 0);
+</script></body></html>
+"""
 
 
 def optimize(args):
@@ -627,6 +784,8 @@ def write_candidates(args, terrain, report, found, baseline, baseline_key, legen
         else:
             log('No distinct alternative met the same constraints; see search.alternative_notes.')
     draw_map(terrain,baseline,[q for q,_ in found],args.out/'comparison.png',legend)
+    if args.html:
+        write_html(args, terrain, report, baseline, 'Recorded ascent' if baseline_key == 'original' else 'Straight reference line', found, args.out/'map.html')
     (args.out/'report.json').write_text(json.dumps(report,indent=2,allow_nan=False))
     summary = {'output':str(args.out.resolve()), baseline_key:report[baseline_key], 'candidate':report['candidate']}
     if 'alternatives' in report:
@@ -695,6 +854,7 @@ def parser():
     opt.add_argument('--cache',type=Path,required=True,help='Area-specific terrain cache; existing cache controls grid/resolution')
     opt.add_argument('--avoid',type=Path,action='append',metavar='GEOJSON',help='GeoJSON Polygon/MultiPolygon areas to exclude; repeatable')
     opt.add_argument('--alternatives',type=int,default=1,choices=range(1,6),metavar='N',help='Also search for up to N-1 distinct alternatives (1-5) under the same constraints')
+    opt.add_argument('--html',action='store_true',help='Also write map.html: interactive map, elevation profiles and highlighted limit violations')
     opt.add_argument('--offline',action='store_true',help='Require an existing terrain cache; make no downloads')
     opt.add_argument('--goal',choices=['highest','last'],help='End at the highest GPX elevation or the final point (GPX only; default: highest)')
     opt.add_argument('--start',type=latlon,metavar='LAT,LON',help='Plan without a GPX: exact start point')
