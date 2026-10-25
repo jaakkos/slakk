@@ -97,6 +97,51 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(call.call_args.args[1],'test-token')
         self.assertNotIn('test-token',call.call_args.args[0])
 
+    def test_waypoint_forces_route_through_it(self):
+        reference = np.array([[7.,20.],[32.,20.]])
+        via = np.array([[20.,8.3]])
+        q, info = cli.solve(self.terrain(),reference,self.args(),via)
+        self.assertEqual(info['waypoints'],1)
+        self.assertTrue((q == via[0]).all(axis=1).any(), 'exact waypoint missing from candidate')
+        np.testing.assert_array_equal(q[[0,-1]],reference)
+
+    def test_masked_waypoint_is_rejected_not_skipped(self):
+        colors = np.zeros((40,40,4),np.uint8)
+        colors[8,20] = [255,255,0,255]
+        with self.assertRaisesRegex(cli.NoRoute,'Waypoint 1'):
+            cli.solve(self.terrain(colors),np.array([[7.,20.],[32.,20.]]),self.args(),np.array([[8.,20.]]))
+
+    def test_unreachable_waypoint_reports_which_leg(self):
+        colors = np.zeros((40,40,4),np.uint8)
+        colors[12,:] = [255,255,0,255]
+        with self.assertRaisesRegex(cli.NoRoute,'waypoint 1'):
+            cli.solve(self.terrain(colors),np.array([[20.,5.],[20.,35.]]),self.args(),np.array([[6.,20.]]))
+
+    def test_coordinate_mode_without_gpx(self):
+        terrain = self.terrain()
+        (start,), (via,), (end,) = (terrain.lonlat(np.array([p])) for p in ([8.,8.],[20.,25.],[32.,10.]))
+        fmt = lambda p: f'{p[1]:.9f},{p[0]:.9f}'
+        out = self.root/'out'
+        code = cli.main(['optimize','--start',fmt(start),'--end',fmt(end),'--via',fmt(via),
+                         '--cache',str(self.root),'--out',str(out),'--offline','--corridor-m','500'])
+        self.assertEqual(code,0)
+        report = json.loads((out/'report.json').read_text())
+        self.assertEqual((report['mode'],report['search']['waypoints']),('coordinates',1))
+        self.assertTrue((out/'candidate-DRAFT.gpx').exists())
+        self.assertFalse((out/'recorded-ascent.gpx').exists())
+        q = cli.read_gpx(out/'candidate-DRAFT.gpx')
+        np.testing.assert_allclose(q[[0,-1],:2],[start,end],atol=1e-7)
+
+    def test_gpx_and_coordinates_cannot_be_mixed(self):
+        path = self.root/'input.gpx'
+        cli.write_gpx(path,self.terrain().lonlat(np.array([[7,20],[32,20]])),[100,100],'test','test')
+        code = cli.main(['optimize',str(path),'--start','0.001,0.001','--end','0.002,0.002',
+                         '--cache',str(self.root),'--out',str(self.root/'out'),'--offline'])
+        self.assertEqual(code,2)
+
+    def test_bad_coordinate_text_is_a_usage_error(self):
+        with self.assertRaises(SystemExit):
+            cli.parser().parse_args(['optimize','--start','61.2','--end','61,7','--out','o','--cache','c'])
 
 if __name__ == '__main__':
     unittest.main()

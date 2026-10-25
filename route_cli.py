@@ -312,7 +312,51 @@ def edge_options(terrain, blocked, args):
         yield dr, dc, length, allowed
 
 
-def solve(terrain, reference, args):
+def search(terrain, transitions, nearest, runout, args, start, goal):
+    """A* between two cells; returns the cell path, visited count and cost."""
+    costs = np.full(terrain.z.shape, np.inf)
+    previous = np.full(terrain.z.shape, -1, np.int32)
+    costs[start] = 0
+    heap = [(math.hypot(start[0]-goal[0], start[1]-goal[1])*terrain.gs, 0., *start)]
+    visited = 0
+    while heap:
+        _, cost, r, c = heapq.heappop(heap)
+        if cost > costs[r, c] + 1e-9:
+            continue
+        visited += 1
+        if (r, c) == goal:
+            break
+        for dr, dc, length, allowed in transitions:
+            if not allowed[r, c]:
+                continue
+            nr, nc = r + dr, c + dc
+            grade = float(terrain.z[nr, nc] - terrain.z[r, c]) / length
+            weight = 1 + 6 * max(0, grade-.12)**2 + 10 * max(0, -grade) + nearest[nr, nc] / args.corridor_m
+            if args.runout == 'penalize' and runout[nr, nc]:
+                weight += args.runout_cost
+            value = cost + length * weight
+            if value < costs[nr, nc]:
+                costs[nr, nc] = value
+                previous[nr, nc] = r * terrain.w + c
+                heuristic = math.hypot(nr-goal[0], nc-goal[1]) * terrain.gs
+                heapq.heappush(heap, (value + heuristic, value, nr, nc))
+    if not np.isfinite(costs[goal]):
+        return None, visited, math.inf
+    route, at = [goal], goal
+    while at != start:
+        at = divmod(int(previous[at]), terrain.w)
+        route.append(at)
+    route = np.asarray(route[::-1], float)
+    # Remove only exactly collinear vertices; never shortcut across masked terrain.
+    if len(route) > 2:
+        v = np.diff(route, axis=0)
+        bends = v[:-1,0]*v[1:,1] - v[:-1,1]*v[1:,0]
+        route = route[np.r_[True, (bends != 0) | ((v[:-1]*v[1:]).sum(axis=1) <= 0), True]]
+    return route, visited, float(costs[goal])
+
+
+def solve(terrain, reference, args, waypoints=()):
+    """Route from the end of the preserved approach through each waypoint, in order, to the goal."""
     distance = cumulative(reference, terrain.gs)
     keep = int(np.searchsorted(distance, args.keep_first_m))
     if keep >= len(reference) - 1:
@@ -342,57 +386,35 @@ def solve(terrain, reference, args):
     blocked[:, :3] = blocked[:, -3:] = True
     if blocked[start] or blocked[goal]:
         raise NoRoute('A search endpoint is masked by a constraint. Inspect it; constraints were not relaxed.')
+    stops = [tuple(np.rint(w).astype(int)) for w in waypoints]
+    for number, cell in enumerate(stops, 1):
+        if blocked[cell]:
+            raise NoRoute(f'Waypoint {number} is masked by a constraint or lies outside the corridor. Constraints were not relaxed.')
     transitions = list(edge_options(terrain, blocked, args))
-    costs = np.full(terrain.z.shape, np.inf)
-    previous = np.full(terrain.z.shape, -1, np.int32)
-    costs[start] = 0
-    heap = [(math.hypot(start[0]-goal[0], start[1]-goal[1])*terrain.gs, 0., *start)]
-    visited = 0
-    while heap:
-        _, cost, r, c = heapq.heappop(heap)
-        if cost > costs[r, c] + 1e-9:
-            continue
-        visited += 1
-        if (r, c) == goal:
-            break
-        for dr, dc, length, allowed in transitions:
-            if not allowed[r, c]:
-                continue
-            nr, nc = r + dr, c + dc
-            grade = float(terrain.z[nr, nc] - terrain.z[r, c]) / length
-            weight = 1 + 6 * max(0, grade-.12)**2 + 10 * max(0, -grade) + nearest[nr, nc] / args.corridor_m
-            if args.runout == 'penalize' and runout[nr, nc]:
-                weight += args.runout_cost
-            value = cost + length * weight
-            if value < costs[nr, nc]:
-                costs[nr, nc] = value
-                previous[nr, nc] = r * terrain.w + c
-                heuristic = math.hypot(nr-goal[0], nc-goal[1]) * terrain.gs
-                heapq.heappush(heap, (value + heuristic, value, nr, nc))
-    if not np.isfinite(costs[goal]):
-        raise NoRoute(f'No feasible path in this grid/corridor after {visited} nodes. Constraints were not relaxed.')
-    route, at = [goal], goal
-    while at != start:
-        at = divmod(int(previous[at]), terrain.w)
-        route.append(at)
-    route = np.asarray(route[::-1], float)
-    # Remove only exactly collinear vertices; never shortcut across masked terrain.
-    if len(route) > 2:
-        v = np.diff(route, axis=0)
-        bends = v[:-1,0]*v[1:,1] - v[:-1,1]*v[1:,0]
-        route = route[np.r_[True, (bends != 0) | ((v[:-1]*v[1:]).sum(axis=1) <= 0), True]]
+    route, at, visited, total = [start], start, 0, 0.
+    for number, (target, exact) in enumerate(zip(stops + [goal], [*waypoints, None]), 1):
+        leg, count, cost = search(terrain, transitions, nearest, runout, args, at, target)
+        visited += count
+        if leg is None:
+            where = f'waypoint {number}' if exact is not None else 'the goal'
+            raise NoRoute(f'No feasible path to {where} in this grid/corridor after {visited} nodes. Constraints were not relaxed.')
+        if exact is not None:
+            leg[-1] = exact  # pass through the exact waypoint, not just its cell
+        route.extend(leg[1:])
+        at, total = target, total + cost
+    route = np.asarray(route, float)
     candidate = np.vstack([reference[:keep+1], route, reference[-1]])
     candidate = candidate[np.r_[True, np.linalg.norm(np.diff(candidate,axis=0),axis=1) > 1e-8]]
     # Full candidate validation includes the preserved approach and endpoint connectors.
     positions, dense = resample(candidate, min(1, terrain.gs/4), terrain.gs)
     ij = np.rint(dense).astype(int)
     if blocked[ij[:,0], ij[:,1]].any():
-        raise NoRoute('The preserved approach or an endpoint connector violates a hard constraint. No GPX emitted.')
+        raise NoRoute('The preserved approach, a waypoint join or an endpoint connector violates a hard constraint. No GPX emitted.')
     heights = terrain.sample(dense)
     angles = np.degrees(np.arctan(np.diff(heights)/np.diff(positions)))
     if angles.max() > args.max_uphill_deg + .15 or angles.min() < -args.max_downhill_deg - .15:
-        raise NoRoute('Dense validation found a short section exceeding the slope limits (possibly an endpoint connector or preserved approach). No GPX emitted.')
-    return candidate, {'visited_nodes': visited, 'cost': float(costs[goal]), 'preserved_m': float(distance[keep]),
+        raise NoRoute('Dense validation found a short section exceeding the slope limits (possibly a connector, waypoint join or preserved approach). No GPX emitted.')
+    return candidate, {'visited_nodes': visited, 'cost': total, 'preserved_m': float(distance[keep]), 'waypoints': len(stops),
                        'max_sampled_uphill_deg': float(angles.max()), 'validation_spacing_m': min(1, terrain.gs/4)}
 
 
@@ -413,7 +435,7 @@ def metrics(terrain, q):
     return stats
 
 
-def draw_map(terrain, original, candidate, output):
+def draw_map(terrain, original, candidate, output, legend='Teal: recorded | Orange: candidate'):
     with Image.open(terrain.cache / 'topo.png') as source:
         image = source.convert('RGB')
     image.thumbnail((1400, 1800))
@@ -428,7 +450,7 @@ def draw_map(terrain, original, candidate, output):
     draw = ImageDraw.Draw(canvas)
     font = ImageFont.load_default(size=16)
     draw.text((10,8),'UNVERIFIED ascent draft',font=font,fill='#162b32')
-    draw.text((10,31),'Teal: recorded | Orange: candidate',font=font,fill='#162b32')
+    draw.text((10,31),legend,font=font,fill='#162b32')
     draw.text((10,image.height+82),'Map: Kartverket CC BY 4.0',font=font,fill='#162b32')
     canvas.save(output)
 
@@ -444,6 +466,16 @@ def optimize(args):
         raise ValueError('Invalid angle limit.')
     if min(args.keep_first_m,args.steep_buffer_m,args.runout_buffer_m,args.runout_cost,args.side_tolerance_m) < 0:
         raise ValueError('Distances, buffers and cost must be nonnegative.')
+    if args.input and (args.start or args.end):
+        raise ValueError('Give either a recorded GPX or --start and --end, not both.')
+    if not args.input and not (args.start and args.end):
+        raise ValueError('Give a recorded GPX, or both --start and --end.')
+    if not args.input and (args.goal or args.keep_first_m):
+        raise ValueError('--goal and --keep-first-m need a recorded GPX.')
+    vias = np.array([[lon, lat, np.nan] for lat, lon in args.via or []]).reshape(-1, 3)
+    if not args.input:
+        return plan_between(args, vias)
+    args.goal = args.goal or 'highest'
     track = read_gpx(args.input)
     if args.goal == 'highest':
         if not np.isfinite(track[:,2]).all():
@@ -454,10 +486,11 @@ def optimize(args):
     else:
         stop = len(track)-1
     selected = track[:stop+1]
-    terrain = get_terrain(selected, args)
+    terrain = get_terrain(np.vstack([selected, vias]), args)
     original = terrain.rc(selected[:,:2])
     terrain.sample(original)
-    report = {'status': 'unverified_candidate', 'disclaimer': DISCLAIMER,
+    terrain.sample(terrain.rc(vias[:,:2]))
+    report = {'status': 'unverified_candidate', 'disclaimer': DISCLAIMER, 'mode': 'gpx',
               'input_sha256': hashlib.sha256(args.input.read_bytes()).hexdigest(),
               'goal_index_zero_based': stop, 'options': {k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items() if k!='handler'},
               'terrain': terrain.grid, 'original': metrics(terrain, original),
@@ -468,13 +501,9 @@ def optimize(args):
                          '50 m route angles are not terrain slope angles. Exposure distance is not a risk score.']}
     log('Searching the terrain grid…')
     try:
-        candidate, search = solve(terrain, original, args)
+        candidate, search = solve(terrain, original, args, terrain.rc(vias[:, :2]))
     except NoRoute as exc:
-        report.update(status='no_feasible_route', reason=str(exc))
-        args.out.mkdir(parents=True,exist_ok=True)
-        (args.out/'report.json').write_text(json.dumps(report,indent=2,allow_nan=False))
-        log(str(exc))
-        return 3
+        return no_route(args, report, exc)
     report.update(candidate=metrics(terrain,candidate), search=search)
     args.out.mkdir(parents=True,exist_ok=True)
     write_gpx(args.out/'candidate-DRAFT.gpx',terrain.lonlat(candidate),terrain.sample(candidate),'UNVERIFIED ascent draft',DISCLAIMER)
@@ -483,6 +512,54 @@ def optimize(args):
     (args.out/'report.json').write_text(json.dumps(report,indent=2,allow_nan=False))
     print(json.dumps({'output':str(args.out.resolve()),'original':report['original'],'candidate':report['candidate']},indent=2))
     return 0
+
+
+def no_route(args, report, exc):
+    report.update(status='no_feasible_route', reason=str(exc))
+    args.out.mkdir(parents=True,exist_ok=True)
+    (args.out/'report.json').write_text(json.dumps(report,indent=2,allow_nan=False))
+    log(str(exc))
+    return 3
+
+
+def plan_between(args, vias):
+    """Coordinate mode: no recorded track; the corridor follows straight lines through the waypoints."""
+    (slat, slon), (elat, elon) = args.start, args.end
+    points = np.vstack([[slon, slat, np.nan], vias, [elon, elat, np.nan]])
+    terrain = get_terrain(points, args)
+    reference = terrain.rc(points[:, :2])
+    terrain.sample(reference)
+    report = {'status': 'unverified_candidate', 'disclaimer': DISCLAIMER, 'mode': 'coordinates',
+              'options': {k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items() if k!='handler'},
+              'terrain': terrain.grid, 'reference_line': metrics(terrain, reference),
+              'limits': ['Norwegian map-service coverage only.', 'NVE transparent pixels may be unmarked or unmapped; they are not safety clearance.',
+                         'No snowpack, live forecast, vegetation, water-crossing or land-access model.',
+                         'NVE classifications are decoded from a version-specific rendered palette; unknown colours fail closed.',
+                         'Constant local Mercator scale approximation; use for local routes only.',
+                         'The corridor follows straight lines between the given points, not a known route.',
+                         '50 m route angles are not terrain slope angles. Exposure distance is not a risk score.']}
+    log('Searching the terrain grid…')
+    try:
+        candidate, search = solve(terrain, np.vstack([reference[0], reference[-1]]), args, reference[1:-1])
+    except NoRoute as exc:
+        return no_route(args, report, exc)
+    report.update(candidate=metrics(terrain,candidate), search=search)
+    args.out.mkdir(parents=True,exist_ok=True)
+    write_gpx(args.out/'candidate-DRAFT.gpx',terrain.lonlat(candidate),terrain.sample(candidate),'UNVERIFIED ascent draft',DISCLAIMER)
+    draw_map(terrain,reference,candidate,args.out/'comparison.png','Teal: straight reference line | Orange: candidate')
+    (args.out/'report.json').write_text(json.dumps(report,indent=2,allow_nan=False))
+    print(json.dumps({'output':str(args.out.resolve()),'reference_line':report['reference_line'],'candidate':report['candidate']},indent=2))
+    return 0
+
+
+def latlon(text):
+    try:
+        lat, lon = (float(v) for v in text.split(','))
+    except ValueError:
+        raise argparse.ArgumentTypeError('use LAT,LON in decimal degrees, e.g. 61.2345,7.6543') from None
+    if not (math.isfinite(lat) and math.isfinite(lon)) or abs(lat) > 80 or abs(lon) > 180:
+        raise argparse.ArgumentTypeError('coordinates out of range')
+    return (lat, lon)
 
 
 def parser():
@@ -497,13 +574,16 @@ def parser():
     fetch.set_defaults(handler=fetch_strava)
     opt = sub.add_parser('optimize',help='Search Norwegian terrain for an unverified ascent candidate',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    opt.add_argument('input',type=Path,help='Recorded GPX with one continuous track segment or one route')
+    opt.add_argument('input',type=Path,nargs='?',help='Recorded GPX with one continuous track segment or one route; omit when using --start/--end')
     opt.add_argument('--out',type=Path,required=True,help='Output directory; must be new or empty')
     opt.add_argument('--cache',type=Path,required=True,help='Area-specific terrain cache; existing cache controls grid/resolution')
     opt.add_argument('--offline',action='store_true',help='Require an existing terrain cache; make no downloads')
-    opt.add_argument('--goal',choices=['highest','last'],default='highest',help='End at the highest GPX elevation or the final point')
+    opt.add_argument('--goal',choices=['highest','last'],help='End at the highest GPX elevation or the final point (GPX only; default: highest)')
+    opt.add_argument('--start',type=latlon,metavar='LAT,LON',help='Plan without a GPX: exact start point')
+    opt.add_argument('--end',type=latlon,metavar='LAT,LON',help='Plan without a GPX: exact destination')
+    opt.add_argument('--via',type=latlon,metavar='LAT,LON',action='append',help='Mandatory waypoint, visited in the order given; repeat for more')
     opt.add_argument('--keep-first-m',type=float,default=0,help='Follow the recorded approach for this distance (m)')
-    opt.add_argument('--corridor-m',type=float,default=600,help='Search distance around the recorded ascent (m)')
+    opt.add_argument('--corridor-m',type=float,default=600,help='Search distance around the recorded ascent, or the straight reference line in coordinate mode (m)')
     opt.add_argument('--resolution-m',type=float,default=6,help='Approximate ground cell size for a new cache (m)')
     opt.add_argument('--side',choices=['any','east','west'],default='any',help='Constrain the route relative to the nearest recorded-route sample')
     opt.add_argument('--side-tolerance-m',type=float,default=20,help='Allowance across the --side boundary (m)')

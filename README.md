@@ -88,6 +88,39 @@ The preserved approach is included in final constraint checks. If that section
 or a connector violates a hard constraint, the CLI declines to emit a GPX.
 Preserving a recorded track does not exempt it from winter-terrain checks.
 
+## Mandatory waypoints
+
+Add `--via LAT,LON` (decimal degrees) to force the candidate through a point,
+such as a known stream crossing or bridge. Repeat it for more points; they are
+visited in the order given. The candidate passes through each exact point.
+
+```sh
+route-cli optimize walk.gpx --out via-draft --cache terrain-cache \
+  --via 61.23456,7.65432 --via 61.24010,7.66120
+```
+
+A waypoint is never skipped or moved. If it lies in masked terrain or outside
+the corridor, or a leg to it has no feasible path, the run ends with exit code
+**3** and a report naming the waypoint or leg.
+
+## Plan without a recorded track
+
+Give `--start` and `--end` instead of a GPX. The corridor then follows straight
+lines from start through each `--via` point to the end, so `--corridor-m` must
+be wide enough to contain a sensible route; a larger corridor means a larger
+download and slower search.
+
+```sh
+route-cli optimize --start 61.2100,7.6000 --end 61.2350,7.6400 \
+  --via 61.2200,7.6250 --out coord-draft --cache area-cache --corridor-m 1200
+```
+
+This writes `candidate-DRAFT.gpx`, `comparison.png` (teal is the straight
+reference line, not a route) and `report.json` with `"mode": "coordinates"` and
+`reference_line` metrics in place of `original`. There is no
+`recorded-ascent.gpx`. `--goal` and `--keep-first-m` need a recorded GPX, and a
+GPX cannot be combined with `--start`/`--end`.
+
 ## Optional: import from Strava
 
 The earlier analysis used the website's GPX export. This CLI instead uses the
@@ -123,6 +156,8 @@ produce an error rather than prompting for credentials.
 - `recorded-ascent.gpx`: original ascent geometry with the same elevation model.
 - `comparison.png`: teal recorded route, orange candidate, Kartverket background.
 - `report.json`: settings, provenance, cache metadata, search outcome and metrics.
+  Since 0.2.0 it also records `mode` (`gpx` or `coordinates`), the `start`,
+  `end` and `via` options, and `search.waypoints`.
 
 Output directories must be empty, so a failed run cannot leave an older GPX
 looking like a new result. The original input is never modified.
@@ -131,7 +166,9 @@ looking like a new result. The original input is never modified.
 
 | Option | Default | Meaning |
 |---|---:|---|
-| `--goal highest\|last` | `highest` | End at the highest GPX elevation or the final point |
+| `--goal highest\|last` | `highest` | End at the highest GPX elevation or the final point (GPX only) |
+| `--start`, `--end` | — | `LAT,LON`; plan without a GPX |
+| `--via` | — | `LAT,LON`; mandatory waypoint, repeatable, visited in order |
 | `--keep-first-m` | `0` | Follow the original approach for this distance |
 | `--corridor-m` | `600` | Search distance around the original ascent |
 | `--resolution-m` | `6` | Approximate ground cell size for a **new** cache |
@@ -206,7 +243,9 @@ python -m unittest -v test_route_cli.py
 
 The tests exercise exact endpoints, steep barriers, non-jumpable elevation
 steps, hazard validation of the preserved approach, unknown map colours,
-disconnected GPX segments, and Strava coordinate conversion with a mocked API.
+disconnected GPX segments, Strava coordinate conversion with a mocked API,
+mandatory waypoints (exact pass-through, masked or unreachable waypoints), and
+coordinate-only planning.
 The optimizer was also run end-to-end on the downloaded activity and cached
 Kartverket/NVE data. Live Strava API authentication was not tested; the original
 GPX download used the browser.
