@@ -387,6 +387,8 @@ def edge_options(terrain, blocked, args):
 
 def search(terrain, transitions, nearest, runout, args, start, goal, extra=None):
     """A* between two cells; returns the cell path, visited count and cost."""
+    if args.turn_cost_m > 0:
+        return search_turns(terrain, transitions, nearest, runout, args, start, goal, extra)
     costs = np.full(terrain.z.shape, np.inf)
     previous = np.full(terrain.z.shape, -1, np.int32)
     costs[start] = 0
@@ -403,13 +405,7 @@ def search(terrain, transitions, nearest, runout, args, start, goal, extra=None)
             if not allowed[r, c]:
                 continue
             nr, nc = r + dr, c + dc
-            grade = float(terrain.z[nr, nc] - terrain.z[r, c]) / length
-            weight = 1 + 6 * max(0, grade-.12)**2 + 10 * max(0, -grade) + nearest[nr, nc] / args.corridor_m
-            if args.runout == 'penalize' and runout[nr, nc]:
-                weight += args.runout_cost
-            if extra is not None:
-                weight += extra[nr, nc]
-            value = cost + length * weight
+            value = cost + length * edge_weight(terrain, nearest, runout, args, extra, r, c, nr, nc, length)
             if value < costs[nr, nc]:
                 costs[nr, nc] = value
                 previous[nr, nc] = r * terrain.w + c
@@ -421,13 +417,67 @@ def search(terrain, transitions, nearest, runout, args, start, goal, extra=None)
     while at != start:
         at = divmod(int(previous[at]), terrain.w)
         route.append(at)
-    route = np.asarray(route[::-1], float)
+    return simplify(np.asarray(route[::-1], float)), visited, float(costs[goal])
+
+
+def edge_weight(terrain, nearest, runout, args, extra, r, c, nr, nc, length):
+    grade = float(terrain.z[nr, nc] - terrain.z[r, c]) / length
+    weight = 1 + 6 * max(0, grade-.12)**2 + 10 * max(0, -grade) + nearest[nr, nc] / args.corridor_m
+    if args.runout == 'penalize' and runout[nr, nc]:
+        weight += args.runout_cost
+    if extra is not None:
+        weight += extra[nr, nc]
+    return weight
+
+
+def simplify(route):
     # Remove only exactly collinear vertices; never shortcut across masked terrain.
     if len(route) > 2:
         v = np.diff(route, axis=0)
         bends = v[:-1,0]*v[1:,1] - v[:-1,1]*v[1:,0]
         route = route[np.r_[True, (bends != 0) | ((v[:-1]*v[1:]).sum(axis=1) <= 0), True]]
-    return route, visited, float(costs[goal])
+    return route
+
+
+def search_turns(terrain, transitions, nearest, runout, args, start, goal, extra=None):
+    """A* over (cell, heading) states. Each heading change costs turn_cost_m * (angle/180)^2,
+    so a sharp reversal costs the full amount and a gradual bend over several edges much less."""
+    headings = [math.atan2(dr, dc) for dr, dc, _, _ in transitions]
+    turn = np.array([[args.turn_cost_m * (abs((a - b + math.pi) % (2*math.pi) - math.pi) / math.pi)**2
+                      for b in headings] for a in headings])
+    costs, previous = {}, {}  # sparse: only states the search reaches
+    heap = [(math.hypot(start[0]-goal[0], start[1]-goal[1])*terrain.gs, 0., start[0], start[1], -1)]
+    visited, end = 0, None
+    while heap:
+        _, cost, r, c, d = heapq.heappop(heap)
+        if d >= 0 and cost > costs[r, c, d]:
+            continue
+        visited += 1
+        if (r, c) == goal:
+            end = (r, c, d)
+            break
+        for k, (dr, dc, length, allowed) in enumerate(transitions):
+            if not allowed[r, c]:
+                continue
+            nr, nc = r + dr, c + dc
+            value = cost + length * edge_weight(terrain, nearest, runout, args, extra, r, c, nr, nc, length)
+            if d >= 0:
+                value += turn[d, k]
+            if value < costs.get((nr, nc, k), math.inf):
+                costs[nr, nc, k] = value
+                previous[nr, nc, k] = (r, c, d)
+                heuristic = math.hypot(nr-goal[0], nc-goal[1]) * terrain.gs
+                heapq.heappush(heap, (value + heuristic, value, nr, nc, k))
+    if end is None:
+        return None, visited, math.inf
+    if end[2] < 0:
+        return np.asarray([start], float), visited, 0.
+    route, state = [], end
+    while state[2] >= 0:
+        route.append(state[:2])
+        state = previous[state]
+    route.append(state[:2])
+    return simplify(np.asarray(route[::-1], float)), visited, float(costs[end])
 
 
 def solve(terrain, reference, args, waypoints=(), avoid=None):
@@ -540,6 +590,16 @@ def route_legs(terrain, reference, keep, distance, start, goal, stops, waypoints
                        'max_sampled_uphill_deg': float(angles.max()), 'validation_spacing_m': min(1, terrain.gs/4)}
 
 
+def kick_turns(dense, gs):
+    """Approximate count of sharp direction reversals: heading over the previous vs next 15 m differs by more than 90 degrees."""
+    if len(dense) < 7:
+        return 0
+    before, after = dense[3:-3] - dense[:-6], dense[6:] - dense[3:-3]
+    cosine = (before * after).sum(axis=1) / np.maximum(np.linalg.norm(before, axis=1) * np.linalg.norm(after, axis=1), 1e-12)
+    sharp = cosine < 0
+    return int(np.count_nonzero(sharp[1:] & ~sharp[:-1]) + (1 if sharp.size and sharp[0] else 0))
+
+
 def metrics(terrain, q):
     positions, dense = resample(q, 5, terrain.gs)
     height = terrain.sample(dense)
@@ -548,7 +608,8 @@ def metrics(terrain, q):
     stats = {'distance_m': round(float(positions[-1]), 1),
              'ascent_m': round(float(np.maximum(np.diff(height), 0).sum()), 1),
              'nve_steep_m': round(float(weights @ terrain.steep[ij[:-1,0],ij[:-1,1]]), 1),
-             'nve_runout_m': round(float(weights @ terrain.runout[ij[:-1,0],ij[:-1,1]]), 1)}
+             'nve_runout_m': round(float(weights @ terrain.runout[ij[:-1,0],ij[:-1,1]]), 1),
+             'kick_turns_approx': kick_turns(dense, terrain.gs)}
     if positions[-1] >= 50:
         start = positions[positions <= positions[-1] - 50]
         change = np.interp(start+50, positions, height)-np.interp(start, positions, height)
@@ -745,7 +806,7 @@ def optimize(args):
         raise ValueError('Use resolution 2–30 m and corridor 20–3000 m.')
     if not 0 < args.max_uphill_deg < 45 or not 0 < args.max_downhill_deg < 45 or not 0 < args.max_terrain_deg < 80:
         raise ValueError('Invalid angle limit.')
-    if min(args.keep_first_m,args.steep_buffer_m,args.runout_buffer_m,args.runout_cost,args.side_tolerance_m) < 0:
+    if min(args.keep_first_m,args.steep_buffer_m,args.runout_buffer_m,args.runout_cost,args.side_tolerance_m,args.turn_cost_m) < 0:
         raise ValueError('Distances, buffers and cost must be nonnegative.')
     if args.input and (args.start or args.end):
         raise ValueError('Give either a recorded GPX or --start and --end, not both.')
@@ -888,6 +949,7 @@ def parser():
     opt.add_argument('--out',type=Path,required=True,help='Output directory; must be new or empty')
     opt.add_argument('--cache',type=Path,required=True,help='Area-specific terrain cache; existing cache controls grid/resolution')
     opt.add_argument('--avoid',type=Path,action='append',metavar='GEOJSON',help='GeoJSON Polygon/MultiPolygon areas to exclude; repeatable')
+    opt.add_argument('--turn-cost-m',type=float,default=0,help='Search cost of a full reversal, in metres of travel; sharper turns cost more (0 = off; slower when on)')
     opt.add_argument('--alternatives',type=int,default=1,choices=range(1,6),metavar='N',help='Also search for up to N-1 distinct alternatives (1-5) under the same constraints')
     opt.add_argument('--html',action='store_true',help='Also write map.html: interactive map, elevation profiles and highlighted limit violations')
     opt.add_argument('--offline',action='store_true',help='Require an existing terrain cache; make no downloads')

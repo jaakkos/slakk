@@ -247,6 +247,17 @@ class RouteTests(unittest.TestCase):
         colors[:,20:] = [255,170,0,255]
         coverage = cli.hazard_coverage(self.terrain(colors,z))
         self.assertEqual(coverage['fraction_near_nve_steep'],1.0)
+    def test_turn_cost_replaces_micro_zigzags_with_long_traverses(self):
+        rows = np.arange(40,dtype=np.float32)[:,None]
+        z = np.repeat(1000 - rows*10*np.tan(np.radians(25)),40,axis=1).astype(np.float32)
+        terrain = self.terrain(z=z)
+        reference = np.array([[36.,20.],[4.,20.]])
+        plain, _ = cli.solve(terrain,reference,self.args('--max-terrain-deg','40'))
+        turned, _ = cli.solve(terrain,reference,self.args('--max-terrain-deg','40','--turn-cost-m','120'))
+        for q in (plain, turned):
+            np.testing.assert_array_equal(q[[0,-1]],reference)
+        dense = lambda q: cli.resample(q,5/10,1)[1]
+        self.assertLess(cli.kick_turns(dense(turned),10),cli.kick_turns(dense(plain),10))
 
 if __name__ == '__main__':
     unittest.main()

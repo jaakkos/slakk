@@ -139,6 +139,22 @@ have a steeper maximum gradient than an alternative; that is the tradeoff to
 read. Fewer than N-1 alternatives can be found; `search.alternative_notes`
 says why.
 
+## Kick turns and zigzags
+
+On slopes steeper than `--max-uphill-deg`, the plain search can climb with a
+long series of one-cell zigzags. They satisfy the gradient limit on paper but
+are not skiable. Every report now includes `kick_turns_approx`, an approximate
+count of places where the heading over the previous 15 m and the next 15 m
+differs by more than 90°.
+
+`--turn-cost-m` makes the search track heading. Each change of direction costs
+`turn-cost-m × (angle / 180°)²` metres of travel, so a full reversal costs the
+whole amount and a gradual bend over several cells much less. On a synthetic
+25° slope with a 15° limit, a value of 120 replaced 128 micro-zigzags with 8
+switchbacks and long traverses, for about 15% more distance. The search is
+several times slower with it on. A turn at a `--via` waypoint is not charged.
+It does not model whether a given kick turn is practical in real terrain.
+
 ## Interactive map
 
 Add `--html` to also write `map.html`, a single self-contained file that opens
@@ -225,6 +241,7 @@ looking like a new result. The original input is never modified.
 | `--avoid` | — | GeoJSON polygon file to exclude, repeatable |
 | `--alternatives N` | `1` | Also search for up to N-1 distinct alternatives |
 | `--html` | off | Also write the interactive `map.html` |
+| `--turn-cost-m` | `0` | Cost of a full reversal in metres; 0 is off |
 | `--keep-first-m` | `0` | Follow the original approach for this distance |
 | `--corridor-m` | `600` | Search distance around the original ascent |
 | `--resolution-m` | `6` | Approximate ground cell size for a **new** cache |
@@ -315,8 +332,8 @@ The tests exercise exact endpoints, steep barriers, non-jumpable elevation
 steps, hazard validation of the preserved approach, unknown map colours,
 disconnected GPX segments, Strava coordinate conversion with a mocked API,
 mandatory waypoints (exact pass-through, masked or unreachable waypoints), and
-coordinate-only planning, GeoJSON exclusion areas, distinct alternatives, the self-contained HTML map, cache checksums, and the
-hazard coverage check.
+coordinate-only planning, GeoJSON exclusion areas, distinct alternatives, the self-contained HTML map, cache checksums, the
+hazard coverage check, and turn costs.
 The optimizer was also run end-to-end on the downloaded activity and cached
 Kartverket/NVE data. Live Strava API authentication was not tested; the original
 GPX download used the browser.
