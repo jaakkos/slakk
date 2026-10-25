@@ -1176,8 +1176,8 @@ def parser():
     opt.add_argument('--runout-buffer-m',type=float,default=10,help='Buffer around NVE runout pixels (m)')
     opt.add_argument('--runout',choices=['avoid','penalize'],default='avoid',help='Exclude mapped runout, or explicitly allow it with a cost')
     opt.add_argument('--landforms',choices=['on','off'],default='on',help='Detect ridges and gullies from the terrain model and use them in the search cost; off reproduces 0.2 routes')
-    opt.add_argument('--gully-cost',type=float,default=1.0,help='Added distance-cost multiplier inside detected gullies')
-    opt.add_argument('--ridge-cost',type=float,default=0.25,help='Added distance-cost multiplier everywhere except detected ridges (prefers ridges)')
+    opt.add_argument('--gully-cost',type=float,default=3.0,help='Added distance-cost multiplier inside detected gullies')
+    opt.add_argument('--ridge-cost',type=float,default=0.5,help='Added distance-cost multiplier everywhere except detected ridges (prefers ridges)')
     opt.add_argument('--runout-cost',type=float,default=12,help='Added distance-cost multiplier inside runout with --runout penalize (not a risk score)')
     opt.set_defaults(handler=optimize)
     return p

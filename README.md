@@ -168,9 +168,9 @@ a cell that far above either surroundings is a **ridge**. Planar slopes are
 neither. Cells whose 60 m window leaves the grid or touches missing elevation
 are unknown and never count as ridge.
 
-The search then adds `--gully-cost` (default 1.0) to the per-metre cost inside
-gullies, and `--ridge-cost` (default 0.25) everywhere that is not a ridge. With
-the defaults a metre in a gully costs about twice a metre on a ridge, before
+The search then adds `--gully-cost` (default 3.0) to the per-metre cost inside
+gullies, and `--ridge-cost` (default 0.5) everywhere that is not a ridge. With
+the defaults a metre in a gully costs about 2.7 times a metre on a ridge, before
 steepness. These are cost terms only: gradient, terrain-slope, NVE, corridor and
 `--avoid` limits stay exactly as strict. The report lists `ridge_m` and
 `gully_m` for every route and the share of grid cells in each class, and
@@ -180,8 +180,14 @@ Limits: the labels describe the shape of the bare-ground model at grid
 resolution. At the default 6 m cells, features narrower than about 12 m (small
 stream banks, narrow ribs) are not detected. A ridge is not safer: cornices,
 wind slab on the lee side and fall exposure are not modelled. A gully label is
-a terrain shape, not an avalanche-risk score. The thresholds were set on
-synthetic terrain and need checking against real tracks.
+a terrain shape, not an avalanche-risk score. On the Troms test track (6 m
+cells, `--keep-first-m 2400 --side east --runout penalize`), these defaults cut
+gully distance from 400 to 190 m and kick turns from 15 to 9, raised ridge
+distance from 350 to 745 m, and made the route 118 m longer. Mapped runout
+distance rose from 600 to 700 m: with `--runout penalize`, ridge-following can
+trade against runout. Check `nve_runout_m` in the report. Lower `--gully-cost`
+and `--ridge-cost` for weaker steering. The thresholds are checked on one real
+area only.
 
 ## Interactive map
 
@@ -299,8 +305,8 @@ looking like a new result. The original input is never modified.
 | `--runout-buffer-m` | `10` | Buffer around modelled runout pixels |
 | `--runout avoid\|penalize` | `avoid` | Exclude runout or explicitly allow it with a cost |
 | `--landforms on\|off` | `on` | Detect ridges and gullies and use them in the search cost; `off` gives 0.2 routes |
-| `--gully-cost` | `1.0` | Added distance-cost multiplier inside detected gullies |
-| `--ridge-cost` | `0.25` | Added distance-cost multiplier everywhere except detected ridges |
+| `--gully-cost` | `3.0` | Added distance-cost multiplier inside detected gullies |
+| `--ridge-cost` | `0.5` | Added distance-cost multiplier everywhere except detected ridges |
 | `--runout-cost` | `12` | Added distance-cost multiplier when runout is permitted |
 | `--offline` | off | Require an existing terrain cache; make no downloads |
 
