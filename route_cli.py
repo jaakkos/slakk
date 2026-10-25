@@ -471,10 +471,6 @@ def dilate(mask, radius):
     return result
 
 
-def shift(a, dr, dc):
-    return np.roll(np.roll(a, -dr, axis=0), -dc, axis=1)
-
-
 def validation_spacing(terrain):
     return min(1, terrain.gs / 4)
 
@@ -529,42 +525,48 @@ def smoothed(terrain, args):
     return limit
 
 
-def edge_height(z, rr, cc):
-    """Bilinear height at offset (rr, cc) cells from every cell."""
+DIRECTIONS = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1),
+              (2,1),(2,-1),(-2,1),(-2,-1),(1,2),(1,-2),(-1,2),(-1,-2)]
+
+
+def edge_height(z, cells, w, rr, cc):
+    """Bilinear height at offset (rr, cc) cells from each of the given flat cell indices."""
     ri, ci = math.floor(rr), math.floor(cc)
     a, b = rr - ri, cc - ci
-    return (shift(z,ri,ci)*(1-a)*(1-b) + shift(z,ri+1,ci)*a*(1-b) + shift(z,ri,ci+1)*(1-a)*b + shift(z,ri+1,ci+1)*a*b)
+    z, at = z.ravel(), cells + ri * w + ci
+    return z[at]*(1-a)*(1-b) + z[at+w]*a*(1-b) + z[at+1]*(1-a)*b + z[at+w+1]*a*b
 
 
-def edge_options(terrain, blocked, args, raw=None):
-    """Precompute traversable edge profiles, including intermediate elevations.
+def edge_options(terrain, blocked, cells, args, raw=None):
+    """Precompute traversable edge profiles, including intermediate elevations, for the unblocked
+    cells (flat indices); blocked cells have no edges, so they are skipped. The grid border is
+    blocked, so every edge sampled from an unblocked cell stays inside the grid.
 
     With raw (the unsmoothed terrain of a --pitch-deg run, where terrain is the smoothed copy), every raw
     sample must also stay within --pitch-deg, and each edge carries the fraction of its raw samples steeper
     than --max-uphill-deg (None otherwise)."""
-    dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1),
-            (2,1),(2,-1),(-2,1),(-2,-1),(1,2),(1,-2),(-1,2),(-1,-2)]
-    for dr, dc in dirs:
+    w, flat = terrain.w, blocked.ravel()
+    for dr, dc in DIRECTIONS:
         length = math.hypot(dr, dc) * terrain.gs
-        allowed = ~blocked.copy()
+        allowed = np.ones(len(cells), bool)
         for r in range(min(0, dr), max(0, dr) + 1):
             for c in range(min(0, dc), max(0, dc) + 1):
-                allowed &= ~shift(blocked, r, c)
+                allowed &= ~flat[cells + r * w + c]
         # Sample at half the final validation spacing, so the search cannot accept an edge
         # whose short steep section the dense validation of the whole route would reject.
         parts = max(4, math.ceil(length / (validation_spacing(terrain) / 2)))
-        previous, over = terrain.z, None
+        previous, over = terrain.z.ravel()[cells], None
         if raw is not None:
-            raw_previous, over = raw.z, np.zeros(terrain.z.shape, np.float32)
+            raw_previous, over = raw.z.ravel()[cells], np.zeros(len(cells), np.float32)
         for fraction in np.arange(1, parts + 1) / parts:
             rr, cc = dr * fraction, dc * fraction
-            height = edge_height(terrain.z, rr, cc)
+            height = edge_height(terrain.z, cells, w, rr, cc)
             grade = (height - previous) / (length / parts)
             allowed &= np.isfinite(grade) & (grade <= math.tan(math.radians(args.max_uphill_deg)))
             allowed &= grade >= -math.tan(math.radians(args.max_downhill_deg))
             previous = height
             if raw is not None:
-                height = edge_height(raw.z, rr, cc)
+                height = edge_height(raw.z, cells, w, rr, cc)
                 grade = (height - raw_previous) / (length / parts)
                 allowed &= np.isfinite(grade) & (abs(grade) <= math.tan(math.radians(args.pitch_deg)))
                 over += grade > math.tan(math.radians(args.max_uphill_deg))
@@ -572,30 +574,36 @@ def edge_options(terrain, blocked, args, raw=None):
         yield dr, dc, length, allowed, None if over is None else over / parts
 
 
-def step_costs(terrain, transitions, nearest, runout, args, extra=None, land=None):
-    """Cost of every allowed edge from each cell, as one array per direction (inf where not allowed).
+def step_costs(terrain, cells, transitions, nearest, runout, args, extra=None, land=None):
+    """Cost of every allowed edge from each unblocked cell: a grid giving each cell's row (-1 when blocked),
+    and a table with one row per cell in cells and one column per direction (inf where not allowed).
     Same arithmetic, in the same order, as evaluating each edge inside the search loop."""
-    steps = []
-    for dr, dc, length, allowed, over in transitions:
-        grade = (shift(terrain.z, dr, dc) - terrain.z) / length
-        weight = 1 + 6 * np.maximum(0, grade-.12)**2 + 10 * np.maximum(0, -grade) + shift(nearest, dr, dc) / args.corridor_m
+    w = terrain.w
+    table = np.empty((len(cells), len(DIRECTIONS)))
+    for k, (dr, dc, length, allowed, over) in enumerate(transitions):
+        to = cells + dr * w + dc
+        grade = (terrain.z.ravel()[to] - terrain.z.ravel()[cells]) / length
+        weight = 1 + 6 * np.maximum(0, grade-.12)**2 + 10 * np.maximum(0, -grade) + nearest.ravel()[to] / args.corridor_m
         if args.runout == 'penalize':
-            weight = np.where(shift(runout, dr, dc), weight + args.runout_cost, weight)
+            weight = np.where(runout.ravel()[to], weight + args.runout_cost, weight)
         if land is not None:
-            weight = weight + shift(land, dr, dc)
+            weight = weight + land.ravel()[to]
         if over is not None:
             weight = weight + args.pitch_cost * over
         if extra is not None:
-            weight += shift(extra, dr, dc)
+            weight += extra.ravel()[to]
         with np.errstate(invalid='ignore'):
-            steps.append((dr, dc, np.where(allowed, length * weight, np.inf)))
-    return steps
+            table[:, k] = np.where(allowed, length * weight, np.inf)
+    row = np.full(terrain.z.shape, -1, np.int32)
+    row.ravel()[cells] = np.arange(len(cells))
+    return row, table, cells
 
 
 def search(terrain, steps, args, start, goal):
     """A* between two cells; returns the cell path, visited count and cost."""
     if args.turn_cost_m > 0:
         return search_turns(terrain, steps, args, start, goal)
+    row, table, _ = steps
     costs = np.full(terrain.z.shape, np.inf)
     previous = np.full(terrain.z.shape, -1, np.int32)
     costs[start] = 0
@@ -608,8 +616,8 @@ def search(terrain, steps, args, start, goal):
         visited += 1
         if (r, c) == goal:
             break
-        for dr, dc, step in steps:
-            edge = step[r, c]
+        # Every cell the search reaches is unblocked: the start is checked, and edges only lead to unblocked cells.
+        for (dr, dc), edge in zip(DIRECTIONS, table[row[r, c]].tolist()):
             if edge == math.inf:
                 continue
             nr, nc = r + dr, c + dc
@@ -640,42 +648,46 @@ def simplify(route):
 def search_turns(terrain, steps, args, start, goal):
     """A* over (cell, heading) states. Each heading change costs turn_cost_m * (angle/180)^2,
     so a sharp reversal costs the full amount and a gradual bend over several edges much less."""
-    headings = [math.atan2(dr, dc) for dr, dc, _ in steps]
+    row, table, cells = steps
+    headings = [math.atan2(dr, dc) for dr, dc in DIRECTIONS]
     turn = np.array([[args.turn_cost_m * (abs((a - b + math.pi) % (2*math.pi) - math.pi) / math.pi)**2
-                      for b in headings] for a in headings])
-    costs, previous = {}, {}  # sparse: only states the search reaches
+                      for b in headings] for a in headings]).tolist()
+    # State number: row of the cell in the cost table * 16 + heading. Previous -1 is the start (no heading yet).
+    n = len(DIRECTIONS)
+    costs, previous = [math.inf] * (len(cells) * n), [-1] * (len(cells) * n)
     heap = [(math.hypot(start[0]-goal[0], start[1]-goal[1])*terrain.gs, 0., start[0], start[1], -1)]
     visited, end = 0, None
     while heap:
         _, cost, r, c, d = heapq.heappop(heap)
-        if d >= 0 and cost > costs[r, c, d]:
+        here = int(row[r, c])
+        if d >= 0 and cost > costs[here * n + d]:
             continue
         visited += 1
         if (r, c) == goal:
-            end = (r, c, d)
+            end = here * n + d if d >= 0 else -1
             break
-        for k, (dr, dc, step) in enumerate(steps):
-            edge = step[r, c]
+        for k, ((dr, dc), edge) in enumerate(zip(DIRECTIONS, table[here].tolist())):
             if edge == math.inf:
                 continue
             nr, nc = r + dr, c + dc
             value = cost + edge
             if d >= 0:
-                value += turn[d, k]
-            if value < costs.get((nr, nc, k), math.inf):
-                costs[nr, nc, k] = value
-                previous[nr, nc, k] = (r, c, d)
+                value += turn[d][k]
+            state = int(row[nr, nc]) * n + k
+            if value < costs[state]:
+                costs[state] = value
+                previous[state] = here * n + d if d >= 0 else -1
                 heuristic = math.hypot(nr-goal[0], nc-goal[1]) * terrain.gs
                 heapq.heappush(heap, (value + heuristic, value, nr, nc, k))
     if end is None:
         return None, visited, math.inf
-    if end[2] < 0:
+    if end < 0:
         return np.asarray([start], float), visited, 0.
     route, state = [], end
-    while state[2] >= 0:
-        route.append(state[:2])
+    while state >= 0:
+        route.append(divmod(int(cells[state // n]), terrain.w))
         state = previous[state]
-    route.append(state[:2])
+    route.append(start)
     return simplify(np.asarray(route[::-1], float)), visited, float(costs[end])
 
 
@@ -732,14 +744,15 @@ def solve_many(terrain, reference, args, waypoints=(), avoid=None, count=1):
     for number, cell in enumerate(stops, 1):
         if blocked[cell]:
             raise NoRoute(f'Waypoint {number} is masked by a constraint or lies outside the corridor. Constraints were not relaxed.')
-    transitions = list(edge_options(limit, blocked, args, terrain if args.pitch_deg else None))
+    usable = np.flatnonzero(~blocked)
+    transitions = list(edge_options(limit, blocked, usable, args, terrain if args.pitch_deg else None))
     land = landform_cost(terrain, args)
     band = max(1, math.ceil(ALTERNATIVE_BAND_M / terrain.gs))
     extra, found, notes = np.zeros(terrain.z.shape), [], []
     for attempt in range(1 if count == 1 else 2 * count):
         try:
             candidate, info = route_legs(terrain, reference, keep, distance, start, goal, stops, waypoints,
-                                         step_costs(terrain, transitions, nearest, runout, args, extra if found else None, land), blocked, args, limit)
+                                         step_costs(terrain, usable, transitions, nearest, runout, args, extra if found else None, land), blocked, args, limit)
             if count == 1:
                 return [(candidate, info)]
         except NoRoute as exc:

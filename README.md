@@ -457,8 +457,22 @@ a window around each sample, and edge costs are precomputed as one array per
 direction with the same arithmetic in the same order. On that grid a search
 went from 9.9 s to 2.9 s with an identical route, cost and node count; routes,
 alternatives and turn-cost searches were checked to be bit-identical with the
-previous version. The precomputed costs use about 8 bytes × 16 directions per
-cell, roughly 190 MB at the 1.5 million-cell limit.
+previous version.
+
+Profiling the 2 m Troms run (4.0 M cells) then showed that 72% of its 86 s
+went to the edge checks, which sampled all 16 directions from every cell of
+the grid, although only 18% of the cells are unblocked. Edge checks and costs
+are now computed only for unblocked cells, and the costs are stored as one row
+of 16 per unblocked cell. The turn-aware search keeps its states in flat lists
+instead of dictionaries. Measured on that track (4-core Linux, Python 3.13):
+the 2 m default went from 86 s and 1.45 GB peak memory to 25 s and 0.64 GB, a
+3 m run from 29 s and 0.67 GB to 10 s and 0.32 GB, and a 3 m
+`--turn-cost-m 60` run from 177 s and 2.0 GB to 82 s and 0.6 GB. On a MacBook
+Pro the 2 m default went from 75 s and 1.54 GB to 32 s and 1.04 GB. Nine runs
+(2 m and 3 m, alternatives, a waypoint, `--runout avoid`, `--pitch-deg 0`,
+`--landforms off`, turn cost, and several no-route cases) gave byte-identical
+GPX, PNG, HTML and report files and the same messages as 0.4.0. The cost table
+uses 8 bytes × 16 directions per unblocked cell, about 95 MB on that track.
 
 ## Checks
 

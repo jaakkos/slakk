@@ -386,6 +386,15 @@ class RouteTests(unittest.TestCase):
             self.assertEqual(call.call_args.kwargs['form']['grant_type'],'refresh_token')
             self.assertEqual(call.call_args.kwargs['form']['refresh_token'],'r1')
             self.assertEqual(json.loads(cli.token_file().read_text())['refresh_token'],'r2')
+    def test_turn_search_without_turn_cost_matches_plain_search(self):
+        # Both searches read the same per-cell edge table; a negligible turn cost must not change the cost.
+        rng = np.random.default_rng(2)
+        z = (100 + np.cumsum(rng.normal(0.4,1.6,(40,40)),axis=1)).astype(np.float32)
+        reference = np.array([[20.,5.],[20.,35.]])
+        _, plain = cli.solve(self.terrain(z=z),reference,self.args('--max-terrain-deg','60'))
+        _, turned = cli.solve(self.terrain(z=z),reference,self.args('--max-terrain-deg','60','--turn-cost-m','1e-9'))
+        self.assertAlmostEqual(turned['cost'],plain['cost'],places=5)
+
     def test_search_and_dense_validation_agree_on_rough_terrain(self):
         # Seed 2 found a route in 0.2.0 that the 1 m validation then rejected (edges were checked at 4 points).
         rng = np.random.default_rng(2)
