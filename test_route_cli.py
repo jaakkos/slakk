@@ -216,6 +216,11 @@ class RouteTests(unittest.TestCase):
         recorded, candidate = data['routes'][:2]
         self.assertTrue(any(recorded['over']))
         self.assertFalse(any(candidate['over']))
+        self.assertTrue(data['landforms'])
+        self.assertIn('Ridge m', page)
+        report = json.loads((out/'report.json').read_text())
+        self.assertTrue(report['landforms']['enabled'])
+        self.assertIn('gully_m', report['candidate'])
     def add_checksums(self):
         grid = json.loads((self.root/'manifest.json').read_text())
         grid['files'] = {n: {'sha256': __import__('hashlib').sha256((self.root/n).read_bytes()).hexdigest()}
@@ -295,6 +300,39 @@ class RouteTests(unittest.TestCase):
         z = (100 + np.cumsum(rng.normal(0.4,1.6,(40,40)),axis=1)).astype(np.float32)
         q, info = cli.solve(self.terrain(z=z),np.array([[20.,5.],[20.,35.]]),self.args('--max-terrain-deg','60'))
         self.assertLessEqual(info['max_sampled_uphill_deg'],15.15)
+
+    def test_landforms_classify_crest_valley_plane_and_edges(self):
+        cols = np.arange(40,dtype=np.float32)
+        ridge = self.terrain(z=np.repeat((300 - abs(cols - 20)*3)[None],40,axis=0))
+        land = cli.landforms(ridge)
+        self.assertTrue((land[10:30,20] == cli.RIDGE).all())
+        self.assertTrue((land[10:30,8:13] == cli.OTHER).all())  # planar flank
+        self.assertTrue((land[:6] == cli.UNKNOWN).all())  # 60 m window leaves the grid
+        self.root = Path(tempfile.mkdtemp(dir=self.temp.name))
+        valley = self.terrain(z=np.repeat((100 + abs(cols - 20)*3)[None],40,axis=0))
+        self.assertTrue((cli.landforms(valley)[10:30,20] == cli.GULLY).all())
+        self.root = Path(tempfile.mkdtemp(dir=self.temp.name))
+        plane = self.terrain(z=np.repeat((100 + cols*2)[None],40,axis=0))
+        self.assertTrue((cli.landforms(plane)[6:-6,6:-6] == cli.OTHER).all())
+
+    def test_search_leaves_a_gully_unless_landforms_are_off(self):
+        rows = np.arange(40,dtype=np.float32)[:,None]
+        z = np.repeat(100 + abs(rows - 20)*1.5,40,axis=1).astype(np.float32)  # V valley, 8.5 degree flanks
+        terrain = self.terrain(z=z)
+        reference = np.array([[20.,5.],[20.,35.]])
+        off, _ = cli.solve(terrain,reference,self.args('--landforms','off'))
+        on, _ = cli.solve(terrain,reference,self.args())
+        cli.landforms(terrain)
+        self.assertGreater(cli.metrics(terrain,off)['gully_m'],250)
+        self.assertLess(cli.metrics(terrain,on)['gully_m'],cli.metrics(terrain,off)['gully_m']/2)
+        for q in (off, on):
+            np.testing.assert_array_equal(q[[0,-1]],reference)
+
+    def test_landform_costs_must_be_nonnegative(self):
+        args = self.args('--gully-cost','-1')
+        args.input, args.start = Path('x.gpx'), None
+        with self.assertRaisesRegex(ValueError,'nonnegative'):
+            cli.optimize(args)
 
 if __name__ == '__main__':
     unittest.main()

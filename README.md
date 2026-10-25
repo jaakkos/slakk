@@ -155,6 +155,34 @@ switchbacks and long traverses, for about 15% more distance. The search is
 several times slower with it on. A turn at a `--via` waypoint is not charged.
 It does not model whether a given kick turn is practical in real terrain.
 
+## Ridges and gullies
+
+Since 0.3.0 the search detects ridges and gullies in the terrain model and uses
+them by default. **This changes routes compared with 0.2.** Use `--landforms off`
+to get the 0.2 routes back exactly.
+
+Each cell's height is compared with the mean height around it (topographic
+position), within about 15 m and about 60 m. A cell more than 1 m below its
+15 m surroundings, or 3 m below its 60 m surroundings, is a **gully**. Otherwise
+a cell that far above either surroundings is a **ridge**. Planar slopes are
+neither. Cells whose 60 m window leaves the grid or touches missing elevation
+are unknown and never count as ridge.
+
+The search then adds `--gully-cost` (default 1.0) to the per-metre cost inside
+gullies, and `--ridge-cost` (default 0.25) everywhere that is not a ridge. With
+the defaults a metre in a gully costs about twice a metre on a ridge, before
+steepness. These are cost terms only: gradient, terrain-slope, NVE, corridor and
+`--avoid` limits stay exactly as strict. The report lists `ridge_m` and
+`gully_m` for every route and the share of grid cells in each class, and
+`map.html` has a ridge and gully layer, table columns and profile bands.
+
+Limits: the labels describe the shape of the bare-ground model at grid
+resolution. At the default 6 m cells, features narrower than about 12 m (small
+stream banks, narrow ribs) are not detected. A ridge is not safer: cornices,
+wind slab on the lee side and fall exposure are not modelled. A gully label is
+a terrain shape, not an avalanche-risk score. The thresholds were set on
+synthetic terrain and need checking against real tracks.
+
 ## Interactive map
 
 Add `--html` to also write `map.html`, a single self-contained file that opens
@@ -270,6 +298,9 @@ looking like a new result. The original input is never modified.
 | `--steep-buffer-m` | `6` | Buffer around NVE steep-slope pixels |
 | `--runout-buffer-m` | `10` | Buffer around modelled runout pixels |
 | `--runout avoid\|penalize` | `avoid` | Exclude runout or explicitly allow it with a cost |
+| `--landforms on\|off` | `on` | Detect ridges and gullies and use them in the search cost; `off` gives 0.2 routes |
+| `--gully-cost` | `1.0` | Added distance-cost multiplier inside detected gullies |
+| `--ridge-cost` | `0.25` | Added distance-cost multiplier everywhere except detected ridges |
 | `--runout-cost` | `12` | Added distance-cost multiplier when runout is permitted |
 | `--offline` | off | Require an existing terrain cache; make no downloads |
 
@@ -313,8 +344,8 @@ not yet been checked against real tracks.
 ## Algorithm and scope
 
 The search uses a 16-neighbour raster graph. Its cost combines distance,
-steepness, small descents, departure from the recorded corridor and optional
-runout penalties. A* uses a straight-line admissible heuristic. Edge profiles
+steepness, small descents, departure from the recorded corridor, ridge and
+gully terms (on by default) and optional runout penalties. A* uses a straight-line admissible heuristic. Edge profiles
 are sampled at half the final validation spacing (0.5 m or finer), so the
 search cannot accept a step that the final check rejects; rectangular cell checks prevent cutting corners
 through excluded areas. Only exactly collinear points are removed after search.
@@ -329,7 +360,7 @@ not a proof of the globally easiest, safest, or physically skiable route.
 This version targets local Norwegian map-service coverage, one continuous GPX
 segment, routes spanning no more than 25 km, and grids up to 1.5 million cells.
 It uses a constant local scale correction with Web Mercator. It does not model
-trees, snow cover, stream banks, ice, turn practicality, land access or a
+trees, snow cover, stream banks narrower than about two cells, ice, turn practicality, land access or a
 travel-date avalanche forecast. NVE transparent pixels can mean unmarked or
 unmapped terrain. Absence of a marking is not safety clearance.
 
@@ -363,7 +394,7 @@ steps, hazard validation of the preserved approach, unknown map colours,
 disconnected GPX segments, Strava coordinate conversion with a mocked API,
 mandatory waypoints (exact pass-through, masked or unreachable waypoints), and
 coordinate-only planning, GeoJSON exclusion areas, distinct alternatives, the self-contained HTML map, cache checksums, the
-hazard coverage check, turn costs, and Strava login and token refresh (mocked).
+hazard coverage check, turn costs, ridge and gully detection and their search cost, and Strava login and token refresh (mocked).
 The optimizer was also run end-to-end on the downloaded activity and cached
 Kartverket/NVE data. Live Strava API authentication was not tested; the original
 GPX download used the browser.

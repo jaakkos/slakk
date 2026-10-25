@@ -22,7 +22,7 @@ if sys.version_info < (3, 11):
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-VERSION = '0.2.0'
+VERSION = '0.3.0'
 
 R = 6378137.0
 DTM = 'https://hoydedata.no/arcgis/rest/services/DTM/ImageServer/exportImage'
@@ -33,7 +33,14 @@ RUNOUT_COLORS = {(0, 77, 168), (76, 155, 255), (154, 177, 230)}
 ALTERNATIVE_BAND_M = 50
 # NVE marks terrain from 30 degrees; check a little above that to tolerate model differences.
 COVERAGE_SLOPE_DEG, COVERAGE_MIN_CELLS, COVERAGE_MIN_AGREEMENT = 33, 50, 0.5
+# Landforms from topographic position (cell height minus the mean height around it), at two scales:
+# small ribs/gullies and main ridges/valleys. A cell is a gully if either scale is clearly below its
+# surroundings, otherwise a ridge if either is clearly above. Thresholds are metres of relief.
+LANDFORM_RADII_M, LANDFORM_RELIEF_M = (15, 60), (1.0, 3.0)
+UNKNOWN, OTHER, RIDGE, GULLY = -1, 0, 1, 2
 ROUTE_COLORS = ['#c44300', '#7b3fa0', '#2b59c3', '#2e7d32', '#8d6e00']
+LANDFORM_LIMIT = ('Ridge and gully labels describe terrain-model shape only, at grid resolution; features narrower than about '
+                  'two cells are not detected. A ridge is not safer: check cornices, wind slab and exposure.')
 DISCLAIMER = ('UNVERIFIED WINTER PLANNING DRAFT. Bare-ground model only; no snow or '
               'forecast assessment. Streams, vegetation, access and turns need field checks. '
               'Mapped or unmodelled avalanche runout may affect the route. '
@@ -462,6 +469,41 @@ def validation_spacing(terrain):
     return min(1, terrain.gs / 4)
 
 
+def window_sum(a, radius):
+    """Sum over the (2*radius+1)-cell square around each cell, via a summed-area table; zero padding outside."""
+    k = 2 * radius + 1
+    s = np.pad(a, radius + 1)[:-1, :-1].cumsum(0).cumsum(1)
+    return s[k:, k:] - s[:-k, k:] - s[k:, :-k] + s[:-k, :-k]
+
+
+def landforms(terrain):
+    """Ridge/gully/other class per cell (cached on the terrain). Cells whose window reaches past the
+    grid edge or touches missing elevation are UNKNOWN: they are never counted as ridge."""
+    if getattr(terrain, 'landform', None) is not None:
+        return terrain.landform
+    valid = (~terrain.invalid).astype(float)
+    z = np.where(terrain.invalid, 0, terrain.z)
+    ridge, gully, known = np.zeros(z.shape, bool), np.zeros(z.shape, bool), ~terrain.invalid
+    for radius_m, relief in zip(LANDFORM_RADII_M, LANDFORM_RELIEF_M):
+        radius = max(1, round(radius_m / terrain.gs))
+        count = window_sum(valid, radius)
+        known &= count == (2 * radius + 1) ** 2
+        tpi = z - window_sum(z, radius) / np.maximum(count, 1)
+        ridge |= tpi > relief
+        gully |= tpi < -relief
+    terrain.landform = np.where(~known, UNKNOWN, np.where(gully, GULLY, np.where(ridge, RIDGE, OTHER))).astype(np.int8)
+    return terrain.landform
+
+
+def landform_cost(terrain, args):
+    """Added per-metre cost by destination cell: gullies cost --gully-cost more, and everything that is
+    not a ridge costs --ridge-cost more. Never negative, so it only adds cost and never relaxes a limit."""
+    if args.landforms == 'off':
+        return None
+    land = landforms(terrain)
+    return args.gully_cost * (land == GULLY) + args.ridge_cost * (land != RIDGE)
+
+
 def edge_options(terrain, blocked, args):
     """Precompute traversable edge profiles, including intermediate elevations."""
     dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1),
@@ -489,7 +531,7 @@ def edge_options(terrain, blocked, args):
         yield dr, dc, length, allowed
 
 
-def step_costs(terrain, transitions, nearest, runout, args, extra=None):
+def step_costs(terrain, transitions, nearest, runout, args, extra=None, land=None):
     """Cost of every allowed edge from each cell, as one array per direction (inf where not allowed).
     Same arithmetic, in the same order, as evaluating each edge inside the search loop."""
     steps = []
@@ -498,6 +540,8 @@ def step_costs(terrain, transitions, nearest, runout, args, extra=None):
         weight = 1 + 6 * np.maximum(0, grade-.12)**2 + 10 * np.maximum(0, -grade) + shift(nearest, dr, dc) / args.corridor_m
         if args.runout == 'penalize':
             weight = np.where(shift(runout, dr, dc), weight + args.runout_cost, weight)
+        if land is not None:
+            weight = weight + shift(land, dr, dc)
         if extra is not None:
             weight += shift(extra, dr, dc)
         with np.errstate(invalid='ignore'):
@@ -643,12 +687,13 @@ def solve_many(terrain, reference, args, waypoints=(), avoid=None, count=1):
         if blocked[cell]:
             raise NoRoute(f'Waypoint {number} is masked by a constraint or lies outside the corridor. Constraints were not relaxed.')
     transitions = list(edge_options(terrain, blocked, args))
+    land = landform_cost(terrain, args)
     band = max(1, math.ceil(ALTERNATIVE_BAND_M / terrain.gs))
     extra, found, notes = np.zeros(terrain.z.shape), [], []
     for attempt in range(1 if count == 1 else 2 * count):
         try:
             candidate, info = route_legs(terrain, reference, keep, distance, start, goal, stops, waypoints,
-                                         step_costs(terrain, transitions, nearest, runout, args, extra if found else None), blocked, args)
+                                         step_costs(terrain, transitions, nearest, runout, args, extra if found else None, land), blocked, args)
             if count == 1:
                 return [(candidate, info)]
         except NoRoute as exc:
@@ -731,6 +776,10 @@ def metrics(terrain, q):
              'nve_steep_m': round(float(weights @ terrain.steep[ij[:-1,0],ij[:-1,1]]), 1),
              'nve_runout_m': round(float(weights @ terrain.runout[ij[:-1,0],ij[:-1,1]]), 1),
              'kick_turns_approx': kick_turns(dense, terrain.gs)}
+    land = getattr(terrain, 'landform', None)
+    if land is not None:
+        cls = land[ij[:-1, 0], ij[:-1, 1]]
+        stats.update(ridge_m=round(float(weights @ (cls == RIDGE)), 1), gully_m=round(float(weights @ (cls == GULLY)), 1))
     if positions[-1] >= 50:
         start = positions[positions <= positions[-1] - 50]
         change = np.interp(start+50, positions, height)-np.interp(start, positions, height)
@@ -763,8 +812,11 @@ def draw_map(terrain, original, candidate, output, legend='Teal: recorded | Oran
 
 
 def route_profile(terrain, q, limit, sx, sy):
-    """5 m samples with elevation, forward 50 m angle and NVE flags, in map-image pixels."""
+    """5 m samples with elevation, forward 50 m angle, NVE and landform flags, in map-image pixels."""
     positions, dense = resample(q, 5, terrain.gs)
+    land = getattr(terrain, 'landform', None)
+    if land is None:
+        land = np.full(terrain.z.shape, UNKNOWN, np.int8)
     height = terrain.sample(dense)
     ij = np.rint(dense).astype(int)
     full = positions <= positions[-1] - 50
@@ -775,6 +827,8 @@ def route_profile(terrain, q, limit, sx, sy):
             'over': (full & (angle > limit)).astype(int).tolist(),
             'steep': terrain.steep[ij[:, 0], ij[:, 1]].astype(int).tolist(),
             'runout': terrain.runout[ij[:, 0], ij[:, 1]].astype(int).tolist(), 'kicks': kick_turns(dense, terrain.gs),
+            'ridge': (land[ij[:, 0], ij[:, 1]] == RIDGE).astype(int).tolist(),
+            'gully': (land[ij[:, 0], ij[:, 1]] == GULLY).astype(int).tolist(),
             'x': np.round((dense[:, 1] + .5) * sx, 1).tolist(), 'y': np.round((dense[:, 0] + .5) * sy, 1).tolist()}
 
 
@@ -794,6 +848,12 @@ def write_html(args, terrain, report, baseline, baseline_label, found, output):
     hazard[terrain.runout] = [40, 90, 220, 110]
     hazard[terrain.steep] = [220, 30, 30, 140]
     hazard = Image.fromarray(hazard).resize(topo.size, Image.NEAREST)
+    shape = np.zeros((terrain.h, terrain.w, 4), np.uint8)
+    land = getattr(terrain, 'landform', None)
+    if land is not None:
+        shape[land == RIDGE] = [230, 150, 0, 120]
+        shape[land == GULLY] = [130, 40, 190, 120]
+    shape = Image.fromarray(shape).resize(topo.size, Image.NEAREST)
     routes = [{'label': baseline_label, 'color': '#087f8c', **route_profile(terrain, baseline, args.max_uphill_deg, sx, sy)}]
     for number, (q, _) in enumerate(found, 1):
         label = 'Candidate (best cost)' if number == 1 else f'Alternative {number}'
@@ -802,8 +862,9 @@ def write_html(args, terrain, report, baseline, baseline_label, found, output):
     areas = [[[round(float((c + .5) * sx), 1), round(float((r + .5) * sy), 1)] for r, c in terrain.rc(ring)]
              for areas in getattr(args, 'areas', []) for ring in areas]
     data = {'width': topo.width, 'height': topo.height, 'limit': args.max_uphill_deg, 'routes': routes,
-            'areas': areas, 'disclaimer': DISCLAIMER, 'status': report['status']}
+            'areas': areas, 'disclaimer': DISCLAIMER, 'status': report['status'], 'landforms': land is not None}
     page = (MAP_HTML.replace('__TOPO__', png_data_url(topo, 'JPEG')).replace('__HAZARD__', png_data_url(hazard))
+            .replace('__LANDFORM__', png_data_url(shape))
             .replace('__DATA__', json.dumps(data, allow_nan=False).replace('</', '<\\/')))
     output.write_text(page, encoding='utf-8')
 
@@ -840,17 +901,19 @@ tr.sel{outline:2px solid var(--fg)}
  <div class="tools">
   <button id="zin">Zoom +</button><button id="zout">Zoom −</button>
   <label><input type="checkbox" id="haz" checked> NVE steep (red) and runout (blue)</label>
+  <label id="landkey"><input type="checkbox" id="land"> Ridges (amber) and gullies (purple)</label>
  </div>
  <div id="viewport"><div id="stage">
-  <img src="__TOPO__" alt="Topographic map, Kartverket"><img id="hazimg" src="__HAZARD__" alt="" style="image-rendering:pixelated">
+  <img src="__TOPO__" alt="Topographic map, Kartverket"><img id="hazimg" src="__HAZARD__" alt="" style="image-rendering:pixelated"><img id="landimg" src="__LANDFORM__" alt="" style="image-rendering:pixelated;display:none">
   <svg id="map"></svg></div></div>
  <div style="color:var(--muted)">Map: Kartverket CC BY 4.0. Hazard layer: NVE, NLOD. Unmarked terrain is not safety clearance.</div>
 </section>
 <section>
- <table id="table"><thead><tr><th>Route</th><th>km</th><th>Ascent m</th><th>Max 50 m°</th><th>Over limit m</th><th>Steep m</th><th>Runout m</th><th>Kick turns</th></tr></thead><tbody></tbody></table>
+ <table id="table"><thead><tr><th>Route</th><th>km</th><th>Ascent m</th><th>Max 50 m°</th><th>Over limit m</th><th>Steep m</th><th>Runout m</th><th>Ridge m</th><th>Gully m</th><th>Kick turns</th></tr></thead><tbody></tbody></table>
  <p style="color:var(--muted)">Click a row to show its elevation profile and violations. Shaded profile bands:
  <span class="key"><span><i class="swatch" style="background:#e53935"></i>50 m angle over limit</span>
- <span><i class="swatch" style="background:#6d1b1b"></i>NVE steep</span><span><i class="swatch" style="background:#2b6cd8"></i>NVE runout</span></span></p>
+ <span><i class="swatch" style="background:#6d1b1b"></i>NVE steep</span><span><i class="swatch" style="background:#2b6cd8"></i>NVE runout</span>
+ <span><i class="swatch" style="background:#e69600"></i>ridge</span><span><i class="swatch" style="background:#8228be"></i>gully</span></span></p>
  <svg id="profile"></svg>
  <div id="readout">Move over the profile to locate a point on the map.</div>
 </section>
@@ -868,6 +931,8 @@ setZoom(zoom);
 document.getElementById('zin').onclick = () => setZoom(zoom * 1.4);
 document.getElementById('zout').onclick = () => setZoom(zoom / 1.4);
 document.getElementById('haz').onchange = e => document.getElementById('hazimg').style.display = e.target.checked ? '' : 'none';
+document.getElementById('land').onchange = e => document.getElementById('landimg').style.display = e.target.checked ? '' : 'none';
+if (!D.landforms) document.getElementById('landkey').style.display = 'none';
 for (const a of D.areas) el('polygon', {points: a.map(p => p.join(',')).join(' '), fill: 'rgba(0,0,0,.25)', stroke: '#000', 'stroke-dasharray': '4 3', 'vector-effect': 'non-scaling-stroke'}, map);
 const lines = D.routes.map((r, i) => {
   const pts = r.x.map((x, k) => x + ',' + r.y[k]).join(' ');
@@ -884,7 +949,7 @@ const rows = D.routes.map((r, i) => {
   const asc = r.z.slice(1).reduce((s, z, k) => s + Math.max(0, z - r.z[k]), 0);
   const maxA = Math.max(...r.a.filter(a => a !== null));
   const tr = tbody.insertRow();
-  const cells = [r.label, (r.d[r.d.length-1] / 1000).toFixed(2), asc.toFixed(0), isFinite(maxA) ? maxA.toFixed(1) : '–', sum(r, 'over').toFixed(0), sum(r, 'steep').toFixed(0), sum(r, 'runout').toFixed(0), r.kicks];
+  const cells = [r.label, (r.d[r.d.length-1] / 1000).toFixed(2), asc.toFixed(0), isFinite(maxA) ? maxA.toFixed(1) : '–', sum(r, 'over').toFixed(0), sum(r, 'steep').toFixed(0), sum(r, 'runout').toFixed(0), D.landforms ? sum(r, 'ridge').toFixed(0) : '–', D.landforms ? sum(r, 'gully').toFixed(0) : '–', r.kicks];
   cells.forEach((c, k) => { const td = tr.insertCell(); if (!k) { const s = document.createElement('i'); s.className = 'swatch'; s.style.background = r.color; td.appendChild(s); } td.appendChild(document.createTextNode(c)); });
   tr.style.cursor = 'pointer'; tr.onclick = () => select(i);
   return tr;
@@ -897,8 +962,8 @@ function select(i) {
   prof.setAttribute('viewBox', `0 0 ${W} ${H}`); prof.innerHTML = '';
   const dmax = r.d[r.d.length-1], zmin = Math.min(...r.z), zmax = Math.max(...r.z) + 1;
   const X = d => L + (W - L - 8) * d / dmax, Y = z => T + (H - T - B) * (1 - (z - zmin) / (zmax - zmin));
-  [['over', '#e53935', 0], ['steep', '#6d1b1b', 1], ['runout', '#2b6cd8', 2]].forEach(([key, color, lane]) => r.d.forEach((d, k) => {
-    if (r[key][k] && k + 1 < r.d.length) el('rect', {x: X(d), width: Math.max(1, X(r.d[k+1]) - X(d)), y: H - B + 2 + lane * 6 - 22, height: 5, fill: color}, prof);
+  [['over', '#e53935', 0], ['steep', '#6d1b1b', 1], ['runout', '#2b6cd8', 2], ['ridge', '#e69600', 3], ['gully', '#8228be', 4]].forEach(([key, color, lane]) => r.d.forEach((d, k) => {
+    if (r[key][k] && k + 1 < r.d.length) el('rect', {x: X(d), width: Math.max(1, X(r.d[k+1]) - X(d)), y: H - B + 2 + lane * 6 - 34, height: 5, fill: color}, prof);
   }));
   for (let t = 0; t <= 4; t++) { const z = zmin + (zmax - zmin) * t / 4; el('line', {x1: L, x2: W - 8, y1: Y(z), y2: Y(z), stroke: 'currentColor', opacity: .12}, prof); el('text', {x: L - 4, y: Y(z) + 4, 'text-anchor': 'end', 'font-size': 11, fill: 'currentColor'}, prof).textContent = z.toFixed(0); }
   el('text', {x: W - 8, y: H - 4, 'text-anchor': 'end', 'font-size': 11, fill: 'currentColor'}, prof).textContent = (dmax / 1000).toFixed(2) + ' km';
@@ -909,7 +974,7 @@ function select(i) {
     let k = r.d.findIndex(v => X(v) >= d); if (k < 0) k = r.d.length - 1;
     cursor.setAttribute('x1', X(r.d[k])); cursor.setAttribute('x2', X(r.d[k])); cursor.setAttribute('visibility', 'visible');
     marker.setAttribute('cx', r.x[k]); marker.setAttribute('cy', r.y[k]); marker.setAttribute('visibility', 'visible');
-    const flags = [r.over[k] && `over ${D.limit}° limit`, r.steep[k] && 'NVE steep', r.runout[k] && 'NVE runout'].filter(Boolean).join(', ');
+    const flags = [r.over[k] && `over ${D.limit}° limit`, r.steep[k] && 'NVE steep', r.runout[k] && 'NVE runout', r.ridge[k] && 'ridge', r.gully[k] && 'gully'].filter(Boolean).join(', ');
     readout.textContent = `${r.label}: ${(r.d[k] / 1000).toFixed(2)} km, ${r.z[k].toFixed(0)} m, next 50 m ${r.a[k] === null ? 'n/a' : r.a[k].toFixed(1) + '°'}${flags ? ' — ' + flags : ''}`;
   };
 }
@@ -927,7 +992,8 @@ def optimize(args):
         raise ValueError('Use resolution 2–30 m and corridor 20–3000 m.')
     if not 0 < args.max_uphill_deg < 45 or not 0 < args.max_downhill_deg < 45 or not 0 < args.max_terrain_deg < 80:
         raise ValueError('Invalid angle limit.')
-    if min(args.keep_first_m,args.steep_buffer_m,args.runout_buffer_m,args.runout_cost,args.side_tolerance_m,args.turn_cost_m) < 0:
+    if min(args.keep_first_m,args.steep_buffer_m,args.runout_buffer_m,args.runout_cost,args.side_tolerance_m,args.turn_cost_m,
+           args.gully_cost,args.ridge_cost) < 0:
         raise ValueError('Distances, buffers and cost must be nonnegative.')
     if args.input and (args.start or args.end):
         raise ValueError('Give either a recorded GPX or --start and --end, not both.')
@@ -952,18 +1018,20 @@ def optimize(args):
     selected = track[:stop+1]
     terrain = get_terrain(np.vstack([selected, vias]), args)
     coverage = hazard_coverage(terrain)
+    land = landform_summary(terrain, args)
     original = terrain.rc(selected[:,:2])
     terrain.sample(original)
     terrain.sample(terrain.rc(vias[:,:2]))
     report = {'status': 'unverified_candidate', 'disclaimer': DISCLAIMER, 'mode': 'gpx',
               'input_sha256': hashlib.sha256(args.input.read_bytes()).hexdigest(),
               'goal_index_zero_based': stop, 'options': options(args), 'avoid_sha256': {str(f): hashlib.sha256(f.read_bytes()).hexdigest() for f in args.avoid or []},
-              'terrain': terrain.grid, 'hazard_coverage': coverage, 'original': metrics(terrain, original),
+              'terrain': terrain.grid, 'hazard_coverage': coverage, 'landforms': land, 'original': metrics(terrain, original),
               'limits': ['Norwegian map-service coverage only.', 'NVE transparent pixels may be unmarked or unmapped; they are not safety clearance.',
                          'No snowpack, live forecast, vegetation, water-crossing or land-access model.',
                          'NVE classifications are decoded from a version-specific rendered palette; unknown colours fail closed.',
                          'Constant local Mercator scale approximation; use for local routes only.',
-                         '50 m route angles are not terrain slope angles. Exposure distance is not a risk score.']}
+                         '50 m route angles are not terrain slope angles. Exposure distance is not a risk score.',
+                         LANDFORM_LIMIT]}
     log('Searching the terrain grid…')
     try:
         found = solve_many(terrain, original, args, terrain.rc(vias[:, :2]), avoid_mask(terrain, args), args.alternatives)
@@ -972,6 +1040,16 @@ def optimize(args):
     args.out.mkdir(parents=True,exist_ok=True)
     write_gpx(args.out/'recorded-ascent.gpx',selected[:,:2],terrain.sample(original),'Recorded ascent','Original ascent geometry; terrain-model elevations. '+DISCLAIMER)
     return write_candidates(args, terrain, report, found, original, 'original', 'Teal: recorded | Orange: candidate')
+
+
+def landform_summary(terrain, args):
+    if args.landforms == 'off':
+        return {'enabled': False}
+    land = landforms(terrain)
+    return {'enabled': True, 'radii_m': list(LANDFORM_RADII_M), 'relief_m': list(LANDFORM_RELIEF_M),
+            'gully_cost': args.gully_cost, 'ridge_cost': args.ridge_cost,
+            'cell_fraction': {name: round(float((land == value).mean()), 3)
+                              for name, value in [('ridge', RIDGE), ('gully', GULLY), ('other', OTHER), ('unknown', UNKNOWN)]}}
 
 
 def options(args):
@@ -1024,17 +1102,19 @@ def plan_between(args, vias):
     points = np.vstack([[slon, slat, np.nan], vias, [elon, elat, np.nan]])
     terrain = get_terrain(points, args)
     coverage = hazard_coverage(terrain)
+    land = landform_summary(terrain, args)
     reference = terrain.rc(points[:, :2])
     terrain.sample(reference)
     report = {'status': 'unverified_candidate', 'disclaimer': DISCLAIMER, 'mode': 'coordinates',
               'options': options(args), 'avoid_sha256': {str(f): hashlib.sha256(f.read_bytes()).hexdigest() for f in args.avoid or []},
-              'terrain': terrain.grid, 'hazard_coverage': coverage, 'reference_line': metrics(terrain, reference),
+              'terrain': terrain.grid, 'hazard_coverage': coverage, 'landforms': land, 'reference_line': metrics(terrain, reference),
               'limits': ['Norwegian map-service coverage only.', 'NVE transparent pixels may be unmarked or unmapped; they are not safety clearance.',
                          'No snowpack, live forecast, vegetation, water-crossing or land-access model.',
                          'NVE classifications are decoded from a version-specific rendered palette; unknown colours fail closed.',
                          'Constant local Mercator scale approximation; use for local routes only.',
                          'The corridor follows straight lines between the given points, not a known route.',
-                         '50 m route angles are not terrain slope angles. Exposure distance is not a risk score.']}
+                         '50 m route angles are not terrain slope angles. Exposure distance is not a risk score.',
+                         LANDFORM_LIMIT]}
     log('Searching the terrain grid…')
     try:
         found = solve_many(terrain, np.vstack([reference[0], reference[-1]]), args, reference[1:-1], avoid_mask(terrain, args), args.alternatives)
@@ -1095,6 +1175,9 @@ def parser():
     opt.add_argument('--steep-buffer-m',type=float,default=6,help='Buffer around NVE steep-slope pixels (m)')
     opt.add_argument('--runout-buffer-m',type=float,default=10,help='Buffer around NVE runout pixels (m)')
     opt.add_argument('--runout',choices=['avoid','penalize'],default='avoid',help='Exclude mapped runout, or explicitly allow it with a cost')
+    opt.add_argument('--landforms',choices=['on','off'],default='on',help='Detect ridges and gullies from the terrain model and use them in the search cost; off reproduces 0.2 routes')
+    opt.add_argument('--gully-cost',type=float,default=1.0,help='Added distance-cost multiplier inside detected gullies')
+    opt.add_argument('--ridge-cost',type=float,default=0.25,help='Added distance-cost multiplier everywhere except detected ridges (prefers ridges)')
     opt.add_argument('--runout-cost',type=float,default=12,help='Added distance-cost multiplier inside runout with --runout penalize (not a risk score)')
     opt.set_defaults(handler=optimize)
     return p
