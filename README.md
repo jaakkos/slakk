@@ -3,26 +3,33 @@
 A small Python CLI for **unverified winter-ascent route planning in Norway**.
 It can import a Strava activity, read a local GPX, download terrain/map layers,
 search for a gentler ascent, and export a candidate GPX plus a comparison map
-and machine-readable report. No Codex, browser automation, or LLM is required.
+and machine-readable report. No browser automation or LLM is required.
 
-## Tools used in the original analysis
+> **Outputs are unverified planning candidates, not safe routes.** A candidate
+> is the best-cost path in a simplified terrain model. It does not assess
+> avalanche conditions, weather, snow, ice, cornices, vegetation, water,
+> access or whether you will need to bootpack. A gentle line can still cross
+> avalanche terrain. Check every candidate against the current
+> [Varsom](https://www.varsom.no/) forecast, maps and the terrain itself, and
+> make your own decisions. See [Disclaimer](#disclaimer).
 
-| Task | Actual tool or source |
+## Data sources and libraries
+
+| Task | Source or library |
 |---|---|
-| Get the original GPX | Strava website → **Export GPX**, controlled through Codex's `cua_repl` browser tool |
 | Terrain elevations | Kartverket [DTM ImageServer](https://hoydedata.no/arcgis/rest/services/DTM/ImageServer), `exportImage`, float32 GeoTIFF |
 | Slope/runout shading | NVE [Bratthet_med_utlop_2024](https://gis3.nve.no/arcgis/rest/services/wmts/Bratthet_med_utlop_2024/MapServer), `export`, PNG |
 | Topographic background | Kartverket [Topografisk Norgeskart WMS](https://wms.geonorge.no/skwms1/wms.topo?service=WMS&request=GetCapabilities), `GetMap` |
-| Data downloads | `curl`; RTK was a shell-output wrapper, not part of the algorithm |
+| Optional track import | Strava [activity-streams API](https://developers.strava.com/docs/reference/#api-Streams-getActivityStreams), or a GPX exported from Strava's website |
 | GPX parsing and output | Python standard library `xml.etree.ElementTree` |
 | Elevation, slope and distance calculations | NumPy |
 | Route search | A* over a raster grid, using Python `heapq` |
 | Raster reading and map export | Pillow |
-| Interactive comparison | D3.js 7.9.0 and HTML/SVG; Sharp rendered a static preview |
 
 The CLI keeps the core dependencies to **NumPy + Pillow**. Its HTTP client is
-Python's `urllib`, and its argument parser is `argparse`. The interactive D3
-view is not required or included; the CLI exports a static comparison PNG.
+Python's `urllib`, and its argument parser is `argparse`. Map data is
+downloaded at run time from the providers above and is not included in this
+repository; see [Data licences](#data-licences).
 
 ## Setup
 
@@ -487,12 +494,47 @@ mandatory waypoints (exact pass-through, masked or unreachable waypoints), and
 coordinate-only planning, GeoJSON exclusion areas, distinct alternatives, the self-contained HTML map, cache checksums, the
 hazard coverage check, turn costs, ridge and gully detection and their search cost, and Strava login and token refresh (mocked).
 The optimizer was also run end-to-end on the downloaded activity and cached
-Kartverket/NVE data. Live Strava API authentication was not tested; the original
-GPX download used the browser.
+Kartverket/NVE data. Live Strava API authentication was not tested.
 
 Exit codes: `0` success, `2` input/provider error, `3` no feasible route.
 
-Map attribution: Kartverket, CC BY 4.0; NVE, NLOD. Review
-[Varsom's avalanche-terrain guidance](https://www.varsom.no/en/avalanches/about-avalanches/avalanche-terrain/)
+## Data licences
+
+This repository contains code only. Terrain, hazard and map data are
+downloaded at run time from their providers and stay under the providers'
+terms. If you share outputs (PNG, HTML map, GPX), keep the attributions.
+
+- **Kartverket** (elevation model and topographic map): Creative Commons
+  Attribution 4.0 ([CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)),
+  credited as "© Kartverket". See Kartverket's
+  [terms of use](https://www.kartverket.no/api-og-data/vilkar-for-bruk). Those
+  terms note that WMS map content at detailed zoom levels comes from the
+  Geovekst partnership and that other reuse of it needs the rights holders'
+  permission, so check before publishing detailed map backgrounds.
+- **NVE** (steepness and runout map, Bratthet med utløp): Norwegian Licence
+  for Open Government Data ([NLOD](https://data.norge.no/nlod/en/2.0)),
+  credited as "NVE". See NVE's terms for its open data and map services.
+- **Strava**: imported tracks are your own activity data, subject to
+  [Strava's API agreement](https://www.strava.com/legal/api). This tool does not
+  upload anything to Strava.
+
+Review [Varsom's avalanche-terrain guidance](https://www.varsom.no/en/avalanches/about-avalanches/avalanche-terrain/)
 and its [map limitations](https://varsom.no/snoskred/snoskredskolen/skredterreng/bratthet-og-utlopsomradekart/)
 when interpreting outputs.
+
+## Disclaimer
+
+This is an experimental planning aid. Every route it produces is an
+**unverified candidate**: the best-cost path through a raster model with the
+limits and costs you chose, not a safe, recommended or skiable route. It may
+still require bootpacking, cross avalanche terrain or runout zones, or run
+into obstacles that the data does not show. Mapped NVE classes describe slope
+steepness and possible runout, not current avalanche danger, and an
+unmarked area is not safety clearance. The software is provided "as is",
+without warranty of any kind; see [LICENSE](LICENSE). You are responsible for
+your own route choices in the mountains.
+
+## License
+
+The code is released under the [MIT License](LICENSE). Data licences are
+listed under [Data licences](#data-licences).
