@@ -169,10 +169,13 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(cli.read_points(wpt),[(69.1,18.1),(69.2,18.2)])
         rte = self.write_points('<rte><rtept lat="69.1" lon="18.1"/><rtept lat="69.15" lon="18.3"/><rtept lat="69.2" lon="18.2"/></rte>')
         self.assertEqual(cli.read_points(rte),[(69.1,18.1),(69.15,18.3),(69.2,18.2)])
+        # A route wins over waypoints; a recorded track is ignored.
+        mixed = self.write_points('<wpt lat="9" lon="9"/><rte><rtept lat="69.1" lon="18.1"/><rtept lat="69.2" lon="18.2"/></rte>'
+                                  '<trk><trkseg><trkpt lat="69" lon="18"/><trkpt lat="70" lon="18"/></trkseg></trk><wpt lat="8" lon="8"/>')
+        self.assertEqual(cli.read_points(mixed),[(69.1,18.1),(69.2,18.2)])
         for body in ('<trk><trkseg><trkpt lat="69.1" lon="18.1"/><trkpt lat="69.2" lon="18.2"/></trkseg></trk>',
                      '<wpt lat="69.1" lon="18.1"/>', '<wpt lat="91" lon="18.1"/><wpt lat="69.2" lon="18.2"/>',
-                     '<wpt lat="69.1" lon="18.1"/><wpt lat="69.2" lon="18.2"/><trk><trkseg><trkpt lat="69" lon="18"/></trkseg></trk>',
-                     '<wpt lat="69.1" lon="18.1"/><rte><rtept lat="1" lon="1"/><rtept lat="2" lon="2"/></rte><wpt lat="69.2" lon="18.2"/>',
+                     '<rte><rtept lat="1" lon="1"/><rtept lat="2" lon="2"/></rte><rte><rtept lat="1" lon="1"/><rtept lat="2" lon="2"/></rte>',
                      '<wpt lon="18.1"/><wpt lat="69.2" lon="18.2"/>', '<wpt lat="x" lon="18.1"/><wpt lat="69.2" lon="18.2"/>',
                      ''.join(f'<wpt lat="69.{i:03d}" lon="18"/>' for i in range(101))):
             with self.assertRaises(ValueError):
@@ -204,6 +207,11 @@ class RouteTests(unittest.TestCase):
         self.assertEqual((data['points'],data['corridor'],data['topo']),([[69.1,18.1],[69.2,18.2]],900,cli.TOPO))
         self.assertNotIn('<script src',text)
         self.assertEqual(cli.main(['pick','-o',str(page),'--no-browser']),2)  # never overwrites
+        before = page.read_bytes()
+        self.assertEqual(cli.main(['pick','-o',str(page),'--no-browser','--corridor-m','nan']),2)
+        self.assertEqual(page.read_bytes(),before)
+        self.assertEqual(cli.main(['pick','-o',str(self.root/'nan.html'),'--no-browser','--corridor-m','nan']),2)
+        self.assertFalse((self.root/'nan.html').exists())
     def write_area(self, terrain, corners, name='avoid.geojson'):
         ring = terrain.lonlat(np.array(corners,float)).tolist()
         path = self.root/name

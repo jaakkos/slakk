@@ -320,16 +320,18 @@ and NVE while the page is open; nothing is sent anywhere else. `--points` loads
 an existing points file for editing, and `--corridor-m` and `--resolution-m` set
 the starting values.
 
-**Use a points file.** `--points` takes a GPX with waypoints, in file order, or
-one GPX route, such as points dropped and exported from Norgeskart, Gaia or
+**Use a points file.** `--points` takes a GPX with one route, or waypoints in
+file order, such as points dropped and exported from Norgeskart, Gaia or
 Caltopo. The first point is the start, the last the destination and the rest
-are `--via` points:
+are `--via` points. When the file holds a route, its points are used and any
+waypoints are ignored; a recorded track in the file is always ignored. Both are
+reported when the file is read.
 
 ```sh
 slakk optimize --points slakk-points.gpx --out coord-draft --cache area-cache --corridor-m 1200
 ```
 
-A recorded track is refused here; give it as the input GPX instead. The report
+A file with only a recorded track is refused; give it as the input GPX instead. The report
 records `points_sha256`, and `options` holds the start, via and end read from the
 file.
 

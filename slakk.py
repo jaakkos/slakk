@@ -144,17 +144,19 @@ def resample(q, spacing, scale):
 
 
 def read_points(path):
-    """Planning points from a GPX: waypoints in file order, else one route's points. First = start, last = end."""
+    """Planning points from a GPX: one route's points, else the waypoints in file order. First = start, last = end."""
     if path.stat().st_size > 1024 * 1024:
         raise ValueError(f'{path}: a points file over 1 MiB is unlikely to be a few planning points.')
     root = ET.parse(path).getroot()
-    if root.findall('.//{*}trkpt'):
-        raise ValueError(f'{path}: holds a recorded track; give a track as the input GPX instead, or remove it from the points file.')
-    nodes = root.findall('{*}wpt')
     routes = [r for r in root.findall('{*}rte') if r.findall('{*}rtept')]
-    if nodes and routes or len(routes) > 1 or not nodes and not routes:
-        raise ValueError(f'{path}: expected only waypoints, or one GPX route, so the order of the points is clear.')
-    nodes = nodes or routes[0].findall('{*}rtept')
+    if len(routes) > 1:
+        raise ValueError(f'{path}: holds {len(routes)} GPX routes; keep the one to plan, so the order of the points is clear.')
+    nodes = routes[0].findall('{*}rtept') if routes else root.findall('{*}wpt')
+    if not nodes:
+        raise ValueError(f'{path}: expected one GPX route or waypoints; a recorded track goes in as the input GPX instead.')
+    ignored = [what for what, found in (('waypoints', routes and root.findall('{*}wpt')), ('recorded track', root.findall('.//{*}trkpt'))) if found]
+    if ignored:
+        log(f'{path}: using the {"route" if routes else "waypoints"}; ignoring the {" and ".join(ignored)} in the file.')
     if not 2 <= len(nodes) <= MAX_POINTS:
         raise ValueError(f'{path}: expected 2–{MAX_POINTS} points (start, optional vias, end); found {len(nodes)}.')
     points = []
@@ -1164,8 +1166,8 @@ select(D.routes.length > 1 ? 1 : 0);
 
 def pick(args):
     """Write a page for placing start, vias and end on a live Kartverket map; it saves a points GPX."""
-    if args.output.exists():
-        raise ValueError(f'{args.output} already exists; choose a new file.')
+    if not 20 <= args.corridor_m <= 3000 or not 1 <= args.resolution_m <= 30:
+        raise ValueError('Use resolution 1–30 m and corridor 20–3000 m.')
     points = read_points(args.points) if args.points else []
     if args.center:
         center, zoom = args.center, 13
@@ -1176,8 +1178,12 @@ def pick(args):
     data = {'points': points, 'center': center, 'zoom': zoom, 'topo': TOPO, 'nve': NVE,
             'corridor': args.corridor_m, 'resolution': args.resolution_m, 'maxCells': MAX_CELLS, 'maxSide': MAX_SIDE,
             'maxSpan': MAX_SPAN_M, 'maxPoints': MAX_POINTS, 'disclaimer': DISCLAIMER, 'version': VERSION}
-    with open(args.output, 'x', encoding='utf-8') as f:  # never overwrite
-        f.write(PICK_HTML.replace('__DATA__', script_json(data)))
+    page = PICK_HTML.replace('__DATA__', script_json(data))
+    try:
+        with open(args.output, 'x', encoding='utf-8') as f:  # never overwrite
+            f.write(page)
+    except FileExistsError:
+        raise ValueError(f'{args.output} already exists; choose a new file.') from None
     log(f'Wrote {args.output}. Click to place start, vias and end, then save the points GPX and run: '
         'slakk optimize --points <file> --out <dir> --cache <dir>')
     if not args.no_browser:
@@ -1253,7 +1259,7 @@ const project = ([lat, lon], z) => {
   return [(lon + 180) / 360 * world(z), (0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)) * world(z)];
 };
 const unproject = ([x, y], z) => [
-  Math.atan(Math.sinh(Math.PI * (1 - 2 * y / world(z)))) * 180 / Math.PI, x / world(z) * 360 - 180];
+  Math.atan(Math.sinh(Math.PI * (1 - 2 * y / world(z)))) * 180 / Math.PI, ((x / world(z) * 360) % 360 + 360) % 360 - 180];
 const mercator = ([lat, lon]) => [R * lon * Math.PI / 180, R * Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360))];
 const size = () => [map.clientWidth, map.clientHeight];
 const toScreen = ll => { const [x, y] = project(ll, zoom), [w, h] = size(); return [x - cx + w / 2, y - cy + h / 2]; };
@@ -1335,10 +1341,14 @@ function drawOverlay() {
 }
 
 const fmt = p => `${p[0].toFixed(6)},${p[1].toFixed(6)}`;
-const quote = s => /^[\w.\/-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
+// Plain names only, so the browser saves exactly this name and the command needs no quoting in any shell.
+const fileName = () => {
+  const name = $('name').value.trim().replace(/[^\w.-]+/g, '-').replace(/^[-.]+/, '');
+  return !name ? 'slakk-points.gpx' : /\.gpx$/i.test(name) ? name : name + '.gpx';
+};
 function command() {
-  const name = $('name').value.trim() || 'slakk-points.gpx', g = grid();
-  return `slakk optimize --points ${quote(name)} --corridor-m ${g ? g.corridor : $('corridor').value}`
+  const name = fileName(), g = grid();
+  return `slakk optimize --points ${name} --corridor-m ${g ? g.corridor : $('corridor').value}`
     + ` --resolution-m ${g ? g.res : $('resolution').value} --out draft --cache area-cache --html`;
 }
 function drawPanel() {
@@ -1385,12 +1395,13 @@ function gpx() {
 $('save').onclick = () => {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([gpx()], {type: 'application/gpx+xml'}));
-  a.download = $('name').value.trim() || 'slakk-points.gpx';
+  a.download = fileName();
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 };
+let copied;
 $('copy').onclick = () => {
-  const done = text => { $('copy').textContent = text; setTimeout(() => { $('copy').textContent = 'Copy command'; }, 2000); };
+  const done = text => { $('copy').textContent = text; clearTimeout(copied); copied = setTimeout(() => { $('copy').textContent = 'Copy command'; }, 2000); };
   const manual = () => { getSelection().selectAllChildren($('cmd')); done('Selected: copy it'); };
   if (navigator.clipboard) navigator.clipboard.writeText(command()).then(() => done('Copied'), manual); else manual();
 };
@@ -1408,10 +1419,13 @@ const zoomAt = (z, sx, sy) => {
 $('zin').onclick = () => zoomAt(zoom + 1, ...size().map(v => v / 2));
 $('zout').onclick = () => zoomAt(zoom - 1, ...size().map(v => v / 2));
 // Trackpads send many small wheel events; zoom one level per 100 px of scrolling.
-let wheel = 0;
+// A pause or a change of direction starts a new gesture.
+let wheel = 0, wheelAt = 0;
 map.addEventListener('wheel', e => {
   e.preventDefault();
-  wheel += e.deltaY * (e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 400 : 1);
+  const delta = e.deltaY * (e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 400 : 1);
+  if (e.timeStamp - wheelAt > 300 || delta * wheel < 0) wheel = 0;
+  wheelAt = e.timeStamp; wheel += delta;
   if (Math.abs(wheel) < 100) return;
   zoomAt(zoom + (wheel < 0 ? 1 : -1), ...local(e)); wheel = 0;
 }, {passive: false});
