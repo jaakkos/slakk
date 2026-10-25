@@ -339,6 +339,18 @@ global hazard model. More precise projections and explicit water/cliff/access
 barriers would be useful additions before treating the tool as more than an
 exploratory planner. No ski-descent route is generated.
 
+## Performance
+
+Profiling a 700 × 700 synthetic grid showed two hot spots: the corridor
+distance map, which scanned the whole grid for every reference sample, and the
+per-edge cost arithmetic inside the A* loop. The corridor map now updates only
+a window around each sample, and edge costs are precomputed as one array per
+direction with the same arithmetic in the same order. On that grid a search
+went from 9.9 s to 2.9 s with an identical route, cost and node count; routes,
+alternatives and turn-cost searches were checked to be bit-identical with the
+previous version. The precomputed costs use about 8 bytes × 16 directions per
+cell, roughly 190 MB at the 1.5 million-cell limit.
+
 ## Checks
 
 ```sh

@@ -482,10 +482,26 @@ def edge_options(terrain, blocked, args):
         yield dr, dc, length, allowed
 
 
-def search(terrain, transitions, nearest, runout, args, start, goal, extra=None):
+def step_costs(terrain, transitions, nearest, runout, args, extra=None):
+    """Cost of every allowed edge from each cell, as one array per direction (inf where not allowed).
+    Same arithmetic, in the same order, as evaluating each edge inside the search loop."""
+    steps = []
+    for dr, dc, length, allowed in transitions:
+        grade = (shift(terrain.z, dr, dc) - terrain.z) / length
+        weight = 1 + 6 * np.maximum(0, grade-.12)**2 + 10 * np.maximum(0, -grade) + shift(nearest, dr, dc) / args.corridor_m
+        if args.runout == 'penalize':
+            weight = np.where(shift(runout, dr, dc), weight + args.runout_cost, weight)
+        if extra is not None:
+            weight += shift(extra, dr, dc)
+        with np.errstate(invalid='ignore'):
+            steps.append((dr, dc, np.where(allowed, length * weight, np.inf)))
+    return steps
+
+
+def search(terrain, steps, args, start, goal):
     """A* between two cells; returns the cell path, visited count and cost."""
     if args.turn_cost_m > 0:
-        return search_turns(terrain, transitions, nearest, runout, args, start, goal, extra)
+        return search_turns(terrain, steps, args, start, goal)
     costs = np.full(terrain.z.shape, np.inf)
     previous = np.full(terrain.z.shape, -1, np.int32)
     costs[start] = 0
@@ -498,11 +514,12 @@ def search(terrain, transitions, nearest, runout, args, start, goal, extra=None)
         visited += 1
         if (r, c) == goal:
             break
-        for dr, dc, length, allowed in transitions:
-            if not allowed[r, c]:
+        for dr, dc, step in steps:
+            edge = step[r, c]
+            if edge == math.inf:
                 continue
             nr, nc = r + dr, c + dc
-            value = cost + length * edge_weight(terrain, nearest, runout, args, extra, r, c, nr, nc, length)
+            value = cost + edge
             if value < costs[nr, nc]:
                 costs[nr, nc] = value
                 previous[nr, nc] = r * terrain.w + c
@@ -517,16 +534,6 @@ def search(terrain, transitions, nearest, runout, args, start, goal, extra=None)
     return simplify(np.asarray(route[::-1], float)), visited, float(costs[goal])
 
 
-def edge_weight(terrain, nearest, runout, args, extra, r, c, nr, nc, length):
-    grade = float(terrain.z[nr, nc] - terrain.z[r, c]) / length
-    weight = 1 + 6 * max(0, grade-.12)**2 + 10 * max(0, -grade) + nearest[nr, nc] / args.corridor_m
-    if args.runout == 'penalize' and runout[nr, nc]:
-        weight += args.runout_cost
-    if extra is not None:
-        weight += extra[nr, nc]
-    return weight
-
-
 def simplify(route):
     # Remove only exactly collinear vertices; never shortcut across masked terrain.
     if len(route) > 2:
@@ -536,10 +543,10 @@ def simplify(route):
     return route
 
 
-def search_turns(terrain, transitions, nearest, runout, args, start, goal, extra=None):
+def search_turns(terrain, steps, args, start, goal):
     """A* over (cell, heading) states. Each heading change costs turn_cost_m * (angle/180)^2,
     so a sharp reversal costs the full amount and a gradual bend over several edges much less."""
-    headings = [math.atan2(dr, dc) for dr, dc, _, _ in transitions]
+    headings = [math.atan2(dr, dc) for dr, dc, _ in steps]
     turn = np.array([[args.turn_cost_m * (abs((a - b + math.pi) % (2*math.pi) - math.pi) / math.pi)**2
                       for b in headings] for a in headings])
     costs, previous = {}, {}  # sparse: only states the search reaches
@@ -553,11 +560,12 @@ def search_turns(terrain, transitions, nearest, runout, args, start, goal, extra
         if (r, c) == goal:
             end = (r, c, d)
             break
-        for k, (dr, dc, length, allowed) in enumerate(transitions):
-            if not allowed[r, c]:
+        for k, (dr, dc, step) in enumerate(steps):
+            edge = step[r, c]
+            if edge == math.inf:
                 continue
             nr, nc = r + dr, c + dc
-            value = cost + length * edge_weight(terrain, nearest, runout, args, extra, r, c, nr, nc, length)
+            value = cost + edge
             if d >= 0:
                 value += turn[d, k]
             if value < costs.get((nr, nc, k), math.inf):
@@ -596,11 +604,16 @@ def solve_many(terrain, reference, args, waypoints=(), avoid=None, count=1):
     nearest = np.full(terrain.z.shape, np.inf)
     nearest_col = np.zeros(terrain.z.shape)
     _, samples = resample(reference, max(terrain.gs, 10), terrain.gs)
+    # Only cells within the corridor matter (the rest are blocked), so update a window per sample.
+    reach = math.ceil(args.corridor_m / terrain.gs) + 2
     for r, c in samples:
-        dsq = (rows-r)**2 + (cols-c)**2
-        closer = dsq < nearest
-        nearest[closer] = dsq[closer]
-        nearest_col[closer] = c
+        r0, r1 = max(0, math.floor(r) - reach), min(terrain.h, math.ceil(r) + reach + 1)
+        c0, c1 = max(0, math.floor(c) - reach), min(terrain.w, math.ceil(c) + reach + 1)
+        window = nearest[r0:r1, c0:c1]
+        dsq = (rows[r0:r1, c0:c1]-r)**2 + (cols[r0:r1, c0:c1]-c)**2
+        closer = dsq < window
+        window[closer] = dsq[closer]
+        nearest_col[r0:r1, c0:c1][closer] = c
     nearest = np.sqrt(nearest) * terrain.gs
     blocked = dilate(terrain.invalid, 1) | (terrain.slope > args.max_terrain_deg)
     blocked |= dilate(terrain.steep, math.ceil(args.steep_buffer_m / terrain.gs))
@@ -628,7 +641,7 @@ def solve_many(terrain, reference, args, waypoints=(), avoid=None, count=1):
     for attempt in range(1 if count == 1 else 2 * count):
         try:
             candidate, info = route_legs(terrain, reference, keep, distance, start, goal, stops, waypoints,
-                                         transitions, nearest, runout, blocked, args, extra if found else None)
+                                         step_costs(terrain, transitions, nearest, runout, args, extra if found else None), blocked, args)
             if count == 1:
                 return [(candidate, info)]
         except NoRoute as exc:
@@ -659,10 +672,10 @@ def solve_many(terrain, reference, args, waypoints=(), avoid=None, count=1):
     return found
 
 
-def route_legs(terrain, reference, keep, distance, start, goal, stops, waypoints, transitions, nearest, runout, blocked, args, extra):
+def route_legs(terrain, reference, keep, distance, start, goal, stops, waypoints, steps, blocked, args):
     route, at, visited, total = [start], start, 0, 0.
     for number, (target, exact) in enumerate(zip(stops + [goal], [*waypoints, None]), 1):
-        leg, count, cost = search(terrain, transitions, nearest, runout, args, at, target, extra)
+        leg, count, cost = search(terrain, steps, args, at, target)
         visited += count
         if leg is None:
             where = f'waypoint {number}' if exact is not None else 'the goal'
