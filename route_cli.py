@@ -23,7 +23,7 @@ if sys.version_info < (3, 11):
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-VERSION = '0.3.0'
+VERSION = '0.4.0'
 
 R = 6378137.0
 DTM = 'https://hoydedata.no/arcgis/rest/services/DTM/ImageServer/exportImage'
@@ -300,7 +300,8 @@ def get_terrain(points, args):
     high = np.ceil((xy.max(axis=0) + margin) / resolution) * resolution
     width, height = np.rint((high - low) / resolution).astype(int)
     if width * height > MAX_CELLS or max(width, height) > 4096:
-        raise ValueError('Requested grid is too large. Increase --resolution-m or reduce --corridor-m.')
+        raise ValueError(f'Requested grid is too large ({width} × {height} cells; at most {MAX_CELLS:,} and 4096 per side). '
+                         'Pass a coarser --resolution-m (e.g. 3 or 6) or reduce --corridor-m.')
     grid = {'provider': 'kartverket-nve-v1', 'bbox': [*low.tolist(), *high.tolist()],
             'width': int(width), 'height': int(height), 'resolution': resolution,
             'scale': scale, 'ground_resolution': resolution * scale,
@@ -711,7 +712,7 @@ def solve_many(terrain, reference, args, waypoints=(), avoid=None, count=1):
     limit = smoothed(terrain, args)
     blocked = dilate(terrain.invalid, 1) | (limit.slope > args.max_terrain_deg)
     if args.pitch_deg:
-        blocked |= terrain.slope > args.pitch_terrain_deg
+        blocked |= terrain.slope > (max(45., args.max_terrain_deg) if args.pitch_terrain_deg is None else args.pitch_terrain_deg)
     blocked |= dilate(terrain.steep, math.ceil(args.steep_buffer_m / terrain.gs))
     blocked |= nearest > args.corridor_m
     if args.side == 'east':
@@ -1123,9 +1124,11 @@ def optimize(args):
         raise ValueError('Use resolution 1–30 m and corridor 20–3000 m.')
     if not 0.5 <= args.map_detail_m <= 30:
         raise ValueError('Use --map-detail-m 0.5–30.')
+    if args.pitch_terrain_deg is None:
+        args.pitch_terrain_deg = max(45., args.max_terrain_deg)
     if args.pitch_deg and not (args.max_uphill_deg < args.pitch_deg < 45 and args.max_terrain_deg <= args.pitch_terrain_deg < 80
                                and 2 <= args.pitch_window_m <= 60 and args.pitch_max_m >= 0 and args.pitch_cost >= 0):
-        raise ValueError('With --pitch-deg: it must exceed --max-uphill-deg and be under 45; --pitch-terrain-deg must be at least '
+        raise ValueError('With --pitch-deg (default 25; 0 turns it off): it must exceed --max-uphill-deg and be under 45; --pitch-terrain-deg must be at least '
                          '--max-terrain-deg and under 80; --pitch-window-m 2–60; --pitch-max-m and --pitch-cost nonnegative.')
     if args.pitch_deg < 0:
         raise ValueError('--pitch-deg must be 0 (off) or a positive angle.')
@@ -1316,15 +1319,15 @@ def parser():
     opt.add_argument('--via',type=latlon,metavar='LAT,LON',action='append',help='Mandatory waypoint, visited in the order given; repeat for more')
     opt.add_argument('--keep-first-m',type=float,default=0,help='Follow the recorded approach for this distance (m)')
     opt.add_argument('--corridor-m',type=float,default=600,help='Search distance around the recorded ascent, or the straight reference line in coordinate mode (m)')
-    opt.add_argument('--resolution-m',type=float,default=6,help='Approximate ground cell size for a new cache (m)')
+    opt.add_argument('--resolution-m',type=float,default=2,help='Approximate ground cell size for a new cache (m)')
     opt.add_argument('--side',choices=['any','east','west'],default='any',help='Constrain the route relative to the nearest recorded-route sample')
     opt.add_argument('--side-tolerance-m',type=float,default=20,help='Allowance across the --side boundary (m)')
     opt.add_argument('--max-uphill-deg',type=float,default=15,help='Along-route uphill angle limit, checked within search edges')
     opt.add_argument('--angle-window-m',type=float,default=50,help='Distance over which reports and map.html average the route angle (5-500; default %(default)g). Reporting only: the search and validation limits are unchanged')
-    opt.add_argument('--pitch-deg',type=float,default=0,help='Fine-grid rule, off by default: judge the uphill, downhill and terrain limits on terrain averaged over --pitch-window-m, and allow short pitches up to this angle on the unsmoothed terrain')
+    opt.add_argument('--pitch-deg',type=float,default=25,help='Fine-grid short-pitch rule (default %(default)g; 0 = off, the strict 0.3 rule): judge the uphill, downhill and terrain limits on terrain averaged over --pitch-window-m, and allow short pitches up to this angle on the unsmoothed terrain')
     opt.add_argument('--pitch-window-m',type=float,default=15,help='With --pitch-deg: width of the averaging square (default %(default)g)')
     opt.add_argument('--pitch-max-m',type=float,default=15,help='With --pitch-deg: longest allowed stretch steeper than --max-uphill-deg on the unsmoothed terrain (default %(default)g)')
-    opt.add_argument('--pitch-terrain-deg',type=float,default=45,help='With --pitch-deg: exclude cells whose unsmoothed terrain slope exceeds this (default %(default)g)')
+    opt.add_argument('--pitch-terrain-deg',type=float,help='With --pitch-deg: exclude cells whose unsmoothed terrain slope exceeds this (default: 45, or --max-terrain-deg if higher)')
     opt.add_argument('--pitch-cost',type=float,default=4,help='With --pitch-deg: added distance-cost multiplier for the part of an edge steeper than --max-uphill-deg (default %(default)g)')
     opt.add_argument('--max-downhill-deg',type=float,default=10,help='Limit for small descending sections during the ascent')
     opt.add_argument('--max-terrain-deg',type=float,default=35,help='Exclude cells whose terrain-model slope exceeds this')

@@ -226,7 +226,9 @@ class RouteTests(unittest.TestCase):
         z[21:] += 6.5  # a bank across the whole grid: over 15 degrees in every crossing direction
         terrain, reference = self.terrain(z=z), np.array([[7.,20],[32.,20]])
         with self.assertRaises(cli.NoRoute):
-            cli.solve(terrain, reference, self.args())
+            cli.solve(terrain, reference, self.args('--pitch-deg','0'))
+        _, info = cli.solve(terrain, reference, self.args('--pitch-window-m','50','--pitch-max-m','30'))  # default 25 degrees
+        self.assertLessEqual(info['max_raw_uphill_deg'], 25.15)
         pitch = ('--pitch-deg','35','--pitch-window-m','50')
         q, info = cli.solve(terrain, reference, self.args(*pitch,'--pitch-max-m','30'))
         self.assertGreater(info['max_raw_uphill_deg'], 15)
