@@ -768,7 +768,7 @@ def kick_turns(dense, gs):
     return int(np.count_nonzero(sharp[1:] & ~sharp[:-1]) + (1 if sharp.size and sharp[0] else 0))
 
 
-def metrics(terrain, q):
+def metrics(terrain, q, window=50):
     positions, dense = resample(q, 5, terrain.gs)
     height = terrain.sample(dense)
     ij = np.rint(dense).astype(int)
@@ -782,11 +782,11 @@ def metrics(terrain, q):
     if land is not None:
         cls = land[ij[:-1, 0], ij[:-1, 1]]
         stats.update(ridge_m=round(float(weights @ (cls == RIDGE)), 1), gully_m=round(float(weights @ (cls == GULLY)), 1))
-    if positions[-1] >= 50:
-        start = positions[positions <= positions[-1] - 50]
-        change = np.interp(start+50, positions, height)-np.interp(start, positions, height)
-        angles = np.degrees(np.arctan(change/50))
-        stats.update(max_50m_deg=round(float(angles.max()), 2), p95_50m_deg=round(float(np.percentile(angles,95)), 2))
+    if positions[-1] >= window:
+        start = positions[positions <= positions[-1] - window]
+        change = np.interp(start+window, positions, height)-np.interp(start, positions, height)
+        angles = np.degrees(np.arctan(change/window))
+        stats.update({f'max_{window:g}m_deg': round(float(angles.max()), 2), f'p95_{window:g}m_deg': round(float(np.percentile(angles,95)), 2)})
     return stats
 
 
@@ -813,17 +813,17 @@ def draw_map(terrain, original, candidate, output, legend='Teal: recorded | Oran
     canvas.save(output)
 
 
-def route_profile(terrain, q, limit, sx, sy):
-    """5 m samples with elevation, forward 50 m angle, NVE and landform flags, in map-image pixels."""
+def route_profile(terrain, q, limit, sx, sy, window=50):
+    """5 m samples with elevation, forward angle over the next window metres, NVE and landform flags, in map-image pixels."""
     positions, dense = resample(q, 5, terrain.gs)
     land = getattr(terrain, 'landform', None)
     if land is None:
         land = np.full(terrain.z.shape, UNKNOWN, np.int8)
     height = terrain.sample(dense)
     ij = np.rint(dense).astype(int)
-    full = positions <= positions[-1] - 50
-    ahead = np.interp(positions + 50, positions, height)
-    angle = np.where(full, np.degrees(np.arctan((ahead - height) / 50)), np.nan)
+    full = positions <= positions[-1] - window
+    ahead = np.interp(positions + window, positions, height)
+    angle = np.where(full, np.degrees(np.arctan((ahead - height) / window)), np.nan)
     return {'d': np.round(positions, 1).tolist(), 'z': np.round(height, 1).tolist(),
             'a': [None if not np.isfinite(v) else round(float(v), 2) for v in angle],
             'over': (full & (angle > limit)).astype(int).tolist(),
@@ -912,19 +912,19 @@ def write_html(args, terrain, report, baseline, baseline_label, found, output):
         shape[land == RIDGE] = [230, 150, 0, 120]
         shape[land == GULLY] = [130, 40, 190, 120]
     shape = Image.fromarray(shape)
-    routes = [{'label': baseline_label, 'color': '#087f8c', **route_profile(terrain, baseline, args.max_uphill_deg, sx, sy)}]
+    routes = [{'label': baseline_label, 'color': '#087f8c', **route_profile(terrain, baseline, args.max_uphill_deg, sx, sy, args.angle_window_m)}]
     for number, (q, _) in enumerate(found, 1):
         label = 'Candidate (best cost)' if number == 1 else f'Alternative {number}'
         routes.append({'label': label, 'color': ROUTE_COLORS[number - 1],
-                       **route_profile(terrain, q, args.max_uphill_deg, sx, sy)})
+                       **route_profile(terrain, q, args.max_uphill_deg, sx, sy, args.angle_window_m)})
     areas = [[[round(float((c + .5) * sx), 1), round(float((r + .5) * sy), 1)] for r, c in terrain.rc(ring)]
              for areas in getattr(args, 'areas', []) for ring in areas]
-    data = {'width': topo.width, 'height': topo.height, 'limit': args.max_uphill_deg, 'routes': routes,
+    data = {'width': topo.width, 'height': topo.height, 'limit': args.max_uphill_deg, 'window': f'{args.angle_window_m:g}', 'routes': routes,
             'areas': areas, 'disclaimer': DISCLAIMER, 'status': report['status'], 'landforms': land is not None,
             'map_m_per_px': round(detail, 2)}
     page = (MAP_HTML.replace('__TOPO__', png_data_url(topo, 'JPEG')).replace('__HAZARD__', png_data_url(hazard))
             .replace('__LANDFORM__', png_data_url(shape))
-            .replace('__DATA__', json.dumps(data, allow_nan=False).replace('</', '<\\/')))
+            .replace('__WINDOW__', data['window']).replace('__DATA__', json.dumps(data, allow_nan=False).replace('</', '<\\/')))
     output.write_text(page, encoding='utf-8')
 
 
@@ -968,9 +968,9 @@ tr.sel{outline:2px solid var(--fg)}
  <div style="color:var(--muted)">Map: Kartverket CC BY 4.0, <span id="detail"></span> m per pixel. Hazard layer: NVE, NLOD. Unmarked terrain is not safety clearance.</div>
 </section>
 <section>
- <table id="table"><thead><tr><th>Route</th><th>km</th><th>Ascent m</th><th>Max 50 m°</th><th>Over limit m</th><th>Steep m</th><th>Runout m</th><th>Ridge m</th><th>Gully m</th><th>Kick turns</th></tr></thead><tbody></tbody></table>
+ <table id="table"><thead><tr><th>Route</th><th>km</th><th>Ascent m</th><th>Max __WINDOW__ m°</th><th>Over limit m</th><th>Steep m</th><th>Runout m</th><th>Ridge m</th><th>Gully m</th><th>Kick turns</th></tr></thead><tbody></tbody></table>
  <p style="color:var(--muted)">Click a row to show its elevation profile and violations. Shaded profile bands:
- <span class="key"><span><i class="swatch" style="background:#e53935"></i>50 m angle over limit</span>
+ <span class="key"><span><i class="swatch" style="background:#e53935"></i>__WINDOW__ m angle over limit</span>
  <span><i class="swatch" style="background:#6d1b1b"></i>NVE steep</span><span><i class="swatch" style="background:#2b6cd8"></i>NVE runout</span>
  <span><i class="swatch" style="background:#e69600"></i>ridge</span><span><i class="swatch" style="background:#8228be"></i>gully</span></span></p>
  <svg id="profile"></svg>
@@ -1035,7 +1035,7 @@ function select(i) {
     cursor.setAttribute('x1', X(r.d[k])); cursor.setAttribute('x2', X(r.d[k])); cursor.setAttribute('visibility', 'visible');
     marker.setAttribute('cx', r.x[k]); marker.setAttribute('cy', r.y[k]); marker.setAttribute('visibility', 'visible');
     const flags = [r.over[k] && `over ${D.limit}° limit`, r.steep[k] && 'NVE steep', r.runout[k] && 'NVE runout', r.ridge[k] && 'ridge', r.gully[k] && 'gully'].filter(Boolean).join(', ');
-    readout.textContent = `${r.label}: ${(r.d[k] / 1000).toFixed(2)} km, ${r.z[k].toFixed(0)} m, next 50 m ${r.a[k] === null ? 'n/a' : r.a[k].toFixed(1) + '°'}${flags ? ' — ' + flags : ''}`;
+    readout.textContent = `${r.label}: ${(r.d[k] / 1000).toFixed(2)} km, ${r.z[k].toFixed(0)} m, next ${D.window} m ${r.a[k] === null ? 'n/a' : r.a[k].toFixed(1) + '°'}${flags ? ' — ' + flags : ''}`;
   };
 }
 select(D.routes.length > 1 ? 1 : 0);
@@ -1052,6 +1052,8 @@ def optimize(args):
         raise ValueError('Use resolution 2–30 m and corridor 20–3000 m.')
     if not 0.5 <= args.map_detail_m <= 30:
         raise ValueError('Use --map-detail-m 0.5–30.')
+    if not 5 <= args.angle_window_m <= 500:
+        raise ValueError('Use --angle-window-m 5–500; route angles are sampled every 5 m.')
     if not 0 < args.max_uphill_deg < 45 or not 0 < args.max_downhill_deg < 45 or not 0 < args.max_terrain_deg < 80:
         raise ValueError('Invalid angle limit.')
     if min(args.keep_first_m,args.steep_buffer_m,args.runout_buffer_m,args.runout_cost,args.side_tolerance_m,args.turn_cost_m,
@@ -1087,12 +1089,12 @@ def optimize(args):
     report = {'status': 'unverified_candidate', 'disclaimer': DISCLAIMER, 'mode': 'gpx',
               'input_sha256': hashlib.sha256(args.input.read_bytes()).hexdigest(),
               'goal_index_zero_based': stop, 'options': options(args), 'avoid_sha256': {str(f): hashlib.sha256(f.read_bytes()).hexdigest() for f in args.avoid or []},
-              'terrain': terrain.grid, 'hazard_coverage': coverage, 'landforms': land, 'original': metrics(terrain, original),
+              'terrain': terrain.grid, 'hazard_coverage': coverage, 'landforms': land, 'original': metrics(terrain, original, args.angle_window_m),
               'limits': ['Norwegian map-service coverage only.', 'NVE transparent pixels may be unmarked or unmapped; they are not safety clearance.',
                          'No snowpack, live forecast, vegetation, water-crossing or land-access model.',
                          'NVE classifications are decoded from a version-specific rendered palette; unknown colours fail closed.',
                          'Constant local Mercator scale approximation; use for local routes only.',
-                         '50 m route angles are not terrain slope angles. Exposure distance is not a risk score.',
+                         f'{args.angle_window_m:g} m route angles are not terrain slope angles. Exposure distance is not a risk score.',
                          LANDFORM_LIMIT]}
     log('Searching the terrain grid…')
     try:
@@ -1127,14 +1129,14 @@ def avoid_mask(terrain, args):
 def write_candidates(args, terrain, report, found, baseline, baseline_key, legend):
     """Best candidate keeps the original file names; alternatives are numbered from 2."""
     (candidate, search), *others = found
-    report.update(candidate=metrics(terrain,candidate), search=search)
+    report.update(candidate=metrics(terrain,candidate,args.angle_window_m), search=search)
     write_gpx(args.out/'candidate-DRAFT.gpx',terrain.lonlat(candidate),terrain.sample(candidate),'UNVERIFIED ascent draft',DISCLAIMER)
     if args.alternatives > 1:
         report['alternatives'] = []
         for number, (q, info) in enumerate(others, 2):
             name = f'candidate-{number}-DRAFT.gpx'
             write_gpx(args.out/name,terrain.lonlat(q),terrain.sample(q),f'UNVERIFIED ascent draft, alternative {number}',DISCLAIMER)
-            report['alternatives'].append({'file': name, **metrics(terrain,q), 'search': info})
+            report['alternatives'].append({'file': name, **metrics(terrain,q,args.angle_window_m), 'search': info})
         if others:
             legend += '\nAlternatives 2-5: purple, blue, green, brown'
         else:
@@ -1169,13 +1171,13 @@ def plan_between(args, vias):
     terrain.sample(reference)
     report = {'status': 'unverified_candidate', 'disclaimer': DISCLAIMER, 'mode': 'coordinates',
               'options': options(args), 'avoid_sha256': {str(f): hashlib.sha256(f.read_bytes()).hexdigest() for f in args.avoid or []},
-              'terrain': terrain.grid, 'hazard_coverage': coverage, 'landforms': land, 'reference_line': metrics(terrain, reference),
+              'terrain': terrain.grid, 'hazard_coverage': coverage, 'landforms': land, 'reference_line': metrics(terrain, reference, args.angle_window_m),
               'limits': ['Norwegian map-service coverage only.', 'NVE transparent pixels may be unmarked or unmapped; they are not safety clearance.',
                          'No snowpack, live forecast, vegetation, water-crossing or land-access model.',
                          'NVE classifications are decoded from a version-specific rendered palette; unknown colours fail closed.',
                          'Constant local Mercator scale approximation; use for local routes only.',
                          'The corridor follows straight lines between the given points, not a known route.',
-                         '50 m route angles are not terrain slope angles. Exposure distance is not a risk score.',
+                         f'{args.angle_window_m:g} m route angles are not terrain slope angles. Exposure distance is not a risk score.',
                          LANDFORM_LIMIT]}
     log('Searching the terrain grid…')
     try:
@@ -1233,6 +1235,7 @@ def parser():
     opt.add_argument('--side',choices=['any','east','west'],default='any',help='Constrain the route relative to the nearest recorded-route sample')
     opt.add_argument('--side-tolerance-m',type=float,default=20,help='Allowance across the --side boundary (m)')
     opt.add_argument('--max-uphill-deg',type=float,default=15,help='Along-route uphill angle limit, checked within search edges')
+    opt.add_argument('--angle-window-m',type=float,default=50,help='Distance over which reports and map.html average the route angle (5-500; default %(default)g). Reporting only: the search and validation limits are unchanged')
     opt.add_argument('--max-downhill-deg',type=float,default=10,help='Limit for small descending sections during the ascent')
     opt.add_argument('--max-terrain-deg',type=float,default=35,help='Exclude cells whose terrain-model slope exceeds this')
     opt.add_argument('--steep-buffer-m',type=float,default=6,help='Buffer around NVE steep-slope pixels (m)')

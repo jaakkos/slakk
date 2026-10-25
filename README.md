@@ -213,6 +213,22 @@ The page embeds your recorded track, so treat it as private like the GPX
 files. The 50 m angle is an average over the next 50 m, a different
 measure from the per-edge limit used in the search.
 
+### Angle window
+
+`--angle-window-m` (default 50, allowed 5–500) sets the distance the route
+angle is averaged over in `report.json` (`max_<W>m_deg`, `p95_<W>m_deg`, so
+the key names the window) and in `map.html` (table, red over-limit bands,
+profile readout). It is reporting only: the search and the dense validation
+already hold every 0.5–1 m step to `--max-uphill-deg`, which is stricter than
+any window, so changing it never changes a route or relaxes a limit.
+
+A shorter window shows short steep pitches that 50 m averages away; on a
+candidate it approaches `search.max_sampled_uphill_deg` and cannot exceed the
+limit. Below roughly two terrain cells (about 15 m on the default 6 m grid)
+it mostly measures the elevation model's cell facets and, on a recorded
+track, GPS position error, so 15 m is a sensible short setting and 5 m is
+noisy. Angles are sampled every 5 m, hence the 5 m minimum.
+
 ## Plan without a recorded track
 
 Give `--start` and `--end` instead of a GPX. The corridor then follows straight
@@ -309,6 +325,7 @@ looking like a new result. The original input is never modified.
 | `--side any\|east\|west` | `any` | Constrain the route relative to the nearest original-route sample |
 | `--side-tolerance-m` | `20` | Small allowance across that directional boundary |
 | `--max-uphill-deg` | `15` | Along-route angle limit, checked within search edges |
+| `--angle-window-m` | `50` | Distance over which reports and `map.html` average the route angle (5–500); reporting only |
 | `--max-downhill-deg` | `10` | Limit small descending sections during the ascent |
 | `--max-terrain-deg` | `35` | Additional terrain-model slope exclusion |
 | `--steep-buffer-m` | `6` | Buffer around NVE steep-slope pixels |

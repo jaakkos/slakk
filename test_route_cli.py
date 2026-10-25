@@ -221,6 +221,29 @@ class RouteTests(unittest.TestCase):
         report = json.loads((out/'report.json').read_text())
         self.assertTrue(report['landforms']['enabled'])
         self.assertIn('gully_m', report['candidate'])
+    def test_angle_window_is_reporting_only(self):
+        z = np.full((40,40),100,dtype=np.float32)
+        z[22:,:] += 8  # one short 8 m rise on an otherwise flat line
+        terrain = self.terrain(z=z)
+        line = np.array([[5.,20],[35.,20]])
+        default, short = cli.metrics(terrain, line), cli.metrics(terrain, line, 15)
+        self.assertIn('max_50m_deg', default)
+        self.assertNotIn('max_50m_deg', short)
+        self.assertGreater(short['max_15m_deg'], default['max_50m_deg'] + 10)
+        gpx = self.root/'input.gpx'
+        cli.write_gpx(gpx,terrain.lonlat(np.array([[20,5],[20,35]])),[100,100],'test','test')
+        files = {}
+        for window in ('50', '15'):
+            out = self.root/f'out{window}'
+            self.assertEqual(cli.main(['optimize',str(gpx),'--goal','last','--html','--angle-window-m',window,
+                                       '--cache',str(self.root),'--out',str(out),'--offline']), 0)
+            files[window] = (out/'candidate-DRAFT.gpx').read_bytes()
+            page, report = (out/'map.html').read_text(), json.loads((out/'report.json').read_text())
+            self.assertIn(f'Max {window} m°', page)
+            self.assertIn(f'max_{window}m_deg', report['candidate'])
+        self.assertEqual(files['50'], files['15'])  # the window never changes the route
+        self.assertEqual(cli.main(['optimize',str(gpx),'--angle-window-m','2','--cache',str(self.root),
+                                   '--out',str(self.root/'bad'),'--offline']), 2)
     def map_tiles(self, url, colour='green'):
         """Fake WMS: a plain tile of the requested size."""
         from urllib.parse import parse_qs, urlsplit
