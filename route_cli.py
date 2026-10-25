@@ -653,7 +653,7 @@ def route_profile(terrain, q, limit, sx, sy):
             'a': [None if not np.isfinite(v) else round(float(v), 2) for v in angle],
             'over': (full & (angle > limit)).astype(int).tolist(),
             'steep': terrain.steep[ij[:, 0], ij[:, 1]].astype(int).tolist(),
-            'runout': terrain.runout[ij[:, 0], ij[:, 1]].astype(int).tolist(),
+            'runout': terrain.runout[ij[:, 0], ij[:, 1]].astype(int).tolist(), 'kicks': kick_turns(dense, terrain.gs),
             'x': np.round((dense[:, 1] + .5) * sx, 1).tolist(), 'y': np.round((dense[:, 0] + .5) * sy, 1).tolist()}
 
 
@@ -726,7 +726,7 @@ tr.sel{outline:2px solid var(--fg)}
  <div style="color:var(--muted)">Map: Kartverket CC BY 4.0. Hazard layer: NVE, NLOD. Unmarked terrain is not safety clearance.</div>
 </section>
 <section>
- <table id="table"><thead><tr><th>Route</th><th>km</th><th>Ascent m</th><th>Max 50 m°</th><th>Over limit m</th><th>Steep m</th><th>Runout m</th></tr></thead><tbody></tbody></table>
+ <table id="table"><thead><tr><th>Route</th><th>km</th><th>Ascent m</th><th>Max 50 m°</th><th>Over limit m</th><th>Steep m</th><th>Runout m</th><th>Kick turns</th></tr></thead><tbody></tbody></table>
  <p style="color:var(--muted)">Click a row to show its elevation profile and violations. Shaded profile bands:
  <span class="key"><span><i class="swatch" style="background:#e53935"></i>50 m angle over limit</span>
  <span><i class="swatch" style="background:#6d1b1b"></i>NVE steep</span><span><i class="swatch" style="background:#2b6cd8"></i>NVE runout</span></span></p>
@@ -763,7 +763,7 @@ const rows = D.routes.map((r, i) => {
   const asc = r.z.slice(1).reduce((s, z, k) => s + Math.max(0, z - r.z[k]), 0);
   const maxA = Math.max(...r.a.filter(a => a !== null));
   const tr = tbody.insertRow();
-  const cells = [r.label, (r.d[r.d.length-1] / 1000).toFixed(2), asc.toFixed(0), isFinite(maxA) ? maxA.toFixed(1) : '–', sum(r, 'over').toFixed(0), sum(r, 'steep').toFixed(0), sum(r, 'runout').toFixed(0)];
+  const cells = [r.label, (r.d[r.d.length-1] / 1000).toFixed(2), asc.toFixed(0), isFinite(maxA) ? maxA.toFixed(1) : '–', sum(r, 'over').toFixed(0), sum(r, 'steep').toFixed(0), sum(r, 'runout').toFixed(0), r.kicks];
   cells.forEach((c, k) => { const td = tr.insertCell(); if (!k) { const s = document.createElement('i'); s.className = 'swatch'; s.style.background = r.color; td.appendChild(s); } td.appendChild(document.createTextNode(c)); });
   tr.style.cursor = 'pointer'; tr.onclick = () => select(i);
   return tr;
