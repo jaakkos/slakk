@@ -177,6 +177,29 @@ class RouteTests(unittest.TestCase):
         path.write_text(json.dumps({'type':'LineString','coordinates':[[0,0],[1,1]]}))
         with self.assertRaisesRegex(ValueError,'only Polygon'):
             cli.read_areas(path)
+    def test_alternatives_are_distinct_and_valid(self):
+        z = np.full((40,40),100,dtype=np.float32)
+        found = cli.solve_many(self.terrain(z=z),np.array([[20.,5.],[20.,35.]]),self.args(),(),None,3)
+        self.assertGreaterEqual(len(found),2)
+        best, _ = found[0]
+        np.testing.assert_array_equal(best, cli.solve(self.terrain(z=z),np.array([[20.,5.],[20.,35.]]),self.args())[0])
+        for q, info in found[1:]:
+            np.testing.assert_array_equal(q[[0,-1]],[[20,5],[20,35]])
+            self.assertLessEqual(info['shared_with_earlier'],.9)
+
+    def test_alternatives_command_writes_numbered_files(self):
+        terrain = self.terrain()
+        gpx = self.root/'input.gpx'
+        cli.write_gpx(gpx,terrain.lonlat(np.array([[20,5],[20,34]])),[100,100],'test','test')
+        out = self.root/'out'
+        code = cli.main(['optimize',str(gpx),'--goal','last','--alternatives','3','--cache',str(self.root),
+                         '--out',str(out),'--offline'])
+        self.assertEqual(code,0)
+        report = json.loads((out/'report.json').read_text())
+        files = sorted(p.name for p in out.glob('candidate*.gpx'))
+        self.assertEqual(files[0],'candidate-2-DRAFT.gpx')
+        self.assertIn('candidate-DRAFT.gpx',files)
+        self.assertEqual(len(files),1+len(report['alternatives']))
 
 if __name__ == '__main__':
     unittest.main()

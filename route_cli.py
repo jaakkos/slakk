@@ -29,6 +29,7 @@ NVE = 'https://gis3.nve.no/arcgis/rest/services/wmts/Bratthet_med_utlop_2024/Map
 TOPO = 'https://wms.geonorge.no/skwms1/wms.topo'
 STEEP_COLORS = {(255, 255, 0), (255, 170, 0), (255, 85, 0), (255, 0, 0), (115, 0, 0)}
 RUNOUT_COLORS = {(0, 77, 168), (76, 155, 255), (154, 177, 230)}
+ALTERNATIVE_BAND_M = 50
 DISCLAIMER = ('UNVERIFIED WINTER PLANNING DRAFT. Bare-ground model only; no snow or '
               'forecast assessment. Streams, vegetation, access and turns need field checks. '
               'Mapped or unmodelled avalanche runout may affect the route. '
@@ -349,7 +350,7 @@ def edge_options(terrain, blocked, args):
         yield dr, dc, length, allowed
 
 
-def search(terrain, transitions, nearest, runout, args, start, goal):
+def search(terrain, transitions, nearest, runout, args, start, goal, extra=None):
     """A* between two cells; returns the cell path, visited count and cost."""
     costs = np.full(terrain.z.shape, np.inf)
     previous = np.full(terrain.z.shape, -1, np.int32)
@@ -371,6 +372,8 @@ def search(terrain, transitions, nearest, runout, args, start, goal):
             weight = 1 + 6 * max(0, grade-.12)**2 + 10 * max(0, -grade) + nearest[nr, nc] / args.corridor_m
             if args.runout == 'penalize' and runout[nr, nc]:
                 weight += args.runout_cost
+            if extra is not None:
+                weight += extra[nr, nc]
             value = cost + length * weight
             if value < costs[nr, nc]:
                 costs[nr, nc] = value
@@ -394,6 +397,14 @@ def search(terrain, transitions, nearest, runout, args, start, goal):
 
 def solve(terrain, reference, args, waypoints=(), avoid=None):
     """Route from the end of the preserved approach through each waypoint, in order, to the goal."""
+    return solve_many(terrain, reference, args, waypoints, avoid, 1)[0]
+
+
+def solve_many(terrain, reference, args, waypoints=(), avoid=None, count=1):
+    """Best candidate first, then up to count-1 distinct alternatives meeting the same hard constraints.
+
+    Alternatives come from re-searching with an added cost near earlier candidates; the
+    first search has no added cost, so it is identical to a single-candidate run."""
     distance = cumulative(reference, terrain.gs)
     keep = int(np.searchsorted(distance, args.keep_first_m))
     if keep >= len(reference) - 1:
@@ -430,9 +441,46 @@ def solve(terrain, reference, args, waypoints=(), avoid=None):
         if blocked[cell]:
             raise NoRoute(f'Waypoint {number} is masked by a constraint or lies outside the corridor. Constraints were not relaxed.')
     transitions = list(edge_options(terrain, blocked, args))
+    band = max(1, math.ceil(ALTERNATIVE_BAND_M / terrain.gs))
+    extra, found, notes = np.zeros(terrain.z.shape), [], []
+    for attempt in range(1 if count == 1 else 2 * count):
+        try:
+            candidate, info = route_legs(terrain, reference, keep, distance, start, goal, stops, waypoints,
+                                         transitions, nearest, runout, blocked, args, extra if found else None)
+            if count == 1:
+                return [(candidate, info)]
+        except NoRoute as exc:
+            if not found:
+                raise
+            notes.append(f'Attempt {attempt + 1}: {exc}')
+            break
+        cells = np.rint(resample(candidate, .5, 1)[1]).astype(int)
+        near = np.zeros(terrain.z.shape, bool)
+        near[cells[:, 0], cells[:, 1]] = True
+        near = dilate(near, band)
+        if found:
+            shared = max(float(earlier[cells[:, 0], cells[:, 1]].mean()) for earlier in bands)
+            if shared > 0.9:
+                notes.append(f'Attempt {attempt + 1}: more than 90% within {ALTERNATIVE_BAND_M} m of an earlier candidate; discarded.')
+                extra += near
+                continue
+            info['shared_with_earlier'] = round(shared, 3)
+            bands.append(near)
+        else:
+            bands = [near]
+        found.append((candidate, info))
+        extra += near
+        if len(found) == count:
+            break
+    if count > 1:
+        found[0][1]['alternative_notes'] = notes
+    return found
+
+
+def route_legs(terrain, reference, keep, distance, start, goal, stops, waypoints, transitions, nearest, runout, blocked, args, extra):
     route, at, visited, total = [start], start, 0, 0.
     for number, (target, exact) in enumerate(zip(stops + [goal], [*waypoints, None]), 1):
-        leg, count, cost = search(terrain, transitions, nearest, runout, args, at, target)
+        leg, count, cost = search(terrain, transitions, nearest, runout, args, at, target, extra)
         visited += count
         if leg is None:
             where = f'waypoint {number}' if exact is not None else 'the goal'
@@ -480,7 +528,11 @@ def draw_map(terrain, original, candidate, output, legend='Teal: recorded | Oran
     image.thumbnail((1400, 1800))
     sx, sy = image.width/terrain.w, image.height/terrain.h
     draw = ImageDraw.Draw(image)
-    for q, color in [(original, '#087f8c'), (candidate, '#c44300')]:
+    if isinstance(candidate, np.ndarray):
+        candidate = [candidate]
+    colors = ['#c44300', '#7b3fa0', '#2b59c3', '#2e7d32', '#8d6e00']
+    # Draw alternatives first so the best candidate stays on top.
+    for q, color in [(original, '#087f8c'), *reversed(list(zip(candidate, colors)))]:
         line = [(float((c+.5)*sx),float((r+.5)*sy)) for r,c in q]
         draw.line(line, fill='white', width=7)
         draw.line(line, fill=color, width=4)
@@ -541,17 +593,12 @@ def optimize(args):
                          '50 m route angles are not terrain slope angles. Exposure distance is not a risk score.']}
     log('Searching the terrain grid…')
     try:
-        candidate, search = solve(terrain, original, args, terrain.rc(vias[:, :2]), avoid_mask(terrain, args))
+        found = solve_many(terrain, original, args, terrain.rc(vias[:, :2]), avoid_mask(terrain, args), args.alternatives)
     except NoRoute as exc:
         return no_route(args, report, exc)
-    report.update(candidate=metrics(terrain,candidate), search=search)
     args.out.mkdir(parents=True,exist_ok=True)
-    write_gpx(args.out/'candidate-DRAFT.gpx',terrain.lonlat(candidate),terrain.sample(candidate),'UNVERIFIED ascent draft',DISCLAIMER)
     write_gpx(args.out/'recorded-ascent.gpx',selected[:,:2],terrain.sample(original),'Recorded ascent','Original ascent geometry; terrain-model elevations. '+DISCLAIMER)
-    draw_map(terrain,original,candidate,args.out/'comparison.png')
-    (args.out/'report.json').write_text(json.dumps(report,indent=2,allow_nan=False))
-    print(json.dumps({'output':str(args.out.resolve()),'original':report['original'],'candidate':report['candidate']},indent=2))
-    return 0
+    return write_candidates(args, terrain, report, found, original, 'original', 'Teal: recorded | Orange: candidate')
 
 
 def options(args):
@@ -562,6 +609,30 @@ def options(args):
 def avoid_mask(terrain, args):
     rings = [ring for areas in args.areas for ring in areas]
     return area_mask(terrain, rings) if rings else None
+
+
+def write_candidates(args, terrain, report, found, baseline, baseline_key, legend):
+    """Best candidate keeps the original file names; alternatives are numbered from 2."""
+    (candidate, search), *others = found
+    report.update(candidate=metrics(terrain,candidate), search=search)
+    write_gpx(args.out/'candidate-DRAFT.gpx',terrain.lonlat(candidate),terrain.sample(candidate),'UNVERIFIED ascent draft',DISCLAIMER)
+    if args.alternatives > 1:
+        report['alternatives'] = []
+        for number, (q, info) in enumerate(others, 2):
+            name = f'candidate-{number}-DRAFT.gpx'
+            write_gpx(args.out/name,terrain.lonlat(q),terrain.sample(q),f'UNVERIFIED ascent draft, alternative {number}',DISCLAIMER)
+            report['alternatives'].append({'file': name, **metrics(terrain,q), 'search': info})
+        if others:
+            legend += '\nAlternatives 2-5: purple, blue, green, brown'
+        else:
+            log('No distinct alternative met the same constraints; see search.alternative_notes.')
+    draw_map(terrain,baseline,[q for q,_ in found],args.out/'comparison.png',legend)
+    (args.out/'report.json').write_text(json.dumps(report,indent=2,allow_nan=False))
+    summary = {'output':str(args.out.resolve()), baseline_key:report[baseline_key], 'candidate':report['candidate']}
+    if 'alternatives' in report:
+        summary['alternatives'] = [{k:v for k,v in a.items() if k != 'search'} for a in report['alternatives']]
+    print(json.dumps(summary,indent=2))
+    return 0
 
 
 def no_route(args, report, exc):
@@ -590,16 +661,11 @@ def plan_between(args, vias):
                          '50 m route angles are not terrain slope angles. Exposure distance is not a risk score.']}
     log('Searching the terrain grid…')
     try:
-        candidate, search = solve(terrain, np.vstack([reference[0], reference[-1]]), args, reference[1:-1], avoid_mask(terrain, args))
+        found = solve_many(terrain, np.vstack([reference[0], reference[-1]]), args, reference[1:-1], avoid_mask(terrain, args), args.alternatives)
     except NoRoute as exc:
         return no_route(args, report, exc)
-    report.update(candidate=metrics(terrain,candidate), search=search)
     args.out.mkdir(parents=True,exist_ok=True)
-    write_gpx(args.out/'candidate-DRAFT.gpx',terrain.lonlat(candidate),terrain.sample(candidate),'UNVERIFIED ascent draft',DISCLAIMER)
-    draw_map(terrain,reference,candidate,args.out/'comparison.png','Teal: straight reference line | Orange: candidate')
-    (args.out/'report.json').write_text(json.dumps(report,indent=2,allow_nan=False))
-    print(json.dumps({'output':str(args.out.resolve()),'reference_line':report['reference_line'],'candidate':report['candidate']},indent=2))
-    return 0
+    return write_candidates(args, terrain, report, found, reference, 'reference_line', 'Teal: straight reference line | Orange: candidate')
 
 
 def latlon(text):
@@ -628,6 +694,7 @@ def parser():
     opt.add_argument('--out',type=Path,required=True,help='Output directory; must be new or empty')
     opt.add_argument('--cache',type=Path,required=True,help='Area-specific terrain cache; existing cache controls grid/resolution')
     opt.add_argument('--avoid',type=Path,action='append',metavar='GEOJSON',help='GeoJSON Polygon/MultiPolygon areas to exclude; repeatable')
+    opt.add_argument('--alternatives',type=int,default=1,choices=range(1,6),metavar='N',help='Also search for up to N-1 distinct alternatives (1-5) under the same constraints')
     opt.add_argument('--offline',action='store_true',help='Require an existing terrain cache; make no downloads')
     opt.add_argument('--goal',choices=['highest','last'],help='End at the highest GPX elevation or the final point (GPX only; default: highest)')
     opt.add_argument('--start',type=latlon,metavar='LAT,LON',help='Plan without a GPX: exact start point')

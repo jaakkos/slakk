@@ -122,6 +122,23 @@ is relaxed. `report.json` records each file's SHA-256 under `avoid_sha256`.
 To keep a known stream crossing, combine an exclusion area along the stream
 with a `--via` point at the crossing.
 
+## Alternatives
+
+`--alternatives N` (2–5) searches again after each candidate, adding a cost to
+cells within 50 m of earlier candidates, so later searches look for a
+different line. Every alternative meets exactly the same hard constraints and
+gets the same full validation. One that runs more than 90% within 50 m of an
+earlier candidate is discarded. The best-cost candidate is still
+`candidate-DRAFT.gpx`; alternatives are `candidate-2-DRAFT.gpx` and so on.
+
+`report.json` lists each alternative's distance, ascent, 50 m gradients, NVE
+steep and runout distance, and `shared_with_earlier` (the fraction close to an
+earlier candidate). The search `cost` of an alternative includes the added
+diversity cost, so compare the metrics, not the cost. A lower-cost route can
+have a steeper maximum gradient than an alternative; that is the tradeoff to
+read. Fewer than N-1 alternatives can be found; `search.alternative_notes`
+says why.
+
 ## Plan without a recorded track
 
 Give `--start` and `--end` instead of a GPX. The corridor then follows straight
@@ -174,6 +191,7 @@ produce an error rather than prompting for credentials.
   terrain-model elevations, no timestamps.
 - `recorded-ascent.gpx`: original ascent geometry with the same elevation model.
 - `comparison.png`: teal recorded route, orange candidate, Kartverket background.
+- `candidate-2-DRAFT.gpx` …: alternatives, only with `--alternatives`.
 - `report.json`: settings, provenance, cache metadata, search outcome and metrics.
   Since 0.2.0 it also records `mode` (`gpx` or `coordinates`), the `start`,
   `end`, `via` and `avoid` options, `avoid_sha256`, and `search.waypoints`.
@@ -189,6 +207,7 @@ looking like a new result. The original input is never modified.
 | `--start`, `--end` | — | `LAT,LON`; plan without a GPX |
 | `--via` | — | `LAT,LON`; mandatory waypoint, repeatable, visited in order |
 | `--avoid` | — | GeoJSON polygon file to exclude, repeatable |
+| `--alternatives N` | `1` | Also search for up to N-1 distinct alternatives |
 | `--keep-first-m` | `0` | Follow the original approach for this distance |
 | `--corridor-m` | `600` | Search distance around the original ascent |
 | `--resolution-m` | `6` | Approximate ground cell size for a **new** cache |
@@ -265,7 +284,7 @@ The tests exercise exact endpoints, steep barriers, non-jumpable elevation
 steps, hazard validation of the preserved approach, unknown map colours,
 disconnected GPX segments, Strava coordinate conversion with a mocked API,
 mandatory waypoints (exact pass-through, masked or unreachable waypoints), and
-coordinate-only planning, and GeoJSON exclusion areas.
+coordinate-only planning, GeoJSON exclusion areas, and distinct alternatives.
 The optimizer was also run end-to-end on the downloaded activity and cached
 Kartverket/NVE data. Live Strava API authentication was not tested; the original
 GPX download used the browser.
