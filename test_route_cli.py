@@ -289,6 +289,12 @@ class RouteTests(unittest.TestCase):
             self.assertEqual(call.call_args.kwargs['form']['grant_type'],'refresh_token')
             self.assertEqual(call.call_args.kwargs['form']['refresh_token'],'r1')
             self.assertEqual(json.loads(cli.token_file().read_text())['refresh_token'],'r2')
+    def test_search_and_dense_validation_agree_on_rough_terrain(self):
+        # Seed 2 found a route in 0.2.0 that the 1 m validation then rejected (edges were checked at 4 points).
+        rng = np.random.default_rng(2)
+        z = (100 + np.cumsum(rng.normal(0.4,1.6,(40,40)),axis=1)).astype(np.float32)
+        q, info = cli.solve(self.terrain(z=z),np.array([[20.,5.],[20.,35.]]),self.args('--max-terrain-deg','60'))
+        self.assertLessEqual(info['max_sampled_uphill_deg'],15.15)
 
 if __name__ == '__main__':
     unittest.main()

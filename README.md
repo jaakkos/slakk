@@ -315,7 +315,8 @@ not yet been checked against real tracks.
 The search uses a 16-neighbour raster graph. Its cost combines distance,
 steepness, small descents, departure from the recorded corridor and optional
 runout penalties. A* uses a straight-line admissible heuristic. Edge profiles
-are sampled at quarter steps; rectangular cell checks prevent cutting corners
+are sampled at half the final validation spacing (0.5 m or finer), so the
+search cannot accept a step that the final check rejects; rectangular cell checks prevent cutting corners
 through excluded areas. Only exactly collinear points are removed after search.
 The complete route is then checked at 1 m spacing or finer, including the
 preserved approach and the joins to the exact endpoints. Sampling more densely

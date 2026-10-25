@@ -458,6 +458,10 @@ def shift(a, dr, dc):
     return np.roll(np.roll(a, -dr, axis=0), -dc, axis=1)
 
 
+def validation_spacing(terrain):
+    return min(1, terrain.gs / 4)
+
+
 def edge_options(terrain, blocked, args):
     """Precompute traversable edge profiles, including intermediate elevations."""
     dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1),
@@ -468,14 +472,17 @@ def edge_options(terrain, blocked, args):
         for r in range(min(0, dr), max(0, dr) + 1):
             for c in range(min(0, dc), max(0, dc) + 1):
                 allowed &= ~shift(blocked, r, c)
+        # Sample at half the final validation spacing, so the search cannot accept an edge
+        # whose short steep section the dense validation of the whole route would reject.
+        parts = max(4, math.ceil(length / (validation_spacing(terrain) / 2)))
         previous = terrain.z
-        for fraction in [.25, .5, .75, 1.]:
+        for fraction in np.arange(1, parts + 1) / parts:
             rr, cc = dr * fraction, dc * fraction
             ri, ci = math.floor(rr), math.floor(cc)
             a, b = rr - ri, cc - ci
             height = (shift(terrain.z,ri,ci)*(1-a)*(1-b) + shift(terrain.z,ri+1,ci)*a*(1-b)
                       + shift(terrain.z,ri,ci+1)*(1-a)*b + shift(terrain.z,ri+1,ci+1)*a*b)
-            grade = (height - previous) / (length / 4)
+            grade = (height - previous) / (length / parts)
             allowed &= np.isfinite(grade) & (grade <= math.tan(math.radians(args.max_uphill_deg)))
             allowed &= grade >= -math.tan(math.radians(args.max_downhill_deg))
             previous = height
@@ -688,16 +695,20 @@ def route_legs(terrain, reference, keep, distance, start, goal, stops, waypoints
     candidate = np.vstack([reference[:keep+1], route, reference[-1]])
     candidate = candidate[np.r_[True, np.linalg.norm(np.diff(candidate,axis=0),axis=1) > 1e-8]]
     # Full candidate validation includes the preserved approach and endpoint connectors.
-    positions, dense = resample(candidate, min(1, terrain.gs/4), terrain.gs)
+    positions, dense = resample(candidate, validation_spacing(terrain), terrain.gs)
     ij = np.rint(dense).astype(int)
     if blocked[ij[:,0], ij[:,1]].any():
         raise NoRoute('The preserved approach, a waypoint join or an endpoint connector violates a hard constraint. No GPX emitted.')
     heights = terrain.sample(dense)
     angles = np.degrees(np.arctan(np.diff(heights)/np.diff(positions)))
-    if angles.max() > args.max_uphill_deg + .15 or angles.min() < -args.max_downhill_deg - .15:
-        raise NoRoute('Dense validation found a short section exceeding the slope limits (possibly a connector, waypoint join or preserved approach). No GPX emitted.')
+    bad = (angles > args.max_uphill_deg + .15) | (angles < -args.max_downhill_deg - .15)
+    if bad.any():
+        at = float(positions[np.argmax(bad)])
+        part = 'in the preserved approach' if at < distance[keep] else 'in the searched route, a waypoint join or the end connector'
+        raise NoRoute(f'Dense validation found {np.count_nonzero(bad)} short section(s) exceeding the slope limits, the first at '
+                      f'{at:.0f} m ({part}; steepest {angles.max():.2f}° up, {-angles.min():.2f}° down). No GPX emitted.')
     return candidate, {'visited_nodes': visited, 'cost': total, 'preserved_m': float(distance[keep]), 'waypoints': len(stops),
-                       'max_sampled_uphill_deg': float(angles.max()), 'validation_spacing_m': min(1, terrain.gs/4)}
+                       'max_sampled_uphill_deg': float(angles.max()), 'validation_spacing_m': validation_spacing(terrain)}
 
 
 def kick_turns(dense, gs):
