@@ -142,6 +142,41 @@ class RouteTests(unittest.TestCase):
     def test_bad_coordinate_text_is_a_usage_error(self):
         with self.assertRaises(SystemExit):
             cli.parser().parse_args(['optimize','--start','61.2','--end','61,7','--out','o','--cache','c'])
+    def write_area(self, terrain, corners, name='avoid.geojson'):
+        ring = terrain.lonlat(np.array(corners,float)).tolist()
+        path = self.root/name
+        path.write_text(json.dumps({'type':'FeatureCollection','features':[
+            {'type':'Feature','properties':{},'geometry':{'type':'Polygon','coordinates':[ring+[ring[0]]]}}]}))
+        return path
+
+    def test_avoid_area_is_never_entered(self):
+        terrain = self.terrain()
+        corners = [[14,10],[14,30],[26,30],[26,10]]
+        rings = cli.read_areas(self.write_area(terrain,corners))
+        mask = cli.area_mask(terrain,rings)
+        q, _ = cli.solve(terrain,np.array([[20.,5.],[20.,35.]]),self.args(),(),mask)
+        _, dense = cli.resample(q,.25,1)
+        ij = np.rint(dense).astype(int)
+        self.assertFalse(mask[ij[:,0],ij[:,1]].any())
+        self.assertTrue(mask[20,20] and mask[14,10] and mask[26,30])
+
+    def test_avoid_area_covering_goal_gives_no_route(self):
+        terrain = self.terrain()
+        path = self.write_area(terrain,[[15,30],[15,38],[25,38],[25,30]])
+        gpx = self.root/'input.gpx'
+        cli.write_gpx(gpx,terrain.lonlat(np.array([[20,5],[20,34]])),[100,100],'test','test')
+        code = cli.main(['optimize',str(gpx),'--goal','last','--avoid',str(path),'--cache',str(self.root),
+                         '--out',str(self.root/'out'),'--offline'])
+        self.assertEqual(code,3)
+        report = json.loads((self.root/'out'/'report.json').read_text())
+        self.assertIn('avoid',report['reason'])
+        self.assertEqual(list(report['avoid_sha256']),[str(path)])
+
+    def test_non_polygon_area_is_rejected(self):
+        path = self.root/'line.geojson'
+        path.write_text(json.dumps({'type':'LineString','coordinates':[[0,0],[1,1]]}))
+        with self.assertRaisesRegex(ValueError,'only Polygon'):
+            cli.read_areas(path)
 
 if __name__ == '__main__':
     unittest.main()

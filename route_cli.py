@@ -276,6 +276,43 @@ class Terrain:
         return values[0]*(1-dr)*(1-dc)+values[1]*dr*(1-dc)+values[2]*(1-dr)*dc+values[3]*dr*dc
 
 
+def read_areas(path):
+    """Outer rings of GeoJSON Polygon/MultiPolygon features as [lon, lat] arrays. Holes are ignored, so they stay excluded."""
+    data = json.loads(path.read_text())
+    features = data.get('features', [data]) if data.get('type') == 'FeatureCollection' else [data]
+    rings = []
+    for feature in features:
+        geometry = feature.get('geometry', feature) if feature.get('type') == 'Feature' else feature
+        kind = (geometry or {}).get('type')
+        if kind == 'Polygon':
+            polygons = [geometry['coordinates']]
+        elif kind == 'MultiPolygon':
+            polygons = geometry['coordinates']
+        else:
+            raise ValueError(f'{path}: only Polygon and MultiPolygon areas are supported, not {kind}.')
+        for polygon in polygons:
+            ring = np.asarray(polygon[0], dtype=float)
+            if ring.ndim != 2 or len(ring) < 4 or not np.isfinite(ring[:, :2]).all() or np.any(abs(ring[:, 1]) > 80):
+                raise ValueError(f'{path}: invalid polygon ring.')
+            rings.append(ring[:, :2])
+    if not rings:
+        raise ValueError(f'{path}: no areas found.')
+    return rings
+
+
+def area_mask(terrain, rings):
+    """Rasterize exclusion areas; any touched cell is excluded, plus one cell of margin."""
+    image = Image.new('1', (terrain.w, terrain.h), 0)
+    draw = ImageDraw.Draw(image)
+    for ring in rings:
+        rc = terrain.rc(ring)
+        draw.polygon([(float(c), float(r)) for r, c in rc], fill=1, outline=1)
+    mask = dilate(np.array(image, bool), 1)
+    if not mask.any():
+        log('Warning: no --avoid area overlaps the terrain grid.')
+    return mask
+
+
 def dilate(mask, radius):
     result = mask.copy()
     for _ in range(radius):
@@ -355,7 +392,7 @@ def search(terrain, transitions, nearest, runout, args, start, goal):
     return route, visited, float(costs[goal])
 
 
-def solve(terrain, reference, args, waypoints=()):
+def solve(terrain, reference, args, waypoints=(), avoid=None):
     """Route from the end of the preserved approach through each waypoint, in order, to the goal."""
     distance = cumulative(reference, terrain.gs)
     keep = int(np.searchsorted(distance, args.keep_first_m))
@@ -379,13 +416,15 @@ def solve(terrain, reference, args, waypoints=()):
         blocked |= cols < nearest_col - args.side_tolerance_m / terrain.gs
     if args.side == 'west':
         blocked |= cols > nearest_col + args.side_tolerance_m / terrain.gs
+    if avoid is not None:
+        blocked |= avoid
     runout = dilate(terrain.runout, math.ceil(args.runout_buffer_m / terrain.gs))
     if args.runout == 'avoid':
         blocked |= runout
     blocked[:3] = blocked[-3:] = True
     blocked[:, :3] = blocked[:, -3:] = True
     if blocked[start] or blocked[goal]:
-        raise NoRoute('A search endpoint is masked by a constraint. Inspect it; constraints were not relaxed.')
+        raise NoRoute('A search endpoint is masked by a constraint (or an --avoid area). Inspect it; constraints were not relaxed.')
     stops = [tuple(np.rint(w).astype(int)) for w in waypoints]
     for number, cell in enumerate(stops, 1):
         if blocked[cell]:
@@ -473,6 +512,7 @@ def optimize(args):
     if not args.input and (args.goal or args.keep_first_m):
         raise ValueError('--goal and --keep-first-m need a recorded GPX.')
     vias = np.array([[lon, lat, np.nan] for lat, lon in args.via or []]).reshape(-1, 3)
+    args.areas = [read_areas(path) for path in args.avoid or []]
     if not args.input:
         return plan_between(args, vias)
     args.goal = args.goal or 'highest'
@@ -492,7 +532,7 @@ def optimize(args):
     terrain.sample(terrain.rc(vias[:,:2]))
     report = {'status': 'unverified_candidate', 'disclaimer': DISCLAIMER, 'mode': 'gpx',
               'input_sha256': hashlib.sha256(args.input.read_bytes()).hexdigest(),
-              'goal_index_zero_based': stop, 'options': {k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items() if k!='handler'},
+              'goal_index_zero_based': stop, 'options': options(args), 'avoid_sha256': {str(f): hashlib.sha256(f.read_bytes()).hexdigest() for f in args.avoid or []},
               'terrain': terrain.grid, 'original': metrics(terrain, original),
               'limits': ['Norwegian map-service coverage only.', 'NVE transparent pixels may be unmarked or unmapped; they are not safety clearance.',
                          'No snowpack, live forecast, vegetation, water-crossing or land-access model.',
@@ -501,7 +541,7 @@ def optimize(args):
                          '50 m route angles are not terrain slope angles. Exposure distance is not a risk score.']}
     log('Searching the terrain grid…')
     try:
-        candidate, search = solve(terrain, original, args, terrain.rc(vias[:, :2]))
+        candidate, search = solve(terrain, original, args, terrain.rc(vias[:, :2]), avoid_mask(terrain, args))
     except NoRoute as exc:
         return no_route(args, report, exc)
     report.update(candidate=metrics(terrain,candidate), search=search)
@@ -512,6 +552,16 @@ def optimize(args):
     (args.out/'report.json').write_text(json.dumps(report,indent=2,allow_nan=False))
     print(json.dumps({'output':str(args.out.resolve()),'original':report['original'],'candidate':report['candidate']},indent=2))
     return 0
+
+
+def options(args):
+    text = lambda v: [text(x) for x in v] if isinstance(v, list) else str(v) if isinstance(v, Path) else v
+    return {k: text(v) for k, v in vars(args).items() if k not in ('handler', 'areas')}
+
+
+def avoid_mask(terrain, args):
+    rings = [ring for areas in args.areas for ring in areas]
+    return area_mask(terrain, rings) if rings else None
 
 
 def no_route(args, report, exc):
@@ -530,7 +580,7 @@ def plan_between(args, vias):
     reference = terrain.rc(points[:, :2])
     terrain.sample(reference)
     report = {'status': 'unverified_candidate', 'disclaimer': DISCLAIMER, 'mode': 'coordinates',
-              'options': {k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items() if k!='handler'},
+              'options': options(args), 'avoid_sha256': {str(f): hashlib.sha256(f.read_bytes()).hexdigest() for f in args.avoid or []},
               'terrain': terrain.grid, 'reference_line': metrics(terrain, reference),
               'limits': ['Norwegian map-service coverage only.', 'NVE transparent pixels may be unmarked or unmapped; they are not safety clearance.',
                          'No snowpack, live forecast, vegetation, water-crossing or land-access model.',
@@ -540,7 +590,7 @@ def plan_between(args, vias):
                          '50 m route angles are not terrain slope angles. Exposure distance is not a risk score.']}
     log('Searching the terrain grid…')
     try:
-        candidate, search = solve(terrain, np.vstack([reference[0], reference[-1]]), args, reference[1:-1])
+        candidate, search = solve(terrain, np.vstack([reference[0], reference[-1]]), args, reference[1:-1], avoid_mask(terrain, args))
     except NoRoute as exc:
         return no_route(args, report, exc)
     report.update(candidate=metrics(terrain,candidate), search=search)
@@ -577,6 +627,7 @@ def parser():
     opt.add_argument('input',type=Path,nargs='?',help='Recorded GPX with one continuous track segment or one route; omit when using --start/--end')
     opt.add_argument('--out',type=Path,required=True,help='Output directory; must be new or empty')
     opt.add_argument('--cache',type=Path,required=True,help='Area-specific terrain cache; existing cache controls grid/resolution')
+    opt.add_argument('--avoid',type=Path,action='append',metavar='GEOJSON',help='GeoJSON Polygon/MultiPolygon areas to exclude; repeatable')
     opt.add_argument('--offline',action='store_true',help='Require an existing terrain cache; make no downloads')
     opt.add_argument('--goal',choices=['highest','last'],help='End at the highest GPX elevation or the final point (GPX only; default: highest)')
     opt.add_argument('--start',type=latlon,metavar='LAT,LON',help='Plan without a GPX: exact start point')

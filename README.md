@@ -103,6 +103,25 @@ A waypoint is never skipped or moved. If it lies in masked terrain or outside
 the corridor, or a leg to it has no feasible path, the run ends with exit code
 **3** and a report naming the waypoint or leg.
 
+## Exclusion areas
+
+Draw areas to keep out of, such as a gorge, a farm or a known bad stream bank,
+in any GeoJSON editor (for example [geojson.io](https://geojson.io)) and save
+them as Polygon or MultiPolygon features. Pass each file with `--avoid`:
+
+```sh
+route-cli optimize walk.gpx --out draft --cache terrain-cache \
+  --avoid gorge.geojson --avoid farmland.geojson
+```
+
+Every grid cell an area touches is excluded, plus one cell of margin. Holes in
+polygons are ignored, so they stay excluded. Areas apply to the whole
+candidate, including a preserved approach. If an area covers an endpoint,
+waypoint or the only way through, the run ends with exit code **3**; nothing
+is relaxed. `report.json` records each file's SHA-256 under `avoid_sha256`.
+To keep a known stream crossing, combine an exclusion area along the stream
+with a `--via` point at the crossing.
+
 ## Plan without a recorded track
 
 Give `--start` and `--end` instead of a GPX. The corridor then follows straight
@@ -157,7 +176,7 @@ produce an error rather than prompting for credentials.
 - `comparison.png`: teal recorded route, orange candidate, Kartverket background.
 - `report.json`: settings, provenance, cache metadata, search outcome and metrics.
   Since 0.2.0 it also records `mode` (`gpx` or `coordinates`), the `start`,
-  `end` and `via` options, and `search.waypoints`.
+  `end`, `via` and `avoid` options, `avoid_sha256`, and `search.waypoints`.
 
 Output directories must be empty, so a failed run cannot leave an older GPX
 looking like a new result. The original input is never modified.
@@ -169,6 +188,7 @@ looking like a new result. The original input is never modified.
 | `--goal highest\|last` | `highest` | End at the highest GPX elevation or the final point (GPX only) |
 | `--start`, `--end` | — | `LAT,LON`; plan without a GPX |
 | `--via` | — | `LAT,LON`; mandatory waypoint, repeatable, visited in order |
+| `--avoid` | — | GeoJSON polygon file to exclude, repeatable |
 | `--keep-first-m` | `0` | Follow the original approach for this distance |
 | `--corridor-m` | `600` | Search distance around the original ascent |
 | `--resolution-m` | `6` | Approximate ground cell size for a **new** cache |
@@ -245,7 +265,7 @@ The tests exercise exact endpoints, steep barriers, non-jumpable elevation
 steps, hazard validation of the preserved approach, unknown map colours,
 disconnected GPX segments, Strava coordinate conversion with a mocked API,
 mandatory waypoints (exact pass-through, masked or unreachable waypoints), and
-coordinate-only planning.
+coordinate-only planning, and GeoJSON exclusion areas.
 The optimizer was also run end-to-end on the downloaded activity and cached
 Kartverket/NVE data. Live Strava API authentication was not tested; the original
 GPX download used the browser.
