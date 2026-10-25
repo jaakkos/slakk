@@ -2,6 +2,7 @@
 """Norwegian terrain-based ascent planning. Generates unverified GPX candidates."""
 import argparse
 import base64
+import copy
 import hashlib
 import heapq
 import io
@@ -33,6 +34,10 @@ MAP_TILE_PX, MAP_MAX_PX = 2048, 6000
 STEEP_COLORS = {(255, 255, 0), (255, 170, 0), (255, 85, 0), (255, 0, 0), (115, 0, 0)}
 RUNOUT_COLORS = {(0, 77, 168), (76, 155, 255), (154, 177, 230)}
 ALTERNATIVE_BAND_M = 50
+# Largest terrain grid, in cells; a single DEM request is also limited to 4096 px per side.
+MAX_CELLS = 6_000_000
+# With --pitch-deg, over-limit stretches separated by less than this are counted as one pitch.
+PITCH_GAP_M = 3
 # NVE marks terrain from 30 degrees; check a little above that to tolerate model differences.
 COVERAGE_SLOPE_DEG, COVERAGE_MIN_CELLS, COVERAGE_MIN_AGREEMENT = 33, 50, 0.5
 # Landforms from topographic position (cell height minus the mean height around it), at two scales:
@@ -40,6 +45,8 @@ COVERAGE_SLOPE_DEG, COVERAGE_MIN_CELLS, COVERAGE_MIN_AGREEMENT = 33, 50, 0.5
 # surroundings, otherwise a ridge if either is clearly above. Thresholds are metres of relief.
 LANDFORM_RADII_M, LANDFORM_RELIEF_M = (15, 60), (1.0, 3.0)
 UNKNOWN, OTHER, RIDGE, GULLY = -1, 0, 1, 2
+PITCH_LIMIT = ('--pitch-deg judges the slope limits on terrain averaged over --pitch-window-m, so short pitches up to --pitch-deg '
+               'are allowed; they are steeper than --max-uphill-deg and may need bootpacking or care in hard snow.')
 ROUTE_COLORS = ['#c44300', '#7b3fa0', '#2b59c3', '#2e7d32', '#8d6e00']
 LANDFORM_LIMIT = ('Ridge and gully labels describe terrain-model shape only, at grid resolution; features narrower than about '
                   'two cells are not detected. A ridge is not safer: check cornices, wind slab and exposure.')
@@ -292,7 +299,7 @@ def get_terrain(points, args):
     low = np.floor((xy.min(axis=0) - margin) / resolution) * resolution
     high = np.ceil((xy.max(axis=0) + margin) / resolution) * resolution
     width, height = np.rint((high - low) / resolution).astype(int)
-    if width * height > 1_500_000 or max(width, height) > 4096:
+    if width * height > MAX_CELLS or max(width, height) > 4096:
         raise ValueError('Requested grid is too large. Increase --resolution-m or reduce --corridor-m.')
     grid = {'provider': 'kartverket-nve-v1', 'bbox': [*low.tolist(), *high.tolist()],
             'width': int(width), 'height': int(height), 'resolution': resolution,
@@ -373,7 +380,7 @@ class Terrain:
             if tie and not np.allclose(tie[3:5], [self.bbox[0], self.bbox[3]], atol=0.01, rtol=0):
                 raise ValueError('DEM origin disagrees with cache manifest.')
         self.h, self.w = self.z.shape
-        if [self.w, self.h] != [grid['width'], grid['height']] or self.h * self.w > 1_500_000:
+        if [self.w, self.h] != [grid['width'], grid['height']] or self.h * self.w > MAX_CELLS:
             raise ValueError('Invalid or oversized cached DEM dimensions.')
         if not np.allclose([self.w * self.res, self.h * self.res], self.bbox[2:] - self.bbox[:2]):
             raise ValueError('Cache bounds do not match the raster grid.')
@@ -506,8 +513,34 @@ def landform_cost(terrain, args):
     return args.gully_cost * (land == GULLY) + args.ridge_cost * (land != RIDGE)
 
 
-def edge_options(terrain, blocked, args):
-    """Precompute traversable edge profiles, including intermediate elevations."""
+def smoothed(terrain, args):
+    """With --pitch-deg, a copy of the terrain whose heights are averaged over a --pitch-window-m square;
+    the slope limits are judged on it. Without, the terrain itself."""
+    if not args.pitch_deg:
+        return terrain
+    radius = max(1, round(args.pitch_window_m / 2 / terrain.gs))
+    valid = (~terrain.invalid).astype(float)
+    limit = copy.copy(terrain)
+    limit.z = np.where(terrain.invalid, np.nan,
+                       window_sum(np.where(terrain.invalid, 0, terrain.z), radius) / np.maximum(window_sum(valid, radius), 1))
+    limit.slope = np.degrees(np.arctan(np.hypot(*np.gradient(np.where(terrain.invalid, 0, limit.z), terrain.gs))))
+    limit.window_m = (2 * radius + 1) * terrain.gs
+    return limit
+
+
+def edge_height(z, rr, cc):
+    """Bilinear height at offset (rr, cc) cells from every cell."""
+    ri, ci = math.floor(rr), math.floor(cc)
+    a, b = rr - ri, cc - ci
+    return (shift(z,ri,ci)*(1-a)*(1-b) + shift(z,ri+1,ci)*a*(1-b) + shift(z,ri,ci+1)*(1-a)*b + shift(z,ri+1,ci+1)*a*b)
+
+
+def edge_options(terrain, blocked, args, raw=None):
+    """Precompute traversable edge profiles, including intermediate elevations.
+
+    With raw (the unsmoothed terrain of a --pitch-deg run, where terrain is the smoothed copy), every raw
+    sample must also stay within --pitch-deg, and each edge carries the fraction of its raw samples steeper
+    than --max-uphill-deg (None otherwise)."""
     dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1),
             (2,1),(2,-1),(-2,1),(-2,-1),(1,2),(1,-2),(-1,2),(-1,-2)]
     for dr, dc in dirs:
@@ -519,31 +552,38 @@ def edge_options(terrain, blocked, args):
         # Sample at half the final validation spacing, so the search cannot accept an edge
         # whose short steep section the dense validation of the whole route would reject.
         parts = max(4, math.ceil(length / (validation_spacing(terrain) / 2)))
-        previous = terrain.z
+        previous, over = terrain.z, None
+        if raw is not None:
+            raw_previous, over = raw.z, np.zeros(terrain.z.shape, np.float32)
         for fraction in np.arange(1, parts + 1) / parts:
             rr, cc = dr * fraction, dc * fraction
-            ri, ci = math.floor(rr), math.floor(cc)
-            a, b = rr - ri, cc - ci
-            height = (shift(terrain.z,ri,ci)*(1-a)*(1-b) + shift(terrain.z,ri+1,ci)*a*(1-b)
-                      + shift(terrain.z,ri,ci+1)*(1-a)*b + shift(terrain.z,ri+1,ci+1)*a*b)
+            height = edge_height(terrain.z, rr, cc)
             grade = (height - previous) / (length / parts)
             allowed &= np.isfinite(grade) & (grade <= math.tan(math.radians(args.max_uphill_deg)))
             allowed &= grade >= -math.tan(math.radians(args.max_downhill_deg))
             previous = height
-        yield dr, dc, length, allowed
+            if raw is not None:
+                height = edge_height(raw.z, rr, cc)
+                grade = (height - raw_previous) / (length / parts)
+                allowed &= np.isfinite(grade) & (abs(grade) <= math.tan(math.radians(args.pitch_deg)))
+                over += grade > math.tan(math.radians(args.max_uphill_deg))
+                raw_previous = height
+        yield dr, dc, length, allowed, None if over is None else over / parts
 
 
 def step_costs(terrain, transitions, nearest, runout, args, extra=None, land=None):
     """Cost of every allowed edge from each cell, as one array per direction (inf where not allowed).
     Same arithmetic, in the same order, as evaluating each edge inside the search loop."""
     steps = []
-    for dr, dc, length, allowed in transitions:
+    for dr, dc, length, allowed, over in transitions:
         grade = (shift(terrain.z, dr, dc) - terrain.z) / length
         weight = 1 + 6 * np.maximum(0, grade-.12)**2 + 10 * np.maximum(0, -grade) + shift(nearest, dr, dc) / args.corridor_m
         if args.runout == 'penalize':
             weight = np.where(shift(runout, dr, dc), weight + args.runout_cost, weight)
         if land is not None:
             weight = weight + shift(land, dr, dc)
+        if over is not None:
+            weight = weight + args.pitch_cost * over
         if extra is not None:
             weight += shift(extra, dr, dc)
         with np.errstate(invalid='ignore'):
@@ -668,7 +708,10 @@ def solve_many(terrain, reference, args, waypoints=(), avoid=None, count=1):
         window[closer] = dsq[closer]
         nearest_col[r0:r1, c0:c1][closer] = c
     nearest = np.sqrt(nearest) * terrain.gs
-    blocked = dilate(terrain.invalid, 1) | (terrain.slope > args.max_terrain_deg)
+    limit = smoothed(terrain, args)
+    blocked = dilate(terrain.invalid, 1) | (limit.slope > args.max_terrain_deg)
+    if args.pitch_deg:
+        blocked |= terrain.slope > args.pitch_terrain_deg
     blocked |= dilate(terrain.steep, math.ceil(args.steep_buffer_m / terrain.gs))
     blocked |= nearest > args.corridor_m
     if args.side == 'east':
@@ -688,14 +731,14 @@ def solve_many(terrain, reference, args, waypoints=(), avoid=None, count=1):
     for number, cell in enumerate(stops, 1):
         if blocked[cell]:
             raise NoRoute(f'Waypoint {number} is masked by a constraint or lies outside the corridor. Constraints were not relaxed.')
-    transitions = list(edge_options(terrain, blocked, args))
+    transitions = list(edge_options(limit, blocked, args, terrain if args.pitch_deg else None))
     land = landform_cost(terrain, args)
     band = max(1, math.ceil(ALTERNATIVE_BAND_M / terrain.gs))
     extra, found, notes = np.zeros(terrain.z.shape), [], []
     for attempt in range(1 if count == 1 else 2 * count):
         try:
             candidate, info = route_legs(terrain, reference, keep, distance, start, goal, stops, waypoints,
-                                         step_costs(terrain, transitions, nearest, runout, args, extra if found else None, land), blocked, args)
+                                         step_costs(terrain, transitions, nearest, runout, args, extra if found else None, land), blocked, args, limit)
             if count == 1:
                 return [(candidate, info)]
         except NoRoute as exc:
@@ -726,7 +769,7 @@ def solve_many(terrain, reference, args, waypoints=(), avoid=None, count=1):
     return found
 
 
-def route_legs(terrain, reference, keep, distance, start, goal, stops, waypoints, steps, blocked, args):
+def route_legs(terrain, reference, keep, distance, start, goal, stops, waypoints, steps, blocked, args, limit=None):
     route, at, visited, total = [start], start, 0, 0.
     for number, (target, exact) in enumerate(zip(stops + [goal], [*waypoints, None]), 1):
         leg, count, cost = search(terrain, steps, args, at, target)
@@ -746,16 +789,41 @@ def route_legs(terrain, reference, keep, distance, start, goal, stops, waypoints
     ij = np.rint(dense).astype(int)
     if blocked[ij[:,0], ij[:,1]].any():
         raise NoRoute('The preserved approach, a waypoint join or an endpoint connector violates a hard constraint. No GPX emitted.')
-    heights = terrain.sample(dense)
+    heights = (limit or terrain).sample(dense)
     angles = np.degrees(np.arctan(np.diff(heights)/np.diff(positions)))
     bad = (angles > args.max_uphill_deg + .15) | (angles < -args.max_downhill_deg - .15)
+    pitch = {}
+    if args.pitch_deg:
+        raw = np.degrees(np.arctan(np.diff(terrain.sample(dense))/np.diff(positions)))
+        bad |= np.abs(raw) > args.pitch_deg + .15
+        pitch = pitches(positions, raw, args.max_uphill_deg)
+        if not bad.any() and pitch['longest_pitch_m'] > args.pitch_max_m:
+            raise NoRoute(f"The best candidate has a {pitch['longest_pitch_m']:.0f} m pitch steeper than {args.max_uphill_deg:g}° on the "
+                          f"unsmoothed terrain, over --pitch-max-m {args.pitch_max_m:g}. No GPX emitted; try a higher --pitch-cost.")
+        pitch.update(smoothing_window_m=round(limit.window_m, 1), max_raw_uphill_deg=round(float(raw.max()), 2))
     if bad.any():
         at = float(positions[np.argmax(bad)])
         part = 'in the preserved approach' if at < distance[keep] else 'in the searched route, a waypoint join or the end connector'
         raise NoRoute(f'Dense validation found {np.count_nonzero(bad)} short section(s) exceeding the slope limits, the first at '
                       f'{at:.0f} m ({part}; steepest {angles.max():.2f}° up, {-angles.min():.2f}° down). No GPX emitted.')
     return candidate, {'visited_nodes': visited, 'cost': total, 'preserved_m': float(distance[keep]), 'waypoints': len(stops),
-                       'max_sampled_uphill_deg': float(angles.max()), 'validation_spacing_m': validation_spacing(terrain)}
+                       'max_sampled_uphill_deg': float(angles.max()), 'validation_spacing_m': validation_spacing(terrain), **pitch}
+
+
+def pitches(positions, angles, limit):
+    """Total distance steeper than limit, and the longest such stretch, merging gaps under PITCH_GAP_M."""
+    lengths = np.diff(positions)
+    over = angles > limit
+    longest = run = gap = 0.
+    for length, steep in zip(lengths, over):
+        if steep:
+            run, gap = run + gap + length, 0.
+            longest = max(longest, run)
+        elif run:
+            gap += length
+            if gap >= PITCH_GAP_M:
+                run = gap = 0.
+    return {'over_limit_raw_m': round(float(lengths @ over), 1), 'longest_pitch_m': round(float(longest), 1)}
 
 
 def kick_turns(dense, gs):
@@ -768,7 +836,7 @@ def kick_turns(dense, gs):
     return int(np.count_nonzero(sharp[1:] & ~sharp[:-1]) + (1 if sharp.size and sharp[0] else 0))
 
 
-def metrics(terrain, q, window=50):
+def metrics(terrain, q, window=50, pitch=None):
     positions, dense = resample(q, 5, terrain.gs)
     height = terrain.sample(dense)
     ij = np.rint(dense).astype(int)
@@ -787,6 +855,9 @@ def metrics(terrain, q, window=50):
         change = np.interp(start+window, positions, height)-np.interp(start, positions, height)
         angles = np.degrees(np.arctan(change/window))
         stats.update({f'max_{window:g}m_deg': round(float(angles.max()), 2), f'p95_{window:g}m_deg': round(float(np.percentile(angles,95)), 2)})
+    if pitch is not None:
+        positions, dense = resample(q, validation_spacing(terrain), terrain.gs)
+        stats.update(pitches(positions, np.degrees(np.arctan(np.diff(terrain.sample(dense)) / np.diff(positions))), pitch))
     return stats
 
 
@@ -1048,10 +1119,16 @@ def optimize(args):
         raise ValueError('Output directory is not empty; choose a new directory to avoid stale/overwritten GPX files.')
     if any(not math.isfinite(v) for v in vars(args).values() if isinstance(v,float)):
         raise ValueError('Numeric options must be finite.')
-    if not 2 <= args.resolution_m <= 30 or not 20 <= args.corridor_m <= 3000:
-        raise ValueError('Use resolution 2–30 m and corridor 20–3000 m.')
+    if not 1 <= args.resolution_m <= 30 or not 20 <= args.corridor_m <= 3000:
+        raise ValueError('Use resolution 1–30 m and corridor 20–3000 m.')
     if not 0.5 <= args.map_detail_m <= 30:
         raise ValueError('Use --map-detail-m 0.5–30.')
+    if args.pitch_deg and not (args.max_uphill_deg < args.pitch_deg < 45 and args.max_terrain_deg <= args.pitch_terrain_deg < 80
+                               and 2 <= args.pitch_window_m <= 60 and args.pitch_max_m >= 0 and args.pitch_cost >= 0):
+        raise ValueError('With --pitch-deg: it must exceed --max-uphill-deg and be under 45; --pitch-terrain-deg must be at least '
+                         '--max-terrain-deg and under 80; --pitch-window-m 2–60; --pitch-max-m and --pitch-cost nonnegative.')
+    if args.pitch_deg < 0:
+        raise ValueError('--pitch-deg must be 0 (off) or a positive angle.')
     if not 5 <= args.angle_window_m <= 500:
         raise ValueError('Use --angle-window-m 5–500; route angles are sampled every 5 m.')
     if not 0 < args.max_uphill_deg < 45 or not 0 < args.max_downhill_deg < 45 or not 0 < args.max_terrain_deg < 80:
@@ -1089,13 +1166,15 @@ def optimize(args):
     report = {'status': 'unverified_candidate', 'disclaimer': DISCLAIMER, 'mode': 'gpx',
               'input_sha256': hashlib.sha256(args.input.read_bytes()).hexdigest(),
               'goal_index_zero_based': stop, 'options': options(args), 'avoid_sha256': {str(f): hashlib.sha256(f.read_bytes()).hexdigest() for f in args.avoid or []},
-              'terrain': terrain.grid, 'hazard_coverage': coverage, 'landforms': land, 'original': metrics(terrain, original, args.angle_window_m),
+              'terrain': terrain.grid, 'hazard_coverage': coverage, 'landforms': land, 'original': metrics(terrain, original, args.angle_window_m, pitch_limit(args)),
               'limits': ['Norwegian map-service coverage only.', 'NVE transparent pixels may be unmarked or unmapped; they are not safety clearance.',
                          'No snowpack, live forecast, vegetation, water-crossing or land-access model.',
                          'NVE classifications are decoded from a version-specific rendered palette; unknown colours fail closed.',
                          'Constant local Mercator scale approximation; use for local routes only.',
                          f'{args.angle_window_m:g} m route angles are not terrain slope angles. Exposure distance is not a risk score.',
                          LANDFORM_LIMIT]}
+    if args.pitch_deg:
+        report['limits'].append(PITCH_LIMIT)
     log('Searching the terrain grid…')
     try:
         found = solve_many(terrain, original, args, terrain.rc(vias[:, :2]), avoid_mask(terrain, args), args.alternatives)
@@ -1116,6 +1195,10 @@ def landform_summary(terrain, args):
                               for name, value in [('ridge', RIDGE), ('gully', GULLY), ('other', OTHER), ('unknown', UNKNOWN)]}}
 
 
+def pitch_limit(args):
+    return args.max_uphill_deg if args.pitch_deg else None
+
+
 def options(args):
     text = lambda v: [text(x) for x in v] if isinstance(v, list) else str(v) if isinstance(v, Path) else v
     return {k: text(v) for k, v in vars(args).items() if k not in ('handler', 'areas')}
@@ -1129,14 +1212,14 @@ def avoid_mask(terrain, args):
 def write_candidates(args, terrain, report, found, baseline, baseline_key, legend):
     """Best candidate keeps the original file names; alternatives are numbered from 2."""
     (candidate, search), *others = found
-    report.update(candidate=metrics(terrain,candidate,args.angle_window_m), search=search)
+    report.update(candidate=metrics(terrain,candidate,args.angle_window_m,pitch_limit(args)), search=search)
     write_gpx(args.out/'candidate-DRAFT.gpx',terrain.lonlat(candidate),terrain.sample(candidate),'UNVERIFIED ascent draft',DISCLAIMER)
     if args.alternatives > 1:
         report['alternatives'] = []
         for number, (q, info) in enumerate(others, 2):
             name = f'candidate-{number}-DRAFT.gpx'
             write_gpx(args.out/name,terrain.lonlat(q),terrain.sample(q),f'UNVERIFIED ascent draft, alternative {number}',DISCLAIMER)
-            report['alternatives'].append({'file': name, **metrics(terrain,q,args.angle_window_m), 'search': info})
+            report['alternatives'].append({'file': name, **metrics(terrain,q,args.angle_window_m,pitch_limit(args)), 'search': info})
         if others:
             legend += '\nAlternatives 2-5: purple, blue, green, brown'
         else:
@@ -1171,7 +1254,7 @@ def plan_between(args, vias):
     terrain.sample(reference)
     report = {'status': 'unverified_candidate', 'disclaimer': DISCLAIMER, 'mode': 'coordinates',
               'options': options(args), 'avoid_sha256': {str(f): hashlib.sha256(f.read_bytes()).hexdigest() for f in args.avoid or []},
-              'terrain': terrain.grid, 'hazard_coverage': coverage, 'landforms': land, 'reference_line': metrics(terrain, reference, args.angle_window_m),
+              'terrain': terrain.grid, 'hazard_coverage': coverage, 'landforms': land, 'reference_line': metrics(terrain, reference, args.angle_window_m, pitch_limit(args)),
               'limits': ['Norwegian map-service coverage only.', 'NVE transparent pixels may be unmarked or unmapped; they are not safety clearance.',
                          'No snowpack, live forecast, vegetation, water-crossing or land-access model.',
                          'NVE classifications are decoded from a version-specific rendered palette; unknown colours fail closed.',
@@ -1179,6 +1262,8 @@ def plan_between(args, vias):
                          'The corridor follows straight lines between the given points, not a known route.',
                          f'{args.angle_window_m:g} m route angles are not terrain slope angles. Exposure distance is not a risk score.',
                          LANDFORM_LIMIT]}
+    if args.pitch_deg:
+        report['limits'].append(PITCH_LIMIT)
     log('Searching the terrain grid…')
     try:
         found = solve_many(terrain, np.vstack([reference[0], reference[-1]]), args, reference[1:-1], avoid_mask(terrain, args), args.alternatives)
@@ -1236,6 +1321,11 @@ def parser():
     opt.add_argument('--side-tolerance-m',type=float,default=20,help='Allowance across the --side boundary (m)')
     opt.add_argument('--max-uphill-deg',type=float,default=15,help='Along-route uphill angle limit, checked within search edges')
     opt.add_argument('--angle-window-m',type=float,default=50,help='Distance over which reports and map.html average the route angle (5-500; default %(default)g). Reporting only: the search and validation limits are unchanged')
+    opt.add_argument('--pitch-deg',type=float,default=0,help='Fine-grid rule, off by default: judge the uphill, downhill and terrain limits on terrain averaged over --pitch-window-m, and allow short pitches up to this angle on the unsmoothed terrain')
+    opt.add_argument('--pitch-window-m',type=float,default=15,help='With --pitch-deg: width of the averaging square (default %(default)g)')
+    opt.add_argument('--pitch-max-m',type=float,default=15,help='With --pitch-deg: longest allowed stretch steeper than --max-uphill-deg on the unsmoothed terrain (default %(default)g)')
+    opt.add_argument('--pitch-terrain-deg',type=float,default=45,help='With --pitch-deg: exclude cells whose unsmoothed terrain slope exceeds this (default %(default)g)')
+    opt.add_argument('--pitch-cost',type=float,default=4,help='With --pitch-deg: added distance-cost multiplier for the part of an edge steeper than --max-uphill-deg (default %(default)g)')
     opt.add_argument('--max-downhill-deg',type=float,default=10,help='Limit for small descending sections during the ascent')
     opt.add_argument('--max-terrain-deg',type=float,default=35,help='Exclude cells whose terrain-model slope exceeds this')
     opt.add_argument('--steep-buffer-m',type=float,default=6,help='Buffer around NVE steep-slope pixels (m)')

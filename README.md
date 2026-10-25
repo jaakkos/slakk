@@ -229,6 +229,37 @@ it mostly measures the elevation model's cell facets and, on a recorded
 track, GPS position error, so 15 m is a sensible short setting and 5 m is
 noisy. Angles are sampled every 5 m, hence the 5 m minimum.
 
+## Fine grids and short pitches
+
+The limits are checked on every 0.5–1 m step of the terrain model. On the
+default 6 m grid that model is smooth; at 2–3 m it shows banks, steps and
+knolls, and a route that climbs over any of them fails the 15° limit. On the
+Troms test track a 3 m grid found no route at all, although 6 m did over the
+same area. `--resolution-m` accepts 1–30 m, and a grid may have up to 6
+million cells (4096 per side), so for example a 5 km track with a 600 m
+corridor fits at 2 m. Search time and memory grow with the cell count.
+
+`--pitch-deg` (off by default) is an explicit rule for fine grids. With it:
+
+- `--max-uphill-deg`, `--max-downhill-deg` and `--max-terrain-deg` are
+  judged on the terrain averaged over a `--pitch-window-m` square (default
+  15 m), i.e. on the slope over roughly that distance;
+- every step on the unsmoothed terrain must stay within `--pitch-deg` up or
+  down, and cells whose unsmoothed slope exceeds `--pitch-terrain-deg`
+  (default 45°) are excluded, so cliff bands stay blocked;
+- each metre steeper than `--max-uphill-deg` on the unsmoothed terrain costs
+  `--pitch-cost` extra (default 4), so the search keeps pitches short; and
+- the finished candidate is rejected if its longest such pitch is longer than
+  `--pitch-max-m` (default 15 m; gaps under 3 m are merged).
+
+This deliberately allows short pitches steeper than `--max-uphill-deg`, so
+the report says so. `search` then records `over_limit_raw_m`,
+`longest_pitch_m`, `max_raw_uphill_deg` and `smoothing_window_m` (the actual
+square, a whole number of cells), and every route's metrics include
+`over_limit_raw_m` and `longest_pitch_m`. Without `--pitch-deg` routes and
+reports are unchanged. A short pitch on the model can still be a real step,
+bank or icy patch that needs bootpacking.
+
 ## Plan without a recorded track
 
 Give `--start` and `--end` instead of a GPX. The corridor then follows straight
@@ -326,6 +357,11 @@ looking like a new result. The original input is never modified.
 | `--side-tolerance-m` | `20` | Small allowance across that directional boundary |
 | `--max-uphill-deg` | `15` | Along-route angle limit, checked within search edges |
 | `--angle-window-m` | `50` | Distance over which reports and `map.html` average the route angle (5–500); reporting only |
+| `--pitch-deg` | `0` (off) | Fine-grid rule: limits judged on averaged terrain, short pitches up to this angle allowed |
+| `--pitch-window-m` | `15` | Averaging square for `--pitch-deg` |
+| `--pitch-max-m` | `15` | Longest stretch over `--max-uphill-deg` on unsmoothed terrain |
+| `--pitch-terrain-deg` | `45` | Unsmoothed terrain-slope exclusion with `--pitch-deg` |
+| `--pitch-cost` | `4` | Added cost multiplier for the over-limit part of an edge |
 | `--max-downhill-deg` | `10` | Limit small descending sections during the ascent |
 | `--max-terrain-deg` | `35` | Additional terrain-model slope exclusion |
 | `--steep-buffer-m` | `6` | Buffer around NVE steep-slope pixels |

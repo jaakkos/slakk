@@ -221,6 +221,32 @@ class RouteTests(unittest.TestCase):
         report = json.loads((out/'report.json').read_text())
         self.assertTrue(report['landforms']['enabled'])
         self.assertIn('gully_m', report['candidate'])
+    def test_pitch_rule_allows_only_short_capped_pitches(self):
+        z = np.full((40,40),100,dtype=np.float32)
+        z[21:] += 6.5  # a bank across the whole grid: over 15 degrees in every crossing direction
+        terrain, reference = self.terrain(z=z), np.array([[7.,20],[32.,20]])
+        with self.assertRaises(cli.NoRoute):
+            cli.solve(terrain, reference, self.args())
+        pitch = ('--pitch-deg','35','--pitch-window-m','50')
+        q, info = cli.solve(terrain, reference, self.args(*pitch,'--pitch-max-m','30'))
+        self.assertGreater(info['max_raw_uphill_deg'], 15)
+        self.assertLessEqual(info['longest_pitch_m'], 30)
+        self.assertLess(info['max_sampled_uphill_deg'], 15.15)  # the smoothed limit still holds
+        with self.assertRaisesRegex(cli.NoRoute, 'pitch'):
+            cli.solve(terrain, reference, self.args(*pitch,'--pitch-max-m','5'))
+        with self.assertRaises(cli.NoRoute):
+            cli.solve(terrain, reference, self.args('--pitch-deg','16','--pitch-window-m','50','--pitch-max-m','30'))
+        with self.assertRaises(cli.NoRoute):  # unsmoothed terrain slope cap
+            cli.solve(terrain, reference, self.args(*pitch,'--pitch-max-m','30','--max-terrain-deg','15','--pitch-terrain-deg','15'))
+        with self.assertRaisesRegex(ValueError, 'exceed'):
+            cli.optimize(self.args('--pitch-deg','10'))
+
+    def test_pitches_merge_short_gaps(self):
+        positions = np.arange(0., 31.)
+        angles = np.zeros(30)
+        angles[0:10] = angles[12:20] = angles[25:28] = 20
+        self.assertEqual(cli.pitches(positions, angles, 15), {'over_limit_raw_m': 21.0, 'longest_pitch_m': 20.0})
+
     def test_angle_window_is_reporting_only(self):
         z = np.full((40,40),100,dtype=np.float32)
         z[22:,:] += 8  # one short 8 m rise on an otherwise flat line
