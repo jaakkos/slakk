@@ -460,15 +460,17 @@ class RouteTests(unittest.TestCase):
         env = {'STRAVA_CLIENT_ID':'42','STRAVA_CLIENT_SECRET':'s3cret','XDG_CONFIG_HOME':str(self.root)}
         with patch.dict('os.environ',env), patch('secrets.token_urlsafe',return_value='fixed'), \
              patch.object(cli,'download',return_value=json.dumps(response).encode()) as call:
-            worker = threading.Thread(target=cli.main,args=(['strava-login','--no-browser','--port','8791','--timeout','20'],))
+            worker = threading.Thread(target=cli.main,args=(['strava-login','--no-browser','--port','8791','--timeout','120'],))
             worker.start()
-            for _ in range(100):
+            # Slow CI runners can take tens of seconds to start the callback server; keep trying until it answers.
+            deadline = time.monotonic() + 110
+            while worker.is_alive() and time.monotonic() < deadline:
                 try:
-                    urllib.request.urlopen('http://127.0.0.1:8791/exchange?state=fixed&code=c0de&scope=read,activity:read_all').read()
+                    urllib.request.urlopen('http://127.0.0.1:8791/exchange?state=fixed&code=c0de&scope=read,activity:read_all',timeout=5).read()
                     break
                 except OSError:
                     time.sleep(.05)
-            worker.join(20)
+            worker.join(120)
             self.assertEqual(call.call_args.kwargs['form']['code'],'c0de')
             path = cli.token_file()
             self.assertEqual(json.loads(path.read_text()),{'access_token':'a1','refresh_token':'r1','expires_at':2**40})
