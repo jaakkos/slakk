@@ -198,6 +198,32 @@ class RouteTests(unittest.TestCase):
         for extra in (['--start',fmt(start)],['--via',fmt(via)],[str(points)]):
             self.assertEqual(cli.main(['optimize','--points',str(points),*extra,'--out',str(self.root/'c'),*common]),2)
 
+    def test_masked_endpoint_names_the_point_constraint_and_nearest_free_cell(self):
+        colors = np.zeros((40,40,4),np.uint8)
+        colors[18:23,4:11] = [0,77,168,255]  # runout around the start at row 20, col 7
+        with self.assertRaises(cli.NoRoute) as caught:
+            cli.solve(self.terrain(colors),np.array([[20.,7.],[20.,32.]]),self.args())
+        text = str(caught.exception)
+        self.assertIn('The start (',text)
+        self.assertIn('NVE runout',text)
+        self.assertNotIn('corridor',text)
+        self.assertIn('nearest unmasked cell is 30 m away',text)
+        with self.assertRaisesRegex(cli.NoRoute,'Waypoint 1 .*NVE runout'):
+            cli.solve(self.terrain(colors),np.array([[30.,20.],[30.,32.]]),self.args(),np.array([[20.,7.]]))
+
+    def test_points_outside_the_cached_area_are_an_input_error(self):
+        terrain = self.terrain()
+        for far in ([20.,60.],[-15.,20.],[20.,38.]):  # beyond each side, and inside the blocked edge band
+            with self.assertRaisesRegex(ValueError,'outside the area this terrain cache covers'):
+                cli.solve(terrain,np.array([[20.,7.],far]),self.args())
+        (start,), (via,), (end,) = (terrain.lonlat(np.array([p])) for p in ([8.,8.],[20.,90.],[32.,10.]))
+        fmt = lambda p: f'{p[1]:.9f},{p[0]:.9f}'
+        with patch.object(cli,'log') as log:
+            code = cli.main(['optimize','--start',fmt(start),'--via',fmt(via),'--end',fmt(end),'--cache',str(self.root),
+                             '--out',str(self.root/'out'),'--offline','--corridor-m','500'])
+        self.assertEqual(code,2)
+        self.assertRegex(log.call_args_list[-1].args[0],r'^Error: Waypoint 1 \(.*outside the area this terrain cache covers')
+
     def test_pick_writes_a_page_with_the_given_points(self):
         points = self.write_points('<wpt lat="69.1" lon="18.1"/><wpt lat="69.2" lon="18.2"/>')
         page = self.root/'pick.html'
@@ -434,15 +460,17 @@ class RouteTests(unittest.TestCase):
         env = {'STRAVA_CLIENT_ID':'42','STRAVA_CLIENT_SECRET':'s3cret','XDG_CONFIG_HOME':str(self.root)}
         with patch.dict('os.environ',env), patch('secrets.token_urlsafe',return_value='fixed'), \
              patch.object(cli,'download',return_value=json.dumps(response).encode()) as call:
-            worker = threading.Thread(target=cli.main,args=(['strava-login','--no-browser','--port','8791','--timeout','20'],))
+            worker = threading.Thread(target=cli.main,args=(['strava-login','--no-browser','--port','8791','--timeout','120'],))
             worker.start()
-            for _ in range(100):
+            # Slow CI runners can take tens of seconds to start the callback server; keep trying until it answers.
+            deadline = time.monotonic() + 110
+            while worker.is_alive() and time.monotonic() < deadline:
                 try:
-                    urllib.request.urlopen('http://127.0.0.1:8791/exchange?state=fixed&code=c0de&scope=read,activity:read_all').read()
+                    urllib.request.urlopen('http://127.0.0.1:8791/exchange?state=fixed&code=c0de&scope=read,activity:read_all',timeout=5).read()
                     break
                 except OSError:
                     time.sleep(.05)
-            worker.join(20)
+            worker.join(120)
             self.assertEqual(call.call_args.kwargs['form']['code'],'c0de')
             path = cli.token_file()
             self.assertEqual(json.loads(path.read_text()),{'access_token':'a1','refresh_token':'r1','expires_at':2**40})

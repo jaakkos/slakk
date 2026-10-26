@@ -314,8 +314,8 @@ Click to add points in order (the first is the start, the last the
 destination), drag a point to move it and right-click it to remove it. The page
 shows the search corridor and the terrain area a new cache would download, warns
 when that grid would be too large, and can overlay the NVE steep and runout
-layers. **Save points GPX** writes `slakk-points.gpx` (to your downloads folder)
-and the page shows the matching command. The map tiles load live from Kartverket
+layers. **Save points GPX** writes `trip-<date and time>.gpx` (to your downloads
+folder; rename it in the page) and the page shows the matching command. The map tiles load live from Kartverket
 and NVE while the page is open; nothing is sent anywhere else. `--points` loads
 an existing points file for editing, and `--corridor-m` and `--resolution-m` set
 the starting values.
@@ -328,7 +328,7 @@ waypoints are ignored; a recorded track in the file is always ignored. Both are
 reported when the file is read.
 
 ```sh
-slakk optimize --points slakk-points.gpx --out coord-draft --cache area-cache --corridor-m 1200
+slakk optimize --points slakk-points.gpx --out slakk-points-draft --cache slakk-points-cache --corridor-m 1200
 ```
 
 A file with only a recorded track is refused; give it as the input GPX instead. The report
@@ -346,6 +346,15 @@ slakk optimize --start 61.2100,7.6000 --end 61.2350,7.6400 \
 slakk optimize --start 33:653210,7731797 --end 33:655800,7733900 \
   --out utm-draft --cache tromso-cache
 ```
+
+A terrain cache holds one area, fixed by the first run that used it, so use a
+new `--cache` directory for each trip; the command the pick page shows names it
+after the points file. Points outside the cached area are an input error (exit
+code **2**). If the start, destination or a waypoint lands on masked terrain (NVE
+steep or runout, too steep in the terrain model, an `--avoid` area, outside the
+corridor), the run stops with exit code **3** and names the point, every
+constraint that masks it and the nearest unmasked cell. The point is never moved
+for you.
 
 In all three cases the corridor follows straight lines from start through each
 via point to the end, so `--corridor-m` must be wide enough to contain a sensible
