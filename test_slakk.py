@@ -198,6 +198,25 @@ class RouteTests(unittest.TestCase):
         for extra in (['--start',fmt(start)],['--via',fmt(via)],[str(points)]):
             self.assertEqual(cli.main(['optimize','--points',str(points),*extra,'--out',str(self.root/'c'),*common]),2)
 
+    def test_masked_endpoint_names_the_point_constraint_and_nearest_free_cell(self):
+        colors = np.zeros((40,40,4),np.uint8)
+        colors[18:23,4:11] = [0,77,168,255]  # runout around the start at row 20, col 7
+        with self.assertRaises(cli.NoRoute) as caught:
+            cli.solve(self.terrain(colors),np.array([[20.,7.],[20.,32.]]),self.args())
+        text = str(caught.exception)
+        self.assertIn('The start (',text)
+        self.assertIn('NVE runout',text)
+        self.assertNotIn('corridor',text)
+        self.assertIn('nearest unmasked cell is 30 m away',text)
+        with self.assertRaisesRegex(cli.NoRoute,'Waypoint 1 .*NVE runout'):
+            cli.solve(self.terrain(colors),np.array([[30.,20.],[30.,32.]]),self.args(),np.array([[20.,7.]]))
+
+    def test_points_outside_the_cached_area_are_an_input_error(self):
+        terrain = self.terrain()
+        for far in ([20.,60.],[-15.,20.]):
+            with self.assertRaisesRegex(ValueError,'outside the area this terrain cache covers'):
+                cli.solve(terrain,np.array([[20.,7.],far]),self.args())
+
     def test_pick_writes_a_page_with_the_given_points(self):
         points = self.write_points('<wpt lat="69.1" lon="18.1"/><wpt lat="69.2" lon="18.2"/>')
         page = self.root/'pick.html'

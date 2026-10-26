@@ -729,6 +729,23 @@ def solve(terrain, reference, args, waypoints=(), avoid=None):
     return solve_many(terrain, reference, args, waypoints, avoid, 1)[0]
 
 
+def masked_message(terrain, blocked, layers, cell, name):
+    """Why a required point is masked, and the nearest cell that is not. Nothing is relaxed or moved."""
+    lon, lat = terrain.lonlat(np.array([cell], float))[0]
+    reasons = '; '.join(label for label, mask in layers if mask[cell])
+    text = f'{name[0].upper()}{name[1:]} ({lat:.6f},{lon:.6f}) is masked: {reasons}.'
+    free = np.flatnonzero(~blocked)
+    if free.size:
+        r, c = np.divmod(free, terrain.w)
+        best = int(np.argmin((r - cell[0])**2 + (c - cell[1])**2))
+        near = np.array([[r[best], c[best]]], float)
+        nlon, nlat = terrain.lonlat(near)[0]
+        dist = math.hypot(r[best] - cell[0], c[best] - cell[1]) * terrain.gs
+        text += (f' The nearest unmasked cell is {dist:.0f} m away at {nlat:.6f},{nlon:.6f}'
+                 ' (not checked for a route; it may be cut off).')
+    return text + ' Move the point or change that option explicitly; constraints were not relaxed.'
+
+
 def solve_many(terrain, reference, args, waypoints=(), avoid=None, count=1):
     """Best candidate first, then up to count-1 distinct alternatives meeting the same hard constraints.
 
@@ -739,6 +756,11 @@ def solve_many(terrain, reference, args, waypoints=(), avoid=None, count=1):
     if keep >= len(reference) - 1:
         raise ValueError('--keep-first-m must be shorter than the selected ascent.')
     start, goal = tuple(np.rint(reference[keep]).astype(int)), tuple(np.rint(reference[-1]).astype(int))
+    for cell, name in ((start, 'The start'), (goal, 'The destination'), *((tuple(np.rint(w).astype(int)), f'Waypoint {n}') for n, w in enumerate(waypoints, 1))):
+        if not (0 <= cell[0] < terrain.h and 0 <= cell[1] < terrain.w):
+            lon, lat = terrain.lonlat(np.array([cell], float))[0]
+            raise ValueError(f'{name} ({lat:.6f},{lon:.6f}) lies outside the area this terrain cache covers. '
+                             'A cache holds one area; use a new --cache directory for these points.')
     rows, cols = np.indices(terrain.z.shape)
     nearest = np.full(terrain.z.shape, np.inf)
     nearest_col = np.zeros(terrain.z.shape)
@@ -755,28 +777,35 @@ def solve_many(terrain, reference, args, waypoints=(), avoid=None, count=1):
         nearest_col[r0:r1, c0:c1][closer] = c
     nearest = np.sqrt(nearest) * terrain.gs
     limit = smoothed(terrain, args)
-    blocked = dilate(terrain.invalid, 1) | (limit.slope > args.max_terrain_deg)
+    # Each hard constraint as its own mask, so a masked endpoint or waypoint can be explained.
+    layers = [('no terrain data (or next to a no-data cell)', dilate(terrain.invalid, 1)),
+              (f'terrain-model slope above --max-terrain-deg {args.max_terrain_deg:g}'
+               + (f' (averaged over {limit.window_m:g} m)' if args.pitch_deg else ''), limit.slope > args.max_terrain_deg)]
     if args.pitch_deg:
-        blocked |= terrain.slope > (max(45., args.max_terrain_deg) if args.pitch_terrain_deg is None else args.pitch_terrain_deg)
-    blocked |= dilate(terrain.steep, math.ceil(args.steep_buffer_m / terrain.gs))
-    blocked |= nearest > args.corridor_m
+        raw = max(45., args.max_terrain_deg) if args.pitch_terrain_deg is None else args.pitch_terrain_deg
+        layers.append((f'unsmoothed slope above {raw:g} (--pitch-terrain-deg)', terrain.slope > raw))
+    layers.append((f'NVE steep terrain or within --steep-buffer-m {args.steep_buffer_m:g}',
+                   dilate(terrain.steep, math.ceil(args.steep_buffer_m / terrain.gs))))
+    layers.append((f'outside --corridor-m {args.corridor_m:g}', nearest > args.corridor_m))
     if args.side == 'east':
-        blocked |= cols < nearest_col - args.side_tolerance_m / terrain.gs
+        layers.append(('west of the --side east boundary', cols < nearest_col - args.side_tolerance_m / terrain.gs))
     if args.side == 'west':
-        blocked |= cols > nearest_col + args.side_tolerance_m / terrain.gs
+        layers.append(('east of the --side west boundary', cols > nearest_col + args.side_tolerance_m / terrain.gs))
     if avoid is not None:
-        blocked |= avoid
+        layers.append(('inside an --avoid area', avoid))
     runout = dilate(terrain.runout, math.ceil(args.runout_buffer_m / terrain.gs))
     if args.runout == 'avoid':
-        blocked |= runout
-    blocked[:3] = blocked[-3:] = True
-    blocked[:, :3] = blocked[:, -3:] = True
-    if blocked[start] or blocked[goal]:
-        raise NoRoute('A search endpoint is masked by a constraint (or an --avoid area). Inspect it; constraints were not relaxed.')
+        layers.append((f'NVE runout or within --runout-buffer-m {args.runout_buffer_m:g} (--runout avoid)', runout))
+    edge = np.zeros(terrain.z.shape, bool)
+    edge[:3] = edge[-3:] = True
+    edge[:, :3] = edge[:, -3:] = True
+    layers.append(('at the edge of the terrain grid', edge))
+    blocked = np.logical_or.reduce([mask for _, mask in layers])
     stops = [tuple(np.rint(w).astype(int)) for w in waypoints]
-    for number, cell in enumerate(stops, 1):
+    names = ['the start' if keep == 0 else 'the start of the search (after --keep-first-m)', 'the destination']
+    for cell, name in ((start, names[0]), (goal, names[1]), *((c, f'waypoint {n}') for n, c in enumerate(stops, 1))):
         if blocked[cell]:
-            raise NoRoute(f'Waypoint {number} is masked by a constraint or lies outside the corridor. Constraints were not relaxed.')
+            raise NoRoute(masked_message(terrain, blocked, layers, cell, name))
     usable = np.flatnonzero(~blocked)
     transitions = list(edge_options(limit, blocked, usable, args, terrain if args.pitch_deg else None))
     land = landform_cost(terrain, args)
@@ -1347,9 +1376,10 @@ const fileName = () => {
   return !name ? 'slakk-points.gpx' : /\.gpx$/i.test(name) ? name : name + '.gpx';
 };
 function command() {
-  const name = fileName(), g = grid();
+  // A cache holds one area, so name it after the points file rather than reusing one cache for every trip.
+  const name = fileName(), base = name.replace(/\.gpx$/i, ''), g = grid();
   return `slakk optimize --points ${name} --corridor-m ${g ? g.corridor : $('corridor').value}`
-    + ` --resolution-m ${g ? g.res : $('resolution').value} --out draft --cache area-cache --html`;
+    + ` --resolution-m ${g ? g.res : $('resolution').value} --out ${base}-draft --cache ${base}-cache --html`;
 }
 function drawPanel() {
   const list = $('list'); list.replaceChildren();
