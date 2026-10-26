@@ -39,6 +39,8 @@ ALTERNATIVE_BAND_M = 50
 MAX_CELLS, MAX_SIDE = 6_000_000, 4096
 # Widest extent of the points or track, in ground metres.
 MAX_SPAN_M = 25000
+# Rows and columns at each grid edge that the search never uses.
+EDGE_CELLS = 3
 # Most points a --points file may hold.
 MAX_POINTS = 100
 # With --pitch-deg, over-limit stretches separated by less than this are counted as one pitch.
@@ -729,11 +731,20 @@ def solve(terrain, reference, args, waypoints=(), avoid=None):
     return solve_many(terrain, reference, args, waypoints, avoid, 1)[0]
 
 
-def masked_message(terrain, blocked, layers, cell, name):
+def check_in_cache(terrain, required):
+    """Required points (grid row/col, name) must lie inside the cached area, clear of the blocked grid edge."""
+    for point, name in required:
+        if not (EDGE_CELLS <= point[0] <= terrain.h - 1 - EDGE_CELLS and EDGE_CELLS <= point[1] <= terrain.w - 1 - EDGE_CELLS):
+            lon, lat = terrain.lonlat(np.array([point], float))[0]
+            raise ValueError(f'{name[0].upper()}{name[1:]} ({lat:.6f},{lon:.6f}) lies outside the area this terrain cache covers, '
+                             'or at its very edge. A cache holds one area; use a new --cache directory for these points.')
+
+
+def masked_message(terrain, blocked, point, name, reasons):
     """Why a required point is masked, and the nearest cell that is not. Nothing is relaxed or moved."""
-    lon, lat = terrain.lonlat(np.array([cell], float))[0]
-    reasons = '; '.join(label for label, mask in layers if mask[cell])
-    text = f'{name[0].upper()}{name[1:]} ({lat:.6f},{lon:.6f}) is masked: {reasons}.'
+    lon, lat = terrain.lonlat(np.array([point], float))[0]
+    cell = tuple(np.rint(point).astype(int))
+    text = f'{name[0].upper()}{name[1:]} ({lat:.6f},{lon:.6f}) is masked: {"; ".join(reasons)}.'
     free = np.flatnonzero(~blocked)
     if free.size:
         r, c = np.divmod(free, terrain.w)
@@ -755,12 +766,10 @@ def solve_many(terrain, reference, args, waypoints=(), avoid=None, count=1):
     keep = int(np.searchsorted(distance, args.keep_first_m))
     if keep >= len(reference) - 1:
         raise ValueError('--keep-first-m must be shorter than the selected ascent.')
+    required = [(reference[keep], 'the start' if keep == 0 else 'the start of the search (after --keep-first-m)'),
+                (reference[-1], 'the destination'), *((w, f'waypoint {n}') for n, w in enumerate(waypoints, 1))]
+    check_in_cache(terrain, required)
     start, goal = tuple(np.rint(reference[keep]).astype(int)), tuple(np.rint(reference[-1]).astype(int))
-    for cell, name in ((start, 'The start'), (goal, 'The destination'), *((tuple(np.rint(w).astype(int)), f'Waypoint {n}') for n, w in enumerate(waypoints, 1))):
-        if not (0 <= cell[0] < terrain.h and 0 <= cell[1] < terrain.w):
-            lon, lat = terrain.lonlat(np.array([cell], float))[0]
-            raise ValueError(f'{name} ({lat:.6f},{lon:.6f}) lies outside the area this terrain cache covers. '
-                             'A cache holds one area; use a new --cache directory for these points.')
     rows, cols = np.indices(terrain.z.shape)
     nearest = np.full(terrain.z.shape, np.inf)
     nearest_col = np.zeros(terrain.z.shape)
@@ -777,35 +786,39 @@ def solve_many(terrain, reference, args, waypoints=(), avoid=None, count=1):
         nearest_col[r0:r1, c0:c1][closer] = c
     nearest = np.sqrt(nearest) * terrain.gs
     limit = smoothed(terrain, args)
-    # Each hard constraint as its own mask, so a masked endpoint or waypoint can be explained.
-    layers = [('no terrain data (or next to a no-data cell)', dilate(terrain.invalid, 1)),
-              (f'terrain-model slope above --max-terrain-deg {args.max_terrain_deg:g}'
-               + (f' (averaged over {limit.window_m:g} m)' if args.pitch_deg else ''), limit.slope > args.max_terrain_deg)]
+    # Each hard constraint is ORed in, noting which ones cover the required points, so a masked one can be explained.
+    cells = [tuple(np.rint(point).astype(int)) for point, _ in required]
+    blocked, reasons = np.zeros(terrain.z.shape, bool), [[] for _ in cells]
+    def add(label, mask):
+        nonlocal blocked
+        blocked |= mask
+        for found, cell in zip(reasons, cells):
+            if mask[cell]:
+                found.append(label)
+    add('no terrain data (or next to a no-data cell)', dilate(terrain.invalid, 1))
+    add(f'terrain-model slope above --max-terrain-deg {args.max_terrain_deg:g}'
+        + (f' (averaged over {limit.window_m:g} m)' if args.pitch_deg else ''), limit.slope > args.max_terrain_deg)
     if args.pitch_deg:
         raw = max(45., args.max_terrain_deg) if args.pitch_terrain_deg is None else args.pitch_terrain_deg
-        layers.append((f'unsmoothed slope above {raw:g} (--pitch-terrain-deg)', terrain.slope > raw))
-    layers.append((f'NVE steep terrain or within --steep-buffer-m {args.steep_buffer_m:g}',
-                   dilate(terrain.steep, math.ceil(args.steep_buffer_m / terrain.gs))))
-    layers.append((f'outside --corridor-m {args.corridor_m:g}', nearest > args.corridor_m))
+        add(f'unsmoothed slope above {raw:g} (--pitch-terrain-deg' + (')' if args.pitch_terrain_deg is not None else
+            ', default 45 or --max-terrain-deg if higher)'), terrain.slope > raw)
+    add(f'NVE steep terrain or within --steep-buffer-m {args.steep_buffer_m:g}', dilate(terrain.steep, math.ceil(args.steep_buffer_m / terrain.gs)))
+    add(f'outside --corridor-m {args.corridor_m:g}', nearest > args.corridor_m)
     if args.side == 'east':
-        layers.append(('west of the --side east boundary', cols < nearest_col - args.side_tolerance_m / terrain.gs))
+        add('west of the --side east boundary', cols < nearest_col - args.side_tolerance_m / terrain.gs)
     if args.side == 'west':
-        layers.append(('east of the --side west boundary', cols > nearest_col + args.side_tolerance_m / terrain.gs))
+        add('east of the --side west boundary', cols > nearest_col + args.side_tolerance_m / terrain.gs)
     if avoid is not None:
-        layers.append(('inside an --avoid area', avoid))
+        add('inside an --avoid area', avoid)
     runout = dilate(terrain.runout, math.ceil(args.runout_buffer_m / terrain.gs))
     if args.runout == 'avoid':
-        layers.append((f'NVE runout or within --runout-buffer-m {args.runout_buffer_m:g} (--runout avoid)', runout))
-    edge = np.zeros(terrain.z.shape, bool)
-    edge[:3] = edge[-3:] = True
-    edge[:, :3] = edge[:, -3:] = True
-    layers.append(('at the edge of the terrain grid', edge))
-    blocked = np.logical_or.reduce([mask for _, mask in layers])
-    stops = [tuple(np.rint(w).astype(int)) for w in waypoints]
-    names = ['the start' if keep == 0 else 'the start of the search (after --keep-first-m)', 'the destination']
-    for cell, name in ((start, names[0]), (goal, names[1]), *((c, f'waypoint {n}') for n, c in enumerate(stops, 1))):
-        if blocked[cell]:
-            raise NoRoute(masked_message(terrain, blocked, layers, cell, name))
+        add(f'NVE runout or within --runout-buffer-m {args.runout_buffer_m:g} (--runout avoid)', runout)
+    blocked[:EDGE_CELLS] = blocked[-EDGE_CELLS:] = True
+    blocked[:, :EDGE_CELLS] = blocked[:, -EDGE_CELLS:] = True
+    for (point, name), found in zip(required, reasons):
+        if found:
+            raise NoRoute(masked_message(terrain, blocked, point, name, found))
+    start, goal, *stops = cells
     usable = np.flatnonzero(~blocked)
     transitions = list(edge_options(limit, blocked, usable, args, terrain if args.pitch_deg else None))
     land = landform_cost(terrain, args)
@@ -1267,7 +1280,7 @@ pre{white-space:pre-wrap;word-break:break-all;background:color-mix(in srgb,var(-
  <div class="tools"><label>Corridor <input type="number" id="corridor" min="20" max="3000" step="50"> m</label>
   <label>Cell <input type="number" id="resolution" min="1" max="30" step="1" style="width:4em"> m</label></div>
  <div id="grid" class="muted"></div>
- <div class="tools"><label>File <input type="text" id="name" value="slakk-points.gpx" style="width:12em"></label></div>
+ <div class="tools"><label>File <input type="text" id="name" style="width:14em"></label></div>
  <div class="tools"><button id="save">Save points GPX</button><button id="copy">Copy command</button></div>
  <pre id="cmd"></pre>
  <div class="muted" style="font-size:12px">The browser saves the file to its downloads folder; run the command there, or give the file's full path.</div>
@@ -1280,7 +1293,9 @@ const R = 6378137, TILE = 256, MINZ = 4, MAXZ = 18;
 const $ = id => document.getElementById(id);
 const map = $('map'), tiles = $('tiles'), svg = $('overlay');
 let points = D.points.map(p => p.slice()), zoom = D.zoom, cx, cy, drag = null;
-$('corridor').value = D.corridor; $('resolution').value = D.resolution; $('disclaimer').textContent = D.disclaimer;
+$('corridor').value = D.corridor; $('resolution').value = D.resolution;
+// Each trip gets its own file name, and so its own cache in the suggested command.
+$('name').value = `trip-${new Date().toISOString().slice(0, 16).replace(/\D/g, '')}.gpx`; $('disclaimer').textContent = D.disclaimer;
 
 const world = z => TILE * 2 ** z;
 const project = ([lat, lon], z) => {
@@ -1558,6 +1573,7 @@ def optimize(args):
     land = landform_summary(terrain, args)
     original = terrain.rc(selected[:,:2])
     terrain.sample(original)
+    check_in_cache(terrain, [(p, f'waypoint {n}') for n, p in enumerate(terrain.rc(vias[:,:2]), 1)])
     terrain.sample(terrain.rc(vias[:,:2]))
     report = {'status': 'unverified_candidate', 'disclaimer': DISCLAIMER, 'mode': 'gpx',
               'input_sha256': hashlib.sha256(args.input.read_bytes()).hexdigest(),
@@ -1647,6 +1663,8 @@ def plan_between(args, vias):
     coverage = hazard_coverage(terrain)
     land = landform_summary(terrain, args)
     reference = terrain.rc(points[:, :2])
+    check_in_cache(terrain, [(reference[0], 'the start'), (reference[-1], 'the destination'),
+                             *((p, f'waypoint {n}') for n, p in enumerate(reference[1:-1], 1))])
     terrain.sample(reference)
     report = {'status': 'unverified_candidate', 'disclaimer': DISCLAIMER, 'mode': 'coordinates',
               'options': options(args), 'avoid_sha256': {str(f): hashlib.sha256(f.read_bytes()).hexdigest() for f in args.avoid or []},

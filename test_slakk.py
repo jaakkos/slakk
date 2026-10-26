@@ -213,9 +213,16 @@ class RouteTests(unittest.TestCase):
 
     def test_points_outside_the_cached_area_are_an_input_error(self):
         terrain = self.terrain()
-        for far in ([20.,60.],[-15.,20.]):
+        for far in ([20.,60.],[-15.,20.],[20.,38.]):  # beyond each side, and inside the blocked edge band
             with self.assertRaisesRegex(ValueError,'outside the area this terrain cache covers'):
                 cli.solve(terrain,np.array([[20.,7.],far]),self.args())
+        (start,), (via,), (end,) = (terrain.lonlat(np.array([p])) for p in ([8.,8.],[20.,90.],[32.,10.]))
+        fmt = lambda p: f'{p[1]:.9f},{p[0]:.9f}'
+        with patch.object(cli,'log') as log:
+            code = cli.main(['optimize','--start',fmt(start),'--via',fmt(via),'--end',fmt(end),'--cache',str(self.root),
+                             '--out',str(self.root/'out'),'--offline','--corridor-m','500'])
+        self.assertEqual(code,2)
+        self.assertRegex(log.call_args_list[-1].args[0],r'^Error: Waypoint 1 \(.*outside the area this terrain cache covers')
 
     def test_pick_writes_a_page_with_the_given_points(self):
         points = self.write_points('<wpt lat="69.1" lon="18.1"/><wpt lat="69.2" lon="18.2"/>')

@@ -314,8 +314,8 @@ Click to add points in order (the first is the start, the last the
 destination), drag a point to move it and right-click it to remove it. The page
 shows the search corridor and the terrain area a new cache would download, warns
 when that grid would be too large, and can overlay the NVE steep and runout
-layers. **Save points GPX** writes `slakk-points.gpx` (to your downloads folder)
-and the page shows the matching command. The map tiles load live from Kartverket
+layers. **Save points GPX** writes `trip-<date and time>.gpx` (to your downloads
+folder; rename it in the page) and the page shows the matching command. The map tiles load live from Kartverket
 and NVE while the page is open; nothing is sent anywhere else. `--points` loads
 an existing points file for editing, and `--corridor-m` and `--resolution-m` set
 the starting values.
