@@ -231,6 +231,15 @@ class RouteTests(unittest.TestCase):
         text = page.read_text(encoding='utf-8')
         data = json.loads(text.split('const D = ',1)[1].split(';\n',1)[0])
         self.assertEqual((data['points'],data['corridor'],data['topo']),([[69.1,18.1],[69.2,18.2]],900,cli.TOPO))
+        self.assertEqual(data['stedsnavn'], cli.STEDSNAVN)
+        self.assertIn('ws.geonorge.no/stedsnavn', data['stedsnavn'])
+        self.assertIn('id="radius"', text)
+        self.assertIn('id="where"', text)
+        self.assertIn('TILE_CACHE_MAX', text)
+        self.assertIn('TILE_HALO', text)
+        self.assertIn('60dvh', text)  # full-viewport map layout on narrow screens
+        self.assertIn('setFocus', text)
+        self.assertIn('zoomToRadius', text)
         self.assertNotIn('<script src',text)
         self.assertEqual(cli.main(['pick','-o',str(page),'--no-browser']),2)  # never overwrites
         before = page.read_bytes()
@@ -536,6 +545,95 @@ class RouteTests(unittest.TestCase):
         args.input, args.start = Path('x.gpx'), None
         with self.assertRaisesRegex(ValueError,'nonnegative'):
             cli.optimize(args)
+
+    def test_course_display_name_truncates_for_watch(self):
+        self.assertEqual(cli.course_display_name(None), 'slakk-DRAFT')
+        self.assertEqual(cli.course_display_name('troms-east-ridge'), 'troms-east-ridg')
+        self.assertEqual(cli.course_display_name('slakk-DRAFT', alt=2), 'slakk-DRAFT-2')
+        self.assertEqual(cli.course_display_name('abcdefghijklmnopqrstuvwxyz', alt=3), 'abcdefghijklm-3')
+        self.assertEqual(len(cli.course_display_name('abcdefghijklmnopqrstuvwxyz', alt=3)), cli.COURSE_NAME_MAX)
+
+    def test_write_gpx_includes_short_name_type_and_disclaimer(self):
+        path = self.root/'course.gpx'
+        lonlat = np.array([[18.95, 69.65], [18.96, 69.66]])
+        cli.write_gpx(path, lonlat, [100.0, 120.5], 'slakk-DRAFT', cli.DISCLAIMER, activity_type='hiking')
+        text = path.read_text()
+        self.assertIn('<name>slakk-DRAFT</name>', text)
+        self.assertIn('<type>hiking</type>', text)
+        self.assertIn('UNVERIFIED WINTER PLANNING DRAFT', text)
+        self.assertIn('<ele>100.00</ele>', text)
+        name, desc, kind = cli.gpx_track_meta(path)
+        self.assertEqual((name, kind), ('slakk-DRAFT', 'hiking'))
+        self.assertIn('UNVERIFIED', desc)
+        points = cli.read_gpx(path)
+        np.testing.assert_allclose(points[:, 2], [100.0, 120.5])
+
+    def test_optimize_writes_garmin_course_metadata(self):
+        terrain = self.terrain()
+        path = self.root/'input.gpx'
+        cli.write_gpx(path, terrain.lonlat(np.array([[7,20],[32,20]])), [100,100], 'test', 'test')
+        code = cli.main(['optimize', str(path), '--goal', 'last', '--cache', str(self.root),
+                         '--out', str(self.root/'out'), '--offline', '--course-name', 'troms-east',
+                         '--course-type', 'skiing', '--steep-buffer-m', '0', '--runout-buffer-m', '0',
+                         '--corridor-m', '500'])
+        self.assertEqual(code, 0)
+        name, desc, kind = cli.gpx_track_meta(self.root/'out'/'candidate-DRAFT.gpx')
+        self.assertEqual(name, 'troms-east')
+        self.assertEqual(kind, 'skiing')
+        self.assertIn('UNVERIFIED', desc)
+
+    def test_push_garmin_requires_optional_dependency(self):
+        gpx = self.root/'c.gpx'
+        cli.write_gpx(gpx, np.array([[19.0, 69.65], [19.1, 69.66]]), [100, 110], 'slakk-DRAFT', cli.DISCLAIMER,
+                      activity_type='hiking')
+        with patch.object(cli, 'require_garmin', side_effect=ValueError(
+                "Garmin support needs the optional dependency: pip install 'slakk[garmin]'")):
+            with self.assertRaisesRegex(ValueError, r"slakk\[garmin\]"):
+                cli.push_garmin(cli.parser().parse_args(['push-garmin', str(gpx)]))
+
+    def test_push_garmin_uploads_course_with_mocked_client(self):
+        gpx = self.root/'c.gpx'
+        cli.write_gpx(gpx, np.array([[19.0, 69.65], [19.1, 69.66]]), [100, 110], 'slakk-DRAFT', cli.DISCLAIMER,
+                      activity_type='hiking')
+        store = self.root/'garmin'
+        store.mkdir()
+        uploaded = {}
+
+        class FakeClient:
+            def login(self, path):
+                uploaded['store'] = path
+            def import_course(self, path):
+                uploaded['gpx'] = Path(path).read_text()
+                return {'courseId': 42}
+            def get_course(self, course_id):
+                return {'courseId': course_id, 'courseType': {'typeKey': 'hiking'}}
+            def update_course(self, course_id, course):
+                uploaded['update'] = (course_id, course)
+
+        with patch.object(cli, 'require_garmin', return_value=lambda *a, **k: FakeClient()), \
+             patch.object(cli, 'garmin_token_dir', return_value=store):
+            cli.push_garmin(cli.parser().parse_args(
+                ['push-garmin', str(gpx), '--name', 'troms-east', '--type', 'skiing']))
+        self.assertEqual(uploaded['store'], str(store))
+        self.assertIn('<name>troms-east</name>', uploaded['gpx'])
+        self.assertIn('<type>skiing</type>', uploaded['gpx'])
+        self.assertEqual(uploaded['update'][0], 42)
+        self.assertEqual(uploaded['update'][1]['courseName'], 'troms-east')
+
+    def test_push_garmin_reports_auth_failure(self):
+        gpx = self.root/'c.gpx'
+        cli.write_gpx(gpx, np.array([[19.0, 69.65], [19.1, 69.66]]), [100, 110], 'slakk-DRAFT', cli.DISCLAIMER)
+        store = self.root/'garmin'
+        store.mkdir()
+
+        class BadClient:
+            def login(self, path):
+                raise RuntimeError('token rejected')
+
+        with patch.object(cli, 'require_garmin', return_value=lambda *a, **k: BadClient()), \
+             patch.object(cli, 'garmin_token_dir', return_value=store):
+            with self.assertRaisesRegex(ValueError, 'authentication failed'):
+                cli.push_garmin(cli.parser().parse_args(['push-garmin', str(gpx)]))
 
 if __name__ == '__main__':
     unittest.main()

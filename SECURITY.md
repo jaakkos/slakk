@@ -17,9 +17,9 @@ Only the latest release gets fixes.
 
 ## Scope
 
-In scope: anything that could leak Strava tokens or client secrets, run code
-or write outside the chosen output and cache folders from crafted GPX,
-GeoJSON or terrain files, or accept a modified cache as valid.
+In scope: anything that could leak Strava or Garmin tokens or client secrets,
+run code or write outside the chosen output and cache folders from crafted
+GPX, GeoJSON or terrain files, or accept a modified cache as valid.
 
 Out of scope: route quality or safety. Candidates are unverified planning
 aids, not safe routes; see the Disclaimer in the README. Please open a normal
@@ -32,7 +32,15 @@ issue for wrong or surprising routes.
   on Linux and macOS. On Windows the file has your user profile's
   permissions.
 - Tokens are sent in the `Authorization` header, never in URLs.
-- The client id and secret come from environment variables and are never
-  written to disk.
+- The Strava client id and secret come from environment variables and are
+  never written to disk.
+- Optional `garmin-login` (extra `slakk[garmin]`) stores unofficial Garmin
+  Connect session tokens under `~/.config/slakk/garmin/` with directory mode
+  0700 and file mode 0600 on Linux and macOS. Email and password are prompted
+  or read from `GARMIN_EMAIL` / `GARMIN_PASSWORD`; they are never accepted as
+  command arguments and are not written to disk by slakk. Those tokens grant
+  account access—delete the directory to revoke local access, and change your
+  Garmin password if they may have leaked.
 
-Dependencies are pinned with hashes and checked weekly with pip-audit.
+Dependencies are pinned with hashes and checked weekly with pip-audit. The
+optional Garmin extra is not part of the hashed core lockfile.

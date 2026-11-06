@@ -311,14 +311,20 @@ slakk pick --center 69.65,18.95
 ```
 
 Click to add points in order (the first is the start, the last the
-destination), drag a point to move it and right-click it to remove it. The page
-shows the search corridor and the terrain area a new cache would download, warns
-when that grid would be too large, and can overlay the NVE steep and runout
-layers. **Save points GPX** writes `trip-<date and time>.gpx` (to your downloads
-folder; rename it in the page) and the page shows the matching command. The map tiles load live from Kartverket
-and NVE while the page is open; nothing is sent anywhere else. `--points` loads
-an existing points file for editing, and `--corridor-m` and `--resolution-m` set
-the starting values.
+destination), drag a point to move it and right-click it to remove it. Drag the
+map to pan and use the wheel or Zoom ±; Kartverket topo tiles (and NVE when
+enabled) load for the visible area as you move, with a short in-memory cache so
+panning back does not re-download immediately. To jump somewhere, enter a
+Norwegian place name (Kartverket Stedsnavn) or `LAT,LON`, set a radius in km,
+and press **Go** — the map zooms to that circle (navigation aid only; it is not
+an optimize constraint). The page shows the search corridor and the terrain
+area a new cache would download, warns when that grid would be too large, and
+can overlay the NVE steep and runout layers. **Save points GPX** writes
+`trip-<date and time>.gpx` (to your downloads folder; rename it in the page)
+and the page shows the matching command. Place search and map tiles talk only
+to Kartverket/NVE while the page is open. `--points` loads an existing points
+file for editing, and `--corridor-m` and `--resolution-m` set the starting
+values.
 
 **Use a points file.** `--points` takes a GPX with one route, or waypoints in
 file order, such as points dropped and exported from Norgeskart, Gaia or
@@ -412,10 +418,58 @@ produce an error rather than prompting for credentials. The login and refresh
 flows are tested with mocked Strava responses only; they have not yet been run
 against the live API.
 
+## Optional: send to Garmin
+
+`candidate-DRAFT.gpx` is written as a Connect-friendly course file: a short
+track name (default `slakk-DRAFT`, truncated to 15 characters for watch
+displays), elevations, and a GPX `<type>` (default `hiking`). Use
+`--course-name` and `--course-type` on `optimize` to change them. The full
+planning disclaimer stays in the track description. Alternatives become
+separate courses (`slakk-DRAFT-2`, …).
+
+### Manual import (no Garmin credentials in slakk)
+
+1. Sign in at [connect.garmin.com](https://connect.garmin.com/) →
+   **Training & Planning** → **Courses** → **Import**, and upload
+   `candidate-DRAFT.gpx`.
+2. Confirm the course type and name, then save.
+3. Open the course → **Send to Device**, pick your watch, and sync with the
+   Garmin Connect phone app (or Garmin Express).
+4. On the watch: start the matching activity → **Navigation** → **Courses**
+   → **Do Course**.
+
+Course support and on-watch navigation detail vary by device. The candidate
+is still an unverified planning draft.
+
+### Optional CLI upload (unofficial API)
+
+Garmin’s official Courses API is enterprise-only. The optional upload uses the
+community [`garminconnect`](https://pypi.org/project/garminconnect/) package
+against Connect’s unofficial web API. It can break when Garmin changes login
+or endpoints, and it is **not** bundled in the standalone binaries.
+
+```sh
+python -m pip install 'slakk[garmin]'
+slakk garmin-login
+slakk push-garmin draft/candidate-DRAFT.gpx
+# or override name/type at upload time:
+slakk push-garmin draft/candidate-DRAFT.gpx --name troms-east --type skiing
+```
+
+`garmin-login` prompts for email and password (or reads `GARMIN_EMAIL` /
+`GARMIN_PASSWORD`; never pass them on the command line). MFA uses a prompt for
+the one-time code. Session tokens are stored under
+`~/.config/slakk/garmin/` (or `$XDG_CONFIG_HOME`), mode 0700/0600 on
+Linux/macOS. `push-garmin` imports the GPX as a Course; you still **Send to
+Device** and sync the watch yourself. Delete the token directory to drop local
+access; change your Garmin password if the tokens may have leaked. Login and
+upload are tested with mocks only, not against the live API.
+
 ## Outputs
 
 - `candidate-DRAFT.gpx`: ascent candidate, exact input start and selected goal,
-  terrain-model elevations, no timestamps.
+  terrain-model elevations, no timestamps; short course name and GPX type for
+  Garmin Connect import.
 - `recorded-ascent.gpx`: original ascent geometry with the same elevation model.
 - `comparison.png`: teal recorded route, orange candidate, Kartverket background.
 - `map.html`: interactive map and profiles, only with `--html`.
@@ -435,6 +489,8 @@ looking like a new result. The original input is never modified.
 | `--start`, `--end` | — | `LAT,LON` or UTM `ZONE:E,N`; plan without a GPX |
 | `--via` | — | `LAT,LON` or UTM `ZONE:E,N`; mandatory waypoint, repeatable, visited in order |
 | `--points` | — | GPX of waypoints or one route: start, vias, end |
+| `--course-name` | `slakk-DRAFT` | Short name in candidate GPX for Garmin watches (truncated to 15 characters) |
+| `--course-type` | `hiking` | GPX track type for Garmin course import |
 | `--avoid` | — | GeoJSON polygon file to exclude, repeatable |
 | `--alternatives N` | `1` | Also search for up to N-1 distinct alternatives |
 | `--html` | off | Also write the interactive `map.html` |
@@ -578,9 +634,9 @@ steps, hazard validation of the preserved approach, unknown map colours,
 disconnected GPX segments, Strava coordinate conversion with a mocked API,
 mandatory waypoints (exact pass-through, masked or unreachable waypoints), and
 coordinate-only planning (points files, UTM against PROJ reference values, the `pick` page data), GeoJSON exclusion areas, distinct alternatives, the self-contained HTML map, cache checksums, the
-hazard coverage check, turn costs, ridge and gully detection and their search cost, and Strava login and token refresh (mocked).
+hazard coverage check, turn costs, ridge and gully detection and their search cost, Strava login and token refresh (mocked), and Garmin course GPX naming plus `push-garmin` (mocked; optional dependency).
 The optimizer was also run end-to-end on the downloaded activity and cached
-Kartverket/NVE data. Live Strava API authentication was not tested.
+Kartverket/NVE data. Live Strava and Garmin authentication were not tested.
 
 Exit codes: `0` success, `2` input/provider error, `3` no feasible route.
 

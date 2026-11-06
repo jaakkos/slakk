@@ -3,6 +3,7 @@
 import argparse
 import base64
 import copy
+import getpass
 import hashlib
 import heapq
 import io
@@ -10,6 +11,7 @@ import json
 import math
 import os
 import re
+import tempfile
 from pathlib import Path
 import sys
 import time
@@ -30,6 +32,7 @@ R = 6378137.0
 DTM = 'https://hoydedata.no/arcgis/rest/services/DTM/ImageServer/exportImage'
 NVE = 'https://gis3.nve.no/arcgis/rest/services/wmts/Bratthet_med_utlop_2024/MapServer/export'
 TOPO = 'https://wms.geonorge.no/skwms1/wms.topo'
+STEDSNAVN = 'https://ws.geonorge.no/stedsnavn/v1/sted'
 # map.html background: fetched separately from topo.png, in WMS tiles, at most this many pixels per side.
 MAP_TILE_PX, MAP_MAX_PX = 2048, 6000
 STEEP_COLORS = {(255, 255, 0), (255, 170, 0), (255, 85, 0), (255, 0, 0), (115, 0, 0)}
@@ -61,6 +64,16 @@ DISCLAIMER = ('UNVERIFIED WINTER PLANNING DRAFT. Bare-ground model only; no snow
               'forecast assessment. Streams, vegetation, access and turns need field checks. '
               'Mapped or unmodelled avalanche runout may affect the route. '
               'No guarantee of skinning without bootpacking. Ascent only.')
+# Garmin watches often show only the first ~15 characters of a course name.
+COURSE_NAME_MAX = 15
+DEFAULT_COURSE_NAME = 'slakk-DRAFT'
+DEFAULT_COURSE_TYPE = 'hiking'
+GARMIN_COURSE_TYPES = (
+    'hiking', 'walking', 'running', 'trail_running', 'cycling', 'mountain_biking',
+    'skiing', 'resort_skiing', 'cross_country_skiing',
+)
+GARMIN_UNOFFICIAL = ('Uses the unofficial Garmin Connect web API (not Garmin\'s enterprise Courses API). '
+                     'Login and upload can break when Garmin changes their site. Tokens grant account access.')
 
 
 class NoRoute(ValueError):
@@ -173,7 +186,22 @@ def read_points(path):
     return points
 
 
-def write_gpx(path, lonlat, elevations, name, description):
+def course_display_name(name, alt=None):
+    """Short course name for Garmin watches; keep DRAFT visible unless the user overrides."""
+    text = (name or DEFAULT_COURSE_NAME).strip() or DEFAULT_COURSE_NAME
+    suffix = f'-{alt}' if alt is not None else ''
+    limit = COURSE_NAME_MAX - len(suffix)
+    if limit < 1:
+        text = (text + suffix)[:COURSE_NAME_MAX]
+    elif len(text) > limit:
+        text = text[:limit] + suffix
+        log(f'Course name truncated to {COURSE_NAME_MAX} characters for Garmin watches: {text!r}')
+    else:
+        text = text + suffix
+    return text
+
+
+def write_gpx(path, lonlat, elevations, name, description, activity_type=None):
     ns = 'http://www.topografix.com/GPX/1/1'
     ET.register_namespace('', ns)
     root = ET.Element('{' + ns + '}gpx', version='1.1', creator='slakk/' + VERSION)
@@ -183,6 +211,8 @@ def write_gpx(path, lonlat, elevations, name, description):
     track = ET.SubElement(root, 'trk')
     ET.SubElement(track, 'name').text = name
     ET.SubElement(track, 'desc').text = description
+    if activity_type:
+        ET.SubElement(track, 'type').text = activity_type
     segment = ET.SubElement(track, 'trkseg')
     for (lon, lat), elevation in zip(lonlat, elevations):
         node = ET.SubElement(segment, 'trkpt', lat=f'{lat:.7f}', lon=f'{lon:.7f}')
@@ -195,9 +225,17 @@ def write_gpx(path, lonlat, elevations, name, description):
 STRAVA_OAUTH = 'https://www.strava.com/oauth'
 
 
-def token_file():
+def config_dir():
     base = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
-    return base / 'slakk' / 'strava-token.json'
+    return base / 'slakk'
+
+
+def token_file():
+    return config_dir() / 'strava-token.json'
+
+
+def garmin_token_dir():
+    return config_dir() / 'garmin'
 
 
 def app_credentials():
@@ -311,6 +349,107 @@ def fetch_strava(args):
               f'Location/elevation streams from Strava activity {args.activity_id}. '
               'Reconstructed GPX, not the original device export. No timestamps or fitness telemetry.')
     print(args.output.resolve())
+
+
+def require_garmin():
+    try:
+        from garminconnect import Garmin
+    except ImportError as exc:
+        raise ValueError("Garmin support needs the optional dependency: pip install 'slakk[garmin]'") from exc
+    return Garmin
+
+
+def _harden_garmin_store(store):
+    """Restrict token-dir permissions the same way as the Strava token file."""
+    if os.name != 'posix':
+        return
+    os.chmod(store, 0o700)
+    for path in store.rglob('*'):
+        os.chmod(path, 0o700 if path.is_dir() else 0o600)
+
+
+def gpx_track_meta(path):
+    """Read track name, description and type from a GPX file (empty strings when absent)."""
+    root = ET.parse(path).getroot()
+    track = root.find('.//{*}trk')
+    if track is None:
+        return '', '', ''
+    text = lambda tag: (node.text or '').strip() if (node := track.find('{*}' + tag)) is not None else ''
+    return text('name'), text('desc'), text('type')
+
+
+def garmin_login(args):
+    Garmin = require_garmin()
+    print(GARMIN_UNOFFICIAL, file=sys.stderr)
+    email = os.environ.get('GARMIN_EMAIL') or input('Garmin email: ').strip()
+    password = os.environ.get('GARMIN_PASSWORD') or getpass.getpass('Garmin password: ')
+    if not email or not password:
+        raise ValueError('Garmin email and password are required (or set GARMIN_EMAIL and GARMIN_PASSWORD). '
+                         'Do not pass them as command arguments.')
+    store = garmin_token_dir()
+    store.mkdir(parents=True, exist_ok=True, mode=0o700)
+    client = Garmin(email, password, prompt_mfa=lambda: input('Garmin MFA code: ').strip())
+    client.login(str(store))
+    _harden_garmin_store(store)
+    print(f'Saved Garmin session tokens to {store} (readable only by you). '
+          f'Delete that directory to revoke local access; change your Garmin password if needed.', file=sys.stderr)
+
+
+def garmin_client():
+    """Resume a saved Garmin session; raise a clear error if login or the optional package fails."""
+    Garmin = require_garmin()
+    store = garmin_token_dir()
+    if not store.exists():
+        raise ValueError('Run "slakk garmin-login" first to authorize Garmin Connect access.')
+    client = Garmin()
+    try:
+        client.login(str(store))
+    except Exception as exc:
+        raise ValueError(f'Garmin authentication failed ({type(exc).__name__}). Run "slakk garmin-login" again.') from None
+    _harden_garmin_store(store)
+    return client
+
+
+def push_garmin(args):
+    if not args.gpx.is_file():
+        raise ValueError(f'GPX not found: {args.gpx}')
+    if args.gpx.suffix.lower() != '.gpx':
+        raise ValueError('push-garmin expects a .gpx file.')
+    points = read_gpx(args.gpx)
+    existing_name, existing_desc, existing_type = gpx_track_meta(args.gpx)
+    name = course_display_name(args.name or existing_name or DEFAULT_COURSE_NAME)
+    activity_type = args.type or existing_type or DEFAULT_COURSE_TYPE
+    if activity_type not in GARMIN_COURSE_TYPES:
+        log(f'Unknown course type {activity_type!r}; using {DEFAULT_COURSE_TYPE!r}.')
+        activity_type = DEFAULT_COURSE_TYPE
+    description = existing_desc or DISCLAIMER
+    print(GARMIN_UNOFFICIAL, file=sys.stderr)
+    client = garmin_client()
+    with tempfile.TemporaryDirectory() as tmp:
+        prepared = Path(tmp) / 'course.gpx'
+        write_gpx(prepared, points[:, :2], points[:, 2], name, description, activity_type=activity_type)
+        try:
+            result = client.import_course(str(prepared))
+        except Exception as exc:
+            raise ValueError(f'Garmin course import failed ({type(exc).__name__}): {exc}') from None
+    course_id = None
+    if isinstance(result, dict):
+        course_id = result.get('courseId') or result.get('id')
+        if course_id is not None and (args.name or args.type):
+            try:
+                course = client.get_course(course_id)
+                if not isinstance(course, dict):
+                    course = {}
+                course = {**course, 'courseName': name, 'courseType': {**(course.get('courseType') or {}), 'typeKey': activity_type}}
+                client.update_course(course_id, course)
+            except Exception as exc:
+                log(f'Imported the course but could not set name/type on Connect ({type(exc).__name__}); edit them there if needed.')
+    if course_id is not None:
+        print(f'Uploaded course {course_id} ({name!r}, type {activity_type}).')
+    else:
+        print(f'Uploaded course {name!r} (type {activity_type}).')
+    print('In Garmin Connect: open the course → Send to Device, then sync the watch. '
+          'On the watch: start the matching activity → Navigation → Courses → Do Course.', file=sys.stderr)
 
 
 def get_terrain(points, args):
@@ -1217,7 +1356,7 @@ def pick(args):
         center, zoom = tuple(np.mean(points, axis=0).tolist()), 13
     else:
         center, zoom = (65.0, 14.0), 5
-    data = {'points': points, 'center': center, 'zoom': zoom, 'topo': TOPO, 'nve': NVE,
+    data = {'points': points, 'center': center, 'zoom': zoom, 'topo': TOPO, 'nve': NVE, 'stedsnavn': STEDSNAVN,
             'corridor': args.corridor_m, 'resolution': args.resolution_m, 'maxCells': MAX_CELLS, 'maxSide': MAX_SIDE,
             'maxSpan': MAX_SPAN_M, 'maxPoints': MAX_POINTS, 'disclaimer': DISCLAIMER, 'version': VERSION}
     page = PICK_HTML.replace('__DATA__', script_json(data))
@@ -1237,51 +1376,71 @@ PICK_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Pick route points</title>
 <style>
-:root{--bg:#fff;--fg:#162b32;--muted:#5b6b70;--line:#d7dee0;--warn:#b00020;--accent:#087f8c;--point:#e8590c}
+:root{--bg:#fff;--fg:#162b32;--muted:#5b6b70;--line:#d7dee0;--warn:#b00020;--accent:#087f8c;--point:#e8590c;--hdr:2.6rem;--bar:2.6rem;--side:280px}
 @media (prefers-color-scheme:dark){:root{--bg:#121719;--fg:#e4ecee;--muted:#9aa9ad;--line:#2d383b;--warn:#ff6b7f;--accent:#3cc1cf}}
-body{margin:0;font:14px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--fg)}
-header{padding:12px 16px;border-bottom:1px solid var(--line)}
-header h1{font-size:17px;margin:0 0 4px}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{font:14px/1.35 system-ui,sans-serif;background:var(--bg);color:var(--fg);display:flex;flex-direction:column;overflow:hidden}
+header{flex:0 0 auto;padding:6px 12px;border-bottom:1px solid var(--line);min-height:var(--hdr)}
+header h1{font-size:15px;margin:0;display:inline}
+header .muted{display:inline;margin-left:8px;font-size:12px}
 .warn{color:var(--warn);font-weight:600}
-main{display:grid;grid-template-columns:minmax(0,3fr) minmax(280px,1fr);gap:16px;padding:16px}
-@media (max-width:820px){main{grid-template-columns:1fr}}
-#map{position:relative;height:72vh;min-height:320px;overflow:hidden;border:1px solid var(--line);background:#dfe6e8;touch-action:none;cursor:crosshair}
+main{flex:1 1 auto;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) var(--side);gap:0}
+@media (max-width:820px){main{grid-template-columns:1fr;grid-template-rows:minmax(60dvh,1fr) auto;overflow:auto}
+ aside{max-height:40dvh;overflow:auto;border-top:1px solid var(--line)}}
+#stage{display:flex;flex-direction:column;min-width:0;min-height:0;border-right:1px solid var(--line)}
+.tools{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--line);flex:0 0 auto;min-height:var(--bar)}
+#map{position:relative;flex:1 1 auto;min-height:240px;overflow:hidden;background:#dfe6e8;touch-action:none;cursor:crosshair}
 #map img{position:absolute;width:256px;height:256px;user-select:none;pointer-events:none}
 #map svg{position:absolute;inset:0;width:100%;height:100%;overflow:visible}
-.tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px}
+.credit{padding:4px 10px;font-size:11px;border-top:1px solid var(--line);flex:0 0 auto}
+aside{padding:10px 12px;overflow:auto;min-height:0}
+aside h2{font-size:14px;margin:0 0 4px}
 button{font:inherit;padding:4px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);cursor:pointer}
 button:disabled{opacity:.5;cursor:default}
 input[type=number],input[type=text]{font:inherit;width:7em;padding:3px 6px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
-ol{padding-left:0;list-style:none;margin:8px 0}
+#where{width:12em}
+#radius{width:4.5em}
+ol{padding-left:0;list-style:none;margin:6px 0}
 li{display:flex;gap:6px;align-items:center;padding:3px 0;border-bottom:1px solid var(--line)}
 li b{min-width:3.4em}
 li code{flex:1;font-size:12px}
 li button{padding:0 6px}
+#hits{margin:0;padding:0;list-style:none;max-height:8em;overflow:auto;font-size:12px}
+#hits li{cursor:pointer;border:none;padding:4px 0}
+#hits li:hover{color:var(--accent)}
 pre{white-space:pre-wrap;word-break:break-all;background:color-mix(in srgb,var(--fg) 7%,transparent);padding:8px;border-radius:6px;font-size:12px}
 .muted{color:var(--muted)}
 #grid.bad{color:var(--warn);font-weight:600}
+.aside-tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
 </style></head><body>
 <header><h1>Pick route points <span class="warn">PLANNING INPUT ONLY</span></h1>
-<div class="muted">Click the map to add points in order: the first is the start, the last is the destination, the rest are mandatory waypoints. Drag a point to move it; right-click it to remove it. The shaded band is the search corridor <code>slakk optimize</code> will use. Placing points does not check the terrain; every route slakk finds is an unverified planning candidate.</div></header>
+<span class="muted">Click to add start → vias → end. Drag the map to pan; tiles load as you move. Drag a point to move it; right-click to remove. The shaded band is the search corridor.</span></header>
 <main>
-<section>
+<section id="stage">
  <div class="tools">
-  <button id="zin" title="Zoom in">Zoom +</button><button id="zout" title="Zoom out">Zoom −</button>
-  <label><input type="checkbox" id="nve"> NVE steep (red–yellow) and runout (blue)</label>
-  <form id="goto"><input type="text" id="where" placeholder="LAT,LON" style="width:11em"> <button>Go</button></form>
+  <button type="button" id="zin" title="Zoom in">Zoom +</button><button type="button" id="zout" title="Zoom out">Zoom −</button>
+  <label><input type="checkbox" id="nve"> NVE steep / runout</label>
+  <form id="goto" class="tools" style="padding:0;border:0;margin:0;display:contents">
+   <input type="text" id="where" placeholder="Place or LAT,LON" autocomplete="off" aria-label="Place name or LAT,LON">
+   <label>Radius <input type="number" id="radius" min="1" max="200" step="1" value="20" aria-label="Radius in kilometres"> km</label>
+   <button type="submit">Go</button>
+  </form>
+  <span id="focusLabel" class="muted"></span>
  </div>
+ <ul id="hits" class="muted" hidden></ul>
  <div id="map" aria-label="Map; click to add a point"><div id="tiles"></div><svg id="overlay"></svg></div>
- <div class="muted">Map: Kartverket, CC BY 4.0. Hazard layer: NVE, NLOD. Unmarked terrain is not safety clearance. Tiles load from Kartverket and NVE while this page is open.</div>
+ <div class="credit muted">Map: Kartverket CC BY 4.0. Places: Kartverket Stedsnavn. Hazard: NVE, NLOD. Tiles load on demand while this page is open. The radius circle is a navigation aid only.</div>
 </section>
 <aside>
- <h2 style="font-size:15px;margin:0">Points</h2>
+ <h2>Points</h2>
  <ol id="list"></ol>
- <div class="tools"><button id="undo">Remove last</button><button id="reverse">Reverse</button><button id="clear">Clear</button></div>
- <div class="tools"><label>Corridor <input type="number" id="corridor" min="20" max="3000" step="50"> m</label>
+ <div class="aside-tools"><button type="button" id="undo">Remove last</button><button type="button" id="reverse">Reverse</button><button type="button" id="clear">Clear</button></div>
+ <div class="aside-tools"><label>Corridor <input type="number" id="corridor" min="20" max="3000" step="50"> m</label>
   <label>Cell <input type="number" id="resolution" min="1" max="30" step="1" style="width:4em"> m</label></div>
  <div id="grid" class="muted"></div>
- <div class="tools"><label>File <input type="text" id="name" style="width:14em"></label></div>
- <div class="tools"><button id="save">Save points GPX</button><button id="copy">Copy command</button></div>
+ <div class="aside-tools"><label>File <input type="text" id="name" style="width:14em"></label></div>
+ <div class="aside-tools"><button type="button" id="save">Save points GPX</button><button type="button" id="copy">Copy command</button></div>
  <pre id="cmd"></pre>
  <div class="muted" style="font-size:12px">The browser saves the file to its downloads folder; run the command there, or give the file's full path.</div>
  <div id="disclaimer" class="muted" style="font-size:12px"></div>
@@ -1289,10 +1448,11 @@ pre{white-space:pre-wrap;word-break:break-all;background:color-mix(in srgb,var(-
 </main>
 <script>
 const D = __DATA__;
-const R = 6378137, TILE = 256, MINZ = 4, MAXZ = 18;
+const R = 6378137, TILE = 256, MINZ = 4, MAXZ = 18, TILE_CACHE_MAX = 200, TILE_HALO = 1;
+const SETTLEMENT = new Set(['By', 'Tettsted', 'BygdelagSomSted', 'Grend', 'Tettbebyggelse']);
 const $ = id => document.getElementById(id);
-const map = $('map'), tiles = $('tiles'), svg = $('overlay');
-let points = D.points.map(p => p.slice()), zoom = D.zoom, cx, cy, drag = null;
+const map = $('map'), tiles = $('tiles'), svg = $('overlay'), hits = $('hits');
+let points = D.points.map(p => p.slice()), zoom = D.zoom, cx, cy, drag = null, focus = null;
 $('corridor').value = D.corridor; $('resolution').value = D.resolution;
 // Each trip gets its own file name, and so its own cache in the suggested command.
 $('name').value = `trip-${new Date().toISOString().slice(0, 16).replace(/\D/g, '')}.gpx`; $('disclaimer').textContent = D.disclaimer;
@@ -1320,27 +1480,43 @@ function tileUrl(base, tx, ty, z, nve) {
   return base + '?' + new URLSearchParams(q);
 }
 const cache = new Map();
+function touchCache(key, img) {
+  cache.delete(key);
+  cache.set(key, img);
+  while (cache.size > TILE_CACHE_MAX) {
+    const [old, victim] = cache.entries().next().value;
+    cache.delete(old);
+    if (victim.isConnected) victim.remove();
+  }
+}
 function drawTiles() {
-  const [w, h] = size(), n = 2 ** zoom, keep = new Set();
+  const [w, h] = size(), n = 2 ** zoom, needed = new Set();
   const layers = $('nve').checked ? [[D.topo, false], [D.nve, true]] : [[D.topo, false]];
-  for (let ty = Math.floor((cy - h / 2) / TILE); ty <= Math.floor((cy + h / 2) / TILE); ty++) {
+  const ty0 = Math.floor((cy - h / 2) / TILE) - TILE_HALO, ty1 = Math.floor((cy + h / 2) / TILE) + TILE_HALO;
+  const tx0 = Math.floor((cx - w / 2) / TILE) - TILE_HALO, tx1 = Math.floor((cx + w / 2) / TILE) + TILE_HALO;
+  for (let ty = ty0; ty <= ty1; ty++) {
     if (ty < 0 || ty >= n) continue;
-    for (let tx = Math.floor((cx - w / 2) / TILE); tx <= Math.floor((cx + w / 2) / TILE); tx++) {
+    for (let tx = tx0; tx <= tx1; tx++) {
       if (tx < 0 || tx >= n) continue;
       for (const [base, nve] of layers) {
         const key = `${nve}/${zoom}/${tx}/${ty}`;
-        keep.add(key);
+        needed.add(key);
         let img = cache.get(key);
         if (!img) {
           img = new Image(); img.alt = ''; img.src = tileUrl(base, tx, ty, zoom, nve);
           if (nve) img.style.opacity = .7;
-          cache.set(key, img); tiles.appendChild(img);
+          tiles.appendChild(img);
         }
+        touchCache(key, img);
         img.style.left = (tx * TILE - cx + w / 2) + 'px'; img.style.top = (ty * TILE - cy + h / 2) + 'px';
+        img.style.visibility = 'visible';
       }
     }
   }
-  for (const [key, img] of cache) if (!keep.has(key)) { img.remove(); cache.delete(key); }
+  // Keep off-screen cached tiles for pan-back; hide them so they do not cover the view.
+  for (const [key, img] of cache) {
+    if (!needed.has(key)) img.style.visibility = 'hidden';
+  }
 }
 
 // Mirrors get_terrain in slakk.py, so the estimate matches the grid a new cache would download.
@@ -1365,6 +1541,14 @@ function el(name, attrs, parent) {
 const role = i => i === 0 ? 'Start' : i === points.length - 1 ? 'End' : `Via ${i}`;
 function drawOverlay() {
   svg.replaceChildren();
+  if (focus) {
+    const [fx, fy] = toScreen([focus.lat, focus.lon]);
+    const mpp = 2 * Math.PI * R * Math.cos(focus.lat * Math.PI / 180) / world(zoom);
+    const rad = focus.radiusKm * 1000 / mpp;
+    el('circle', {cx: fx, cy: fy, r: rad, fill: 'color-mix(in srgb, var(--accent) 12%, transparent)',
+                  stroke: 'var(--accent)', 'stroke-width': 1.5, 'stroke-dasharray': '6 4', 'pointer-events': 'none'}, svg);
+    el('circle', {cx: fx, cy: fy, r: 5, fill: 'var(--accent)', stroke: '#fff', 'stroke-width': 1.5, 'pointer-events': 'none'}, svg);
+  }
   const g = grid(), screen = points.map(toScreen);
   if (g) {
     const [a, b] = [toScreen(fromMercator([g.low[0], g.high[1]])), toScreen(fromMercator([g.high[0], g.low[1]]))];
@@ -1400,7 +1584,7 @@ function drawPanel() {
   const list = $('list'); list.replaceChildren();
   points.forEach((p, i) => {
     const li = document.createElement('li');
-    li.innerHTML = '<b></b><code></code><button title="Move up">↑</button><button title="Move down">↓</button><button title="Remove">✕</button>';
+    li.innerHTML = '<b></b><code></code><button type="button" title="Move up">↑</button><button type="button" title="Move down">↓</button><button type="button" title="Remove">✕</button>';
     li.children[0].textContent = role(i); li.children[1].textContent = fmt(p);
     const [up, down, del] = li.querySelectorAll('button');
     up.disabled = i === 0; down.disabled = i === points.length - 1;
@@ -1426,6 +1610,7 @@ function drawPanel() {
   $('save').disabled = $('copy').disabled = !ok;
   $('cmd').textContent = ok ? command() : '';
   $('undo').disabled = $('clear').disabled = !points.length; $('reverse').disabled = points.length < 2;
+  $('focusLabel').textContent = focus ? `${focus.label} · ${focus.radiusKm} km` : '';
 }
 function render() { drawTiles(); drawOverlay(); drawPanel(); }
 
@@ -1474,11 +1659,77 @@ map.addEventListener('wheel', e => {
   if (Math.abs(wheel) < 100) return;
   zoomAt(zoom + (wheel < 0 ? 1 : -1), ...local(e)); wheel = 0;
 }, {passive: false});
-$('goto').onsubmit = e => {
+
+function placeLabel(hit) {
+  const names = (hit.stedsnavn || []).map(n => n.skrivemåte).filter(Boolean);
+  const primary = names[0] || 'Place';
+  const kommune = (hit.kommuner && hit.kommuner[0] && hit.kommuner[0].kommunenavn) || '';
+  const kind = hit.navneobjekttype || '';
+  return [primary, kind, kommune].filter(Boolean).join(' · ');
+}
+function hitCoords(hit) {
+  const p = hit.representasjonspunkt;
+  if (!p || !Number.isFinite(p.nord) || !Number.isFinite(p.øst)) return null;
+  const lat = +p.nord, lon = +p.øst;
+  if (Math.abs(lat) > 80 || Math.abs(lon) > 180) return null;
+  return [lat, lon];
+}
+function zoomToRadius(ll, radiusKm) {
+  const [w, h] = size(), target = Math.min(w, h) * .8;
+  let z = MAXZ;
+  while (z > MINZ) {
+    const mpp = 2 * Math.PI * R * Math.cos(ll[0] * Math.PI / 180) / world(z);
+    if (2 * radiusKm * 1000 / mpp <= target) break;
+    z--;
+  }
+  centerOn(ll, z);
+}
+function setFocus(ll, radiusKm, label) {
+  focus = {lat: ll[0], lon: ll[1], radiusKm, label};
+  hits.hidden = true; hits.replaceChildren();
+  zoomToRadius(ll, radiusKm);
+}
+function showHits(list, radiusKm) {
+  hits.replaceChildren();
+  list.forEach(hit => {
+    const ll = hitCoords(hit); if (!ll) return;
+    const li = document.createElement('li');
+    li.textContent = placeLabel(hit);
+    li.onclick = () => setFocus(ll, radiusKm, placeLabel(hit));
+    hits.appendChild(li);
+  });
+  hits.hidden = !hits.childElementCount;
+}
+function rankHits(list) {
+  const scored = list.map((hit, i) => ({hit, i, settle: SETTLEMENT.has(hit.navneobjekttype) ? 0 : 1}));
+  scored.sort((a, b) => a.settle - b.settle || a.i - b.i);
+  return scored.map(s => s.hit);
+}
+$('goto').onsubmit = async e => {
   e.preventDefault();
-  const m = $('where').value.trim().match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/);
-  if (m && Math.abs(+m[1]) <= 80 && Math.abs(+m[2]) <= 180) centerOn([+m[1], +m[2]], Math.max(zoom, 13));
-  else alert('Use LAT,LON in decimal degrees, e.g. 69.6500,18.9500');
+  const raw = $('where').value.trim(), radiusKm = Math.max(1, Math.min(200, +$('radius').value || 20));
+  $('radius').value = radiusKm;
+  const m = raw.match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/);
+  if (m && Math.abs(+m[1]) <= 80 && Math.abs(+m[2]) <= 180) {
+    setFocus([+m[1], +m[2]], radiusKm, `${(+m[1]).toFixed(4)},${(+m[2]).toFixed(4)}`);
+    return;
+  }
+  if (!raw) { alert('Enter a place name (Norway) or LAT,LON, e.g. Tromsø or 69.65,18.95'); return; }
+  hits.hidden = false; hits.innerHTML = '<li class="muted">Searching…</li>';
+  try {
+    const url = D.stedsnavn + '?' + new URLSearchParams({sok: raw, treffPerSide: '5', utkoordsys: '4258'});
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    const list = rankHits(data.navn || []).filter(hitCoords);
+    if (!list.length) { hits.innerHTML = '<li class="muted">No places found.</li>'; return; }
+    if (list.length === 1 || (SETTLEMENT.has(list[0].navneobjekttype) && !SETTLEMENT.has((list[1] || {}).navneobjekttype))) {
+      const ll = hitCoords(list[0]);
+      setFocus(ll, radiusKm, placeLabel(list[0]));
+    } else showHits(list, radiusKm);
+  } catch (err) {
+    hits.innerHTML = '<li class="muted">Place search failed. Check the network, or use LAT,LON.</li>';
+  }
 };
 
 map.addEventListener('pointerdown', e => {
@@ -1625,12 +1876,17 @@ def write_candidates(args, terrain, report, found, baseline, baseline_key, legen
     """Best candidate keeps the original file names; alternatives are numbered from 2."""
     (candidate, search), *others = found
     report.update(candidate=metrics(terrain,candidate,args.angle_window_m,pitch_limit(args)), search=search)
-    write_gpx(args.out/'candidate-DRAFT.gpx',terrain.lonlat(candidate),terrain.sample(candidate),'UNVERIFIED ascent draft',DISCLAIMER)
+    course = course_display_name(getattr(args, 'course_name', None))
+    course_type = getattr(args, 'course_type', None) or DEFAULT_COURSE_TYPE
+    write_gpx(args.out/'candidate-DRAFT.gpx', terrain.lonlat(candidate), terrain.sample(candidate),
+              course, DISCLAIMER, activity_type=course_type)
     if args.alternatives > 1:
         report['alternatives'] = []
         for number, (q, info) in enumerate(others, 2):
             name = f'candidate-{number}-DRAFT.gpx'
-            write_gpx(args.out/name,terrain.lonlat(q),terrain.sample(q),f'UNVERIFIED ascent draft, alternative {number}',DISCLAIMER)
+            write_gpx(args.out/name, terrain.lonlat(q), terrain.sample(q),
+                      course_display_name(getattr(args, 'course_name', None), alt=number),
+                      DISCLAIMER, activity_type=course_type)
             report['alternatives'].append({'file': name, **metrics(terrain,q,args.angle_window_m,pitch_limit(args)), 'search': info})
         if others:
             legend += '\nAlternatives 2-5: purple, blue, green, brown'
@@ -1746,6 +2002,14 @@ def parser():
     login.add_argument('--timeout',type=float,default=300,help='Seconds to wait for the browser (default: %(default)s)')
     login.add_argument('--no-browser',action='store_true',help='Only print the authorization URL')
     login.set_defaults(handler=strava_login)
+    glogin = sub.add_parser('garmin-login',help='Authorize Garmin Connect once via the unofficial web API; session tokens are stored locally')
+    glogin.set_defaults(handler=garmin_login)
+    push = sub.add_parser('push-garmin',help='Upload a GPX as a Garmin Connect Course (unofficial API; sync the watch yourself)')
+    push.add_argument('gpx',type=Path,help='Candidate GPX to upload as a Course')
+    push.add_argument('--name',help=f'Course name on Connect/watch (default: name in the GPX, else {DEFAULT_COURSE_NAME}; truncated to {COURSE_NAME_MAX} characters)')
+    push.add_argument('--type',choices=list(GARMIN_COURSE_TYPES),default=None,
+                      help=f'Connect course type (default: type in the GPX, else {DEFAULT_COURSE_TYPE})')
+    push.set_defaults(handler=push_garmin)
     picker = sub.add_parser('pick',help='Write a map page for clicking start, vias and end; it saves a points GPX for optimize --points')
     picker.add_argument('-o','--output',type=Path,default=Path('pick.html'),help='HTML file to create; must not exist (default: %(default)s)')
     picker.add_argument('--center',type=latlon,metavar='LAT,LON',help='Where the map opens (or UTM ZONE:EASTING,NORTHING); default: the --points, else all of Norway')
@@ -1770,6 +2034,10 @@ def parser():
     opt.add_argument('--end',type=latlon,metavar='LAT,LON',help='Plan without a GPX: exact destination (or UTM ZONE:EASTING,NORTHING)')
     opt.add_argument('--via',type=latlon,metavar='LAT,LON',action='append',help='Mandatory waypoint, visited in the order given; repeat for more (or UTM ZONE:EASTING,NORTHING)')
     opt.add_argument('--points',type=Path,metavar='GPX',help='Plan without a recorded track: GPX waypoints (or one route) in order; first = start, last = end, the rest are --via points')
+    opt.add_argument('--course-name',default=DEFAULT_COURSE_NAME,metavar='NAME',
+                     help=f'Short name written into candidate GPX for Garmin Connect/watch (default: %(default)s; truncated to {COURSE_NAME_MAX} characters)')
+    opt.add_argument('--course-type',default=DEFAULT_COURSE_TYPE,choices=list(GARMIN_COURSE_TYPES),
+                     help='GPX track type for Garmin course import (default: %(default)s)')
     opt.add_argument('--keep-first-m',type=float,default=0,help='Follow the recorded approach for this distance (m)')
     opt.add_argument('--corridor-m',type=float,default=600,help='Search distance around the recorded ascent, or the straight reference line in coordinate mode (m)')
     opt.add_argument('--resolution-m',type=float,default=2,help='Approximate ground cell size for a new cache (m)')
