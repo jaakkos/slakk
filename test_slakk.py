@@ -211,6 +211,21 @@ class RouteTests(unittest.TestCase):
         with self.assertRaisesRegex(cli.NoRoute,'Waypoint 1 .*NVE runout'):
             cli.solve(self.terrain(colors),np.array([[30.,20.],[30.,32.]]),self.args(),np.array([[20.,7.]]))
 
+    def test_penalize_prefers_short_runout_over_long(self):
+        # A wall of long runout blocks the straight line; the only opening is a northern gate of short runout.
+        colors = np.zeros((40, 40, 4), np.uint8)
+        colors[:, 18:22] = [*cli.RUNOUT_LONG, 255]       # vertical long-runout wall
+        colors[4:12, 18:22] = [*cli.RUNOUT_SHORT, 255]   # short-runout gate (overwrites long)
+        terrain = self.terrain(colors)
+        reference = np.array([[20., 7.], [20., 32.]])
+        q, _ = cli.solve(terrain, reference, self.args('--runout', 'penalize', '--runout-buffer-m', '0',
+                                                       '--corridor-m', '500', '--max-terrain-deg', '60', '--landforms', 'off'))
+        m = cli.metrics(terrain, q)
+        self.assertGreater(m['nve_runout_short_m'], 20)
+        self.assertLess(m['nve_runout_long_m'], m['nve_runout_short_m'] / 2)
+        costs = cli.runout_cost_table(self.args('--runout', 'penalize'))
+        self.assertEqual(list(costs), [0.0, 4.0, 12.0, 24.0])
+
     def test_points_outside_the_cached_area_are_an_input_error(self):
         terrain = self.terrain()
         for far in ([20.,60.],[-15.,20.],[20.,38.]):  # beyond each side, and inside the blocked edge band
@@ -232,6 +247,7 @@ class RouteTests(unittest.TestCase):
         data = json.loads(text.split('const D = ',1)[1].split(';\n',1)[0])
         self.assertEqual((data['points'],data['corridor'],data['topo']),([[69.1,18.1],[69.2,18.2]],900,cli.TOPO))
         self.assertEqual(data['stedsnavn'], cli.STEDSNAVN)
+        self.assertIsNone(data['focus'])
         self.assertIn('ws.geonorge.no/stedsnavn', data['stedsnavn'])
         self.assertIn('id="radius"', text)
         self.assertIn('id="where"', text)
@@ -240,6 +256,13 @@ class RouteTests(unittest.TestCase):
         self.assertIn('60dvh', text)  # full-viewport map layout on narrow screens
         self.assertIn('setFocus', text)
         self.assertIn('zoomToRadius', text)
+        self.assertIn('id="zinFast"', text)
+        self.assertIn('zoomBy', text)
+        self.assertIn('id="hazards"', text)
+        self.assertIn('sampleNve', text)
+        self.assertIn('checkHazards', text)
+        self.assertEqual(len(data['steepColors'][0]), 3)
+        self.assertEqual(len(data['runoutColors'][0]), 3)
         self.assertNotIn('<script src',text)
         self.assertEqual(cli.main(['pick','-o',str(page),'--no-browser']),2)  # never overwrites
         before = page.read_bytes()
@@ -247,6 +270,28 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(page.read_bytes(),before)
         self.assertEqual(cli.main(['pick','-o',str(self.root/'nan.html'),'--no-browser','--corridor-m','nan']),2)
         self.assertFalse((self.root/'nan.html').exists())
+
+    def test_pick_center_place_name_is_resolved(self):
+        payload = {
+            'navn': [
+                {'navneobjekttype': 'Bygning', 'representasjonspunkt': {'nord': 69.0, 'øst': 18.0},
+                 'stedsnavn': [{'skrivemåte': 'Other'}], 'kommuner': [{'kommunenavn': 'X'}]},
+                {'navneobjekttype': 'Tettsted', 'representasjonspunkt': {'nord': 69.0645, 'øst': 18.5152},
+                 'stedsnavn': [{'skrivemåte': 'Bardufoss'}], 'kommuner': [{'kommunenavn': 'Målselv'}]},
+            ]
+        }
+        page = self.root/'bardufoss.html'
+        with patch.object(cli, 'download', return_value=json.dumps(payload).encode()) as call:
+            self.assertEqual(cli.main(['pick', '-o', str(page), '--center', 'Bardufoss',
+                                       '--radius-km', '25', '--no-browser']), 0)
+        self.assertIn('sok', call.call_args.args[0])
+        data = json.loads(page.read_text(encoding='utf-8').split('const D = ', 1)[1].split(';\n', 1)[0])
+        self.assertEqual(data['center'], [69.0645, 18.5152])
+        self.assertEqual(data['focus']['radiusKm'], 25)
+        self.assertIn('Bardufoss', data['focus']['label'])
+        with patch.object(cli, 'download', return_value=json.dumps({'navn': []}).encode()):
+            self.assertEqual(cli.main(['pick', '-o', str(self.root/'missing.html'),
+                                       '--center', 'NowhereVille', '--no-browser']), 2)
     def write_area(self, terrain, corners, name='avoid.geojson'):
         ring = terrain.lonlat(np.array(corners,float)).tolist()
         path = self.root/name

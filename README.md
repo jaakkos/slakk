@@ -59,7 +59,15 @@ SmartScreen asks you to confirm the first run.
 
 ### Install from source
 
-Use Python 3.11 or later. In this directory:
+Use Python 3.11 or later. In this directory, either:
+
+```sh
+make install                 # creates .venv, installs locked deps, editable slakk
+# make install-garmin        # also installs the optional Garmin upload extra
+.venv/bin/slakk --help       # or: source .venv/bin/activate  then  slakk --help
+```
+
+or by hand:
 
 ```sh
 python3 -m venv .venv
@@ -68,6 +76,30 @@ python -m pip install --require-hashes -r requirements.lock
 python -m pip install --no-deps -e .
 slakk --help
 ```
+
+### Web app (GitHub Pages)
+
+A desktop browser planner lives in [`web/`](web/): click start/vias/end on the
+map, download Kartverket DEM + NVE hazards in the browser, and run the A*
+search in **Rust compiled to WebAssembly**. No server. Strava/Garmin stay in
+the CLI.
+
+- Live site (after Pages is enabled on `main`):
+  https://jaakkos.github.io/slakk/
+- Local: `make web-dev` then open http://localhost:5173/slakk/
+  (needs [rustup](https://rustup.rs/) — not Homebrew `rust` alone —
+  [`wasm-pack`](https://rustwasm.github.io/wasm-pack/), and Node 20+.
+  `make web-dev` puts `~/.cargo/bin` first and runs `make wasm-tools`.)
+- Production build: `make web` → `web/dist/`
+
+Use a recent **Chrome or Edge** (Firefox usually works). Phone is unsupported.
+
+Web vs CLI: plan-from-points and recorded-GPX upload with pitch, landforms,
+alternatives, keep-first, hierarchical 10→fine refine, and IndexedDB DEM
+cache. Raster prep uses **WebGPU** when available (CPU fallback); planning
+runs on a **Worker pool** without SharedArrayBuffer so Kartverket tiles keep
+working (no COEP). Strava/Garmin remain CLI-only. True Wasm threads stay
+deferred unless we add an isolated compute iframe later.
 
 `requirements.lock` pins the exact NumPy and Pillow versions, with hashes, for
 every platform. `pyproject.toml` holds the allowed version ranges. After changing
@@ -113,9 +145,13 @@ slakk optimize walk.gpx \
 ```
 
 `--runout penalize` explicitly permits a candidate to cross mapped runout at
-an increased search cost. **That cost is not a quantitative avalanche-risk
-model.** Inspect `nve_runout_m` in the report. Every successful output is still
-an unverified planning candidate.
+an increased search cost. NVE’s three runout blues are costed separately
+(short / medium / long; defaults `--runout-cost-short 4`, `--runout-cost 12`,
+`--runout-cost-long 24`), so the search prefers short runout over long when
+both are open. **Those costs are planning weights, not a quantitative
+avalanche-risk model.** Inspect `nve_runout_m` and
+`nve_runout_short_m` / `_medium_m` / `_long_m` in the report. Every successful
+output is still an unverified planning candidate.
 
 The preserved approach is included in final constraint checks. If that section
 or a connector violates a hard constraint, the CLI declines to emit a GPX.
@@ -307,19 +343,29 @@ in between. There are three ways to give them.
 **Click them on a map.** `slakk pick` writes `pick.html` and opens it:
 
 ```sh
+slakk pick --center Bardufoss
+slakk pick --center Bardufoss --radius-km 30
 slakk pick --center 69.65,18.95
 ```
 
+`--center` accepts a Norwegian place name (resolved via Kartverket Stedsnavn),
+`LAT,LON`, or UTM. With `--center`, `--radius-km` (default 20) draws a
+navigation circle and zooms to fit it.
+
 Click to add points in order (the first is the start, the last the
 destination), drag a point to move it and right-click it to remove it. Drag the
-map to pan and use the wheel or Zoom ±; Kartverket topo tiles (and NVE when
+map to pan; zoom with the wheel, Zoom ±, Zoom +++/−−− (three levels), double-click,
+or the +/− keys (Shift jumps three levels). Kartverket topo tiles (and NVE when
 enabled) load for the visible area as you move, with a short in-memory cache so
-panning back does not re-download immediately. To jump somewhere, enter a
-Norwegian place name (Kartverket Stedsnavn) or `LAT,LON`, set a radius in km,
-and press **Go** — the map zooms to that circle (navigation aid only; it is not
-an optimize constraint). The page shows the search corridor and the terrain
-area a new cache would download, warns when that grid would be too large, and
-can overlay the NVE steep and runout layers. **Save points GPX** writes
+panning back does not re-download immediately. On the page you can also jump
+with a place name or `LAT,LON` and a radius in km via **Go** — the circle is a
+navigation aid only; it is not an optimize constraint. Each placed point is
+checked against the NVE steep/runout map (~15 m sample); runout or steep under
+a point blocks **Save** and turns the marker warning-red (same default
+`--runout avoid` / steep masks that `optimize` uses). Unmarked cells are still
+not safety clearance. The page shows the search corridor and the terrain area a
+new cache would download, warns when that grid would be too large, and can
+overlay the NVE layers. **Save points GPX** writes
 `trip-<date and time>.gpx` (to your downloads folder; rename it in the page)
 and the page shows the matching command. Place search and map tiles talk only
 to Kartverket/NVE while the page is open. `--points` loads an existing points
@@ -512,11 +558,13 @@ looking like a new result. The original input is never modified.
 | `--max-terrain-deg` | `35` | Additional terrain-model slope exclusion |
 | `--steep-buffer-m` | `6` | Buffer around NVE steep-slope pixels |
 | `--runout-buffer-m` | `10` | Buffer around modelled runout pixels |
-| `--runout avoid\|penalize` | `avoid` | Exclude runout or explicitly allow it with a cost |
+| `--runout avoid\|penalize` | `avoid` | Exclude runout, or allow it with graded short/medium/long costs |
 | `--landforms on\|off` | `on` | Detect ridges and gullies and use them in the search cost; `off` gives 0.2 routes |
 | `--gully-cost` | `3.0` | Added distance-cost multiplier inside detected gullies |
 | `--ridge-cost` | `0.5` | Added distance-cost multiplier everywhere except detected ridges |
-| `--runout-cost` | `12` | Added distance-cost multiplier when runout is permitted |
+| `--runout-cost-short` | `4` | Soft cost in NVE short (dark blue) runout with `--runout penalize` |
+| `--runout-cost` | `12` | Soft cost in NVE medium (blue) runout with `--runout penalize` |
+| `--runout-cost-long` | `24` | Soft cost in NVE long (light blue) runout with `--runout penalize` |
 | `--offline` | off | Require an existing terrain cache; make no downloads |
 
 Angles are **degrees**, not percentage gradients. The terrain slope and the

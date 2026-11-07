@@ -33,10 +33,16 @@ DTM = 'https://hoydedata.no/arcgis/rest/services/DTM/ImageServer/exportImage'
 NVE = 'https://gis3.nve.no/arcgis/rest/services/wmts/Bratthet_med_utlop_2024/MapServer/export'
 TOPO = 'https://wms.geonorge.no/skwms1/wms.topo'
 STEDSNAVN = 'https://ws.geonorge.no/stedsnavn/v1/sted'
+# Prefer these Kartverket navneobjekttype values when resolving --center place names.
+SETTLEMENT_TYPES = frozenset({'By', 'Tettsted', 'BygdelagSomSted', 'Grend', 'Tettbebyggelse'})
 # map.html background: fetched separately from topo.png, in WMS tiles, at most this many pixels per side.
 MAP_TILE_PX, MAP_MAX_PX = 2048, 6000
 STEEP_COLORS = {(255, 255, 0), (255, 170, 0), (255, 85, 0), (255, 0, 0), (115, 0, 0)}
-RUNOUT_COLORS = {(0, 77, 168), (76, 155, 255), (154, 177, 230)}
+# NVE Bratthet med utløp blues: dark=short, mid=medium, light=long (Varsom classes).
+RUNOUT_SHORT, RUNOUT_MEDIUM, RUNOUT_LONG = (0, 77, 168), (76, 155, 255), (154, 177, 230)
+RUNOUT_COLORS = {RUNOUT_SHORT, RUNOUT_MEDIUM, RUNOUT_LONG}
+RUNOUT_NONE, RUNOUT_CLASS_SHORT, RUNOUT_CLASS_MEDIUM, RUNOUT_CLASS_LONG = 0, 1, 2, 3
+RUNOUT_COLOR_CLASS = {RUNOUT_SHORT: RUNOUT_CLASS_SHORT, RUNOUT_MEDIUM: RUNOUT_CLASS_MEDIUM, RUNOUT_LONG: RUNOUT_CLASS_LONG}
 ALTERNATIVE_BAND_M = 50
 # Largest terrain grid, in cells; a single DEM request is also limited to MAX_SIDE px per side.
 MAX_CELLS, MAX_SIDE = 6_000_000, 4096
@@ -567,13 +573,18 @@ class Terrain:
         if rgba.shape[:2] != self.z.shape:
             raise ValueError('NVE raster dimensions do not match DEM.')
         self.steep = np.zeros(self.z.shape, bool)
-        self.runout = np.zeros(self.z.shape, bool)
+        self.runout_class = np.zeros(self.z.shape, np.int8)  # 0 none, 1 short, 2 medium, 3 long
         known = rgba[:, :, 3] == 0
-        for palette, mask in [(STEEP_COLORS, self.steep), (RUNOUT_COLORS, self.runout)]:
-            for color in palette:
-                pixels = (rgba[:, :, :3] == color).all(axis=2) & (rgba[:, :, 3] > 0)
-                mask |= pixels
-                known |= pixels
+        for color in STEEP_COLORS:
+            pixels = (rgba[:, :, :3] == color).all(axis=2) & (rgba[:, :, 3] > 0)
+            self.steep |= pixels
+            known |= pixels
+        for color, level in RUNOUT_COLOR_CLASS.items():
+            pixels = (rgba[:, :, :3] == color).all(axis=2) & (rgba[:, :, 3] > 0)
+            # Prefer the longer class if colours ever overlap (they should not).
+            self.runout_class = np.where(pixels & (self.runout_class < level), level, self.runout_class)
+            known |= pixels
+        self.runout = self.runout_class > 0
         if not known.all():
             raise ValueError('NVE image contains unknown colours. Review the provider palette; refusing to ignore them.')
         with Image.open(cache / 'topo.png') as im:
@@ -645,6 +656,15 @@ def dilate(mask, radius):
     return result
 
 
+def dilate_max(values, radius):
+    """Max-filter dilation for class rasters (keeps the highest class in the buffer)."""
+    result = values.copy()
+    for _ in range(max(0, radius)):
+        padded = np.pad(result, 1, constant_values=0)
+        result = np.maximum.reduce([padded[i:i + values.shape[0], j:j + values.shape[1]] for i in range(3) for j in range(3)])
+    return result
+
+
 def validation_spacing(terrain):
     return min(1, terrain.gs / 4)
 
@@ -677,11 +697,40 @@ def landforms(terrain):
 
 def landform_cost(terrain, args):
     """Added per-metre cost by destination cell: gullies cost --gully-cost more, and everything that is
-    not a ridge costs --ridge-cost more. Never negative, so it only adds cost and never relaxes a limit."""
-    if args.landforms == 'off':
+    not a ridge costs --ridge-cost more. Never negative, so it only adds cost and never relaxes a limit.
+    Also adds --roughness-cost where local DEM stddev exceeds --roughness-threshold-m (micro-terrain)."""
+    n = terrain.z.size
+    cost = np.zeros(terrain.z.shape, float)
+    if args.landforms != 'off':
+        land = landforms(terrain)
+        cost = args.gully_cost * (land == GULLY) + args.ridge_cost * (land != RIDGE)
+    rough_c = float(getattr(args, 'roughness_cost', 0) or 0)
+    if rough_c > 0:
+        thr = float(getattr(args, 'roughness_threshold_m', 0.45) or 0.45)
+        rad = float(getattr(args, 'roughness_radius_m', 15) or 15)
+        cost = cost + rough_c * roughness_penalty(terrain, rad, thr)
+    if args.landforms == 'off' and rough_c <= 0:
         return None
-    land = landforms(terrain)
-    return args.gully_cost * (land == GULLY) + args.ridge_cost * (land != RIDGE)
+    return cost
+
+
+def roughness_penalty(terrain, radius_m, threshold_m):
+    """0..2 scale: local elevation stddev above threshold (broken micro-terrain)."""
+    if threshold_m <= 0:
+        return np.zeros(terrain.z.shape, float)
+    radius = max(1, int(round(radius_m / terrain.gs)))
+    z = np.where(~terrain.invalid, terrain.z.astype(float), 0.0)
+    valid = (~terrain.invalid).astype(float)
+    count = window_sum(valid, radius)
+    zsum = window_sum(z, radius)
+    z2sum = window_sum(z * z, radius)
+    expected = float((2 * radius + 1) ** 2)
+    known = np.abs(count - expected) <= 0.5
+    mean = zsum / np.maximum(count, 1.0)
+    var = np.maximum(z2sum / np.maximum(count, 1.0) - mean * mean, 0.0)
+    std = np.sqrt(var)
+    t = np.clip((std - threshold_m) / threshold_m, 0.0, 2.0)
+    return np.where(known & (count >= 4), t, 0.0)
 
 
 def smoothed(terrain, args):
@@ -748,18 +797,25 @@ def edge_options(terrain, blocked, cells, args, raw=None):
         yield dr, dc, length, allowed, None if over is None else over / parts
 
 
-def step_costs(terrain, cells, transitions, nearest, runout, args, extra=None, land=None):
+def runout_cost_table(args):
+    """Per-metre added cost by NVE runout class: none, short, medium, long."""
+    return np.array([0.0, args.runout_cost_short, args.runout_cost, args.runout_cost_long], dtype=float)
+
+
+def step_costs(terrain, cells, transitions, nearest, runout_class, args, extra=None, land=None):
     """Cost of every allowed edge from each unblocked cell: a grid giving each cell's row (-1 when blocked),
     and a table with one row per cell in cells and one column per direction (inf where not allowed).
     Same arithmetic, in the same order, as evaluating each edge inside the search loop."""
     w = terrain.w
     table = np.empty((len(cells), len(DIRECTIONS)))
+    runout_costs = runout_cost_table(args) if args.runout == 'penalize' else None
     for k, (dr, dc, length, allowed, over) in enumerate(transitions):
         to = cells + dr * w + dc
         grade = (terrain.z.ravel()[to] - terrain.z.ravel()[cells]) / length
-        weight = 1 + 6 * np.maximum(0, grade-.12)**2 + 10 * np.maximum(0, -grade) + nearest.ravel()[to] / args.corridor_m
-        if args.runout == 'penalize':
-            weight = np.where(runout.ravel()[to], weight + args.runout_cost, weight)
+        descent_cost = getattr(args, 'descent_cost', 10)
+        weight = 1 + 6 * np.maximum(0, grade-.12)**2 + descent_cost * np.maximum(0, -grade) + nearest.ravel()[to] / args.corridor_m
+        if runout_costs is not None:
+            weight = weight + runout_costs[runout_class.ravel()[to]]
         if land is not None:
             weight = weight + land.ravel()[to]
         if over is not None:
@@ -949,7 +1005,9 @@ def solve_many(terrain, reference, args, waypoints=(), avoid=None, count=1):
         add('east of the --side west boundary', cols > nearest_col + args.side_tolerance_m / terrain.gs)
     if avoid is not None:
         add('inside an --avoid area', avoid)
-    runout = dilate(terrain.runout, math.ceil(args.runout_buffer_m / terrain.gs))
+    runout_radius = math.ceil(args.runout_buffer_m / terrain.gs)
+    runout = dilate(terrain.runout, runout_radius)
+    runout_class = dilate_max(terrain.runout_class, runout_radius)
     if args.runout == 'avoid':
         add(f'NVE runout or within --runout-buffer-m {args.runout_buffer_m:g} (--runout avoid)', runout)
     blocked[:EDGE_CELLS] = blocked[-EDGE_CELLS:] = True
@@ -966,7 +1024,7 @@ def solve_many(terrain, reference, args, waypoints=(), avoid=None, count=1):
     for attempt in range(1 if count == 1 else 2 * count):
         try:
             candidate, info = route_legs(terrain, reference, keep, distance, start, goal, stops, waypoints,
-                                         step_costs(terrain, usable, transitions, nearest, runout, args, extra if found else None, land), blocked, args, limit)
+                                         step_costs(terrain, usable, transitions, nearest, runout_class, args, extra if found else None, land), blocked, args, limit)
             if count == 1:
                 return [(candidate, info)]
         except NoRoute as exc:
@@ -1067,10 +1125,14 @@ def metrics(terrain, q, window=50, pitch=None):
     height = terrain.sample(dense)
     ij = np.rint(dense).astype(int)
     weights = np.diff(positions)
+    run_cls = terrain.runout_class[ij[:-1, 0], ij[:-1, 1]]
     stats = {'distance_m': round(float(positions[-1]), 1),
              'ascent_m': round(float(np.maximum(np.diff(height), 0).sum()), 1),
              'nve_steep_m': round(float(weights @ terrain.steep[ij[:-1,0],ij[:-1,1]]), 1),
-             'nve_runout_m': round(float(weights @ terrain.runout[ij[:-1,0],ij[:-1,1]]), 1),
+             'nve_runout_m': round(float(weights @ (run_cls > 0)), 1),
+             'nve_runout_short_m': round(float(weights @ (run_cls == RUNOUT_CLASS_SHORT)), 1),
+             'nve_runout_medium_m': round(float(weights @ (run_cls == RUNOUT_CLASS_MEDIUM)), 1),
+             'nve_runout_long_m': round(float(weights @ (run_cls == RUNOUT_CLASS_LONG)), 1),
              'kick_turns_approx': kick_turns(dense, terrain.gs)}
     land = getattr(terrain, 'landform', None)
     if land is not None:
@@ -1345,18 +1407,76 @@ select(D.routes.length > 1 ? 1 : 0);
 """
 
 
+def lookup_place(name):
+    """Resolve a Norwegian place name via Kartverket Stedsnavn to (lat, lon, label)."""
+    query = (name or '').strip()
+    if not query or len(query) > 80:
+        raise ValueError('Place name must be 1–80 characters.')
+    url = STEDSNAVN + '?' + urlencode({'sok': query, 'treffPerSide': '5', 'utkoordsys': '4258'})
+    try:
+        data = json.loads(download(url))
+    except ValueError as exc:
+        raise ValueError(f'Place search failed for {query!r}: {exc}') from None
+    hits = data.get('navn') or []
+    if not isinstance(hits, list) or not hits:
+        raise ValueError(f'No Kartverket place found for {query!r}. Try another spelling or LAT,LON.')
+
+    def coords(hit):
+        point = hit.get('representasjonspunkt') or {}
+        try:
+            lat, lon = float(point['nord']), float(point['øst'])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not (math.isfinite(lat) and math.isfinite(lon)) or abs(lat) > 80 or abs(lon) > 180:
+            return None
+        return lat, lon
+
+    def label(hit):
+        names = [n.get('skrivemåte') for n in (hit.get('stedsnavn') or []) if n.get('skrivemåte')]
+        primary = names[0] if names else query
+        kind = hit.get('navneobjekttype') or ''
+        kommune = ((hit.get('kommuner') or [{}])[0] or {}).get('kommunenavn') or ''
+        return ' · '.join(part for part in (primary, kind, kommune) if part)
+
+    ranked = sorted(enumerate(hits), key=lambda item: (0 if item[1].get('navneobjekttype') in SETTLEMENT_TYPES else 1, item[0]))
+    for _, hit in ranked:
+        ll = coords(hit)
+        if ll:
+            return ll[0], ll[1], label(hit)
+    raise ValueError(f'Kartverket returned no usable coordinates for {query!r}.')
+
+
+def resolve_pick_center(text):
+    """LAT,LON / UTM, or a Norwegian place name. Returns ((lat, lon), label_or_None)."""
+    try:
+        return latlon(text), None
+    except argparse.ArgumentTypeError:
+        pass
+    lat, lon, label = lookup_place(text)
+    return (lat, lon), label
+
+
 def pick(args):
     """Write a page for placing start, vias and end on a live Kartverket map; it saves a points GPX."""
     if not 20 <= args.corridor_m <= 3000 or not 1 <= args.resolution_m <= 30:
         raise ValueError('Use resolution 1–30 m and corridor 20–3000 m.')
+    if not 1 <= args.radius_km <= 200:
+        raise ValueError('Use --radius-km 1–200.')
     points = read_points(args.points) if args.points else []
+    focus = None
     if args.center:
-        center, zoom = args.center, 13
+        center, label = resolve_pick_center(args.center)
+        zoom = 13
+        focus = {'lat': center[0], 'lon': center[1], 'radiusKm': args.radius_km,
+                 'label': label or f'{center[0]:.4f},{center[1]:.4f}'}
+        if label:
+            log(f'Centered on {label} ({center[0]:.5f},{center[1]:.5f}), radius {args.radius_km:g} km.')
     elif points:
         center, zoom = tuple(np.mean(points, axis=0).tolist()), 13
     else:
         center, zoom = (65.0, 14.0), 5
-    data = {'points': points, 'center': center, 'zoom': zoom, 'topo': TOPO, 'nve': NVE, 'stedsnavn': STEDSNAVN,
+    data = {'points': points, 'center': center, 'zoom': zoom, 'focus': focus, 'topo': TOPO, 'nve': NVE, 'stedsnavn': STEDSNAVN,
+            'steepColors': [list(c) for c in sorted(STEEP_COLORS)], 'runoutColors': [list(c) for c in sorted(RUNOUT_COLORS)],
             'corridor': args.corridor_m, 'resolution': args.resolution_m, 'maxCells': MAX_CELLS, 'maxSide': MAX_SIDE,
             'maxSpan': MAX_SPAN_M, 'maxPoints': MAX_POINTS, 'disclaimer': DISCLAIMER, 'version': VERSION}
     page = PICK_HTML.replace('__DATA__', script_json(data))
@@ -1415,11 +1535,14 @@ pre{white-space:pre-wrap;word-break:break-all;background:color-mix(in srgb,var(-
 .aside-tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
 </style></head><body>
 <header><h1>Pick route points <span class="warn">PLANNING INPUT ONLY</span></h1>
-<span class="muted">Click to add start → vias → end. Drag the map to pan; tiles load as you move. Drag a point to move it; right-click to remove. The shaded band is the search corridor.</span></header>
+<span class="muted">Click to add start → vias → end. Drag to pan; scroll or +/− to zoom (Shift or Zoom +++/−−− jumps three levels; double-click zooms in). Tiles load as you move. The shaded band is the search corridor.</span></header>
 <main>
 <section id="stage">
  <div class="tools">
-  <button type="button" id="zin" title="Zoom in">Zoom +</button><button type="button" id="zout" title="Zoom out">Zoom −</button>
+  <button type="button" id="zin" title="Zoom in (Shift: +3 levels; +/= key)">Zoom +</button>
+  <button type="button" id="zout" title="Zoom out (Shift: −3 levels; − key)">Zoom −</button>
+  <button type="button" id="zinFast" title="Zoom in three levels">Zoom +++</button>
+  <button type="button" id="zoutFast" title="Zoom out three levels">Zoom −−−</button>
   <label><input type="checkbox" id="nve"> NVE steep / runout</label>
   <form id="goto" class="tools" style="padding:0;border:0;margin:0;display:contents">
    <input type="text" id="where" placeholder="Place or LAT,LON" autocomplete="off" aria-label="Place name or LAT,LON">
@@ -1439,6 +1562,7 @@ pre{white-space:pre-wrap;word-break:break-all;background:color-mix(in srgb,var(-
  <div class="aside-tools"><label>Corridor <input type="number" id="corridor" min="20" max="3000" step="50"> m</label>
   <label>Cell <input type="number" id="resolution" min="1" max="30" step="1" style="width:4em"> m</label></div>
  <div id="grid" class="muted"></div>
+ <div id="hazards" class="muted" style="font-size:12px;margin:6px 0"></div>
  <div class="aside-tools"><label>File <input type="text" id="name" style="width:14em"></label></div>
  <div class="aside-tools"><button type="button" id="save">Save points GPX</button><button type="button" id="copy">Copy command</button></div>
  <pre id="cmd"></pre>
@@ -1453,6 +1577,10 @@ const SETTLEMENT = new Set(['By', 'Tettsted', 'BygdelagSomSted', 'Grend', 'Tettb
 const $ = id => document.getElementById(id);
 const map = $('map'), tiles = $('tiles'), svg = $('overlay'), hits = $('hits');
 let points = D.points.map(p => p.slice()), zoom = D.zoom, cx, cy, drag = null, focus = null;
+// Parallel to points: null | 'checking' | 'error' | {steep:bool, runout:bool}
+let hazards = points.map(() => null), hazardToken = 0, hazardTimer = 0;
+const steepSet = new Set((D.steepColors || []).map(c => c.join(',')));
+const runoutSet = new Set((D.runoutColors || []).map(c => c.join(',')));
 $('corridor').value = D.corridor; $('resolution').value = D.resolution;
 // Each trip gets its own file name, and so its own cache in the suggested command.
 $('name').value = `trip-${new Date().toISOString().slice(0, 16).replace(/\D/g, '')}.gpx`; $('disclaimer').textContent = D.disclaimer;
@@ -1560,12 +1688,63 @@ function drawOverlay() {
     el('polyline', {points: line, fill: 'none', stroke: '#087f8c', 'stroke-width': 2.5, 'stroke-dasharray': '8 5'}, svg);
   }
   screen.forEach(([x, y], i) => {
-    const c = el('circle', {cx: x, cy: y, r: 9, fill: i === 0 ? '#2b8a3e' : i === points.length - 1 && i ? '#c92a2a' : '#e8590c',
-                            stroke: '#fff', 'stroke-width': 2, 'data-i': i, style: 'cursor:grab'}, svg);
-    el('title', {}, c).textContent = role(i);
+    const haz = hazards[i], bad = haz && haz !== 'checking' && haz !== 'error' && (haz.steep || haz.runout);
+    const fill = i === 0 ? '#2b8a3e' : i === points.length - 1 && i ? '#c92a2a' : '#e8590c';
+    const c = el('circle', {cx: x, cy: y, r: 9, fill, stroke: bad ? 'var(--warn)' : '#fff', 'stroke-width': bad ? 3 : 2,
+                            'data-i': i, style: 'cursor:grab'}, svg);
+    el('title', {}, c).textContent = role(i) + (bad ? hazardLabel(haz) : '');
     el('text', {x, y: y + 4, 'text-anchor': 'middle', 'font-size': 11, 'font-weight': 700, fill: '#fff', 'pointer-events': 'none'}, svg)
       .textContent = i === 0 ? 'S' : i === points.length - 1 ? 'E' : i;
   });
+}
+function hazardLabel(h) {
+  if (!h || h === 'checking' || h === 'error') return '';
+  const bits = [];
+  if (h.steep) bits.push('NVE steep');
+  if (h.runout) bits.push('NVE runout');
+  return bits.length ? ` — ${bits.join(' + ')}` : '';
+}
+async function sampleNve([lat, lon]) {
+  const [x, y] = mercator([lat, lon]), scale = Math.cos(lat * Math.PI / 180), m = 15 / scale;
+  const bbox = [x - m, y - m, x + m, y + m].map(v => v.toFixed(2)).join(',');
+  const url = D.nve + '?' + new URLSearchParams({
+    bbox, bboxSR: 3857, imageSR: 3857, size: '9,9', format: 'png32', transparent: 'true',
+    layers: 'show:1,2,3,4', f: 'image'});
+  const res = await fetch(url, {mode: 'cors'});
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const bitmap = await createImageBitmap(await res.blob());
+  const canvas = document.createElement('canvas');
+  canvas.width = bitmap.width; canvas.height = bitmap.height;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(bitmap, 0, 0);
+  const {data} = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  let steep = false, runout = false;
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] < 128) continue;
+    const key = data[i] + ',' + data[i + 1] + ',' + data[i + 2];
+    if (steepSet.has(key)) steep = true;
+    if (runoutSet.has(key)) runout = true;
+  }
+  return {steep, runout};
+}
+function scheduleHazardCheck() {
+  clearTimeout(hazardTimer);
+  hazardTimer = setTimeout(checkHazards, 200);
+}
+async function checkHazards() {
+  const token = ++hazardToken, snapshot = points.map(p => p.slice());
+  hazards = snapshot.map(() => 'checking');
+  drawOverlay(); drawPanel();
+  const results = await Promise.all(snapshot.map(async (p, i) => {
+    try { return await sampleNve(p); }
+    catch (err) { return 'error'; }
+  }));
+  if (token !== hazardToken) return;
+  hazards = results;
+  if (results.some(h => h && h !== 'checking' && h !== 'error' && (h.steep || h.runout))) {
+    if (!$('nve').checked) { $('nve').checked = true; drawTiles(); }
+  }
+  drawOverlay(); drawPanel();
 }
 
 const fmt = p => `${p[0].toFixed(6)},${p[1].toFixed(6)}`;
@@ -1585,16 +1764,18 @@ function drawPanel() {
   points.forEach((p, i) => {
     const li = document.createElement('li');
     li.innerHTML = '<b></b><code></code><button type="button" title="Move up">↑</button><button type="button" title="Move down">↓</button><button type="button" title="Remove">✕</button>';
-    li.children[0].textContent = role(i); li.children[1].textContent = fmt(p);
+    li.children[0].textContent = role(i); li.children[1].textContent = fmt(p) + hazardLabel(hazards[i]);
+    if (hazards[i] && hazards[i] !== 'checking' && hazards[i] !== 'error' && (hazards[i].steep || hazards[i].runout))
+      li.children[1].style.color = 'var(--warn)';
     const [up, down, del] = li.querySelectorAll('button');
     up.disabled = i === 0; down.disabled = i === points.length - 1;
-    up.onclick = () => { [points[i - 1], points[i]] = [points[i], points[i - 1]]; render(); };
-    down.onclick = () => { [points[i + 1], points[i]] = [points[i], points[i + 1]]; render(); };
-    del.onclick = () => { points.splice(i, 1); render(); };
+    up.onclick = () => { [points[i - 1], points[i]] = [points[i], points[i - 1]]; [hazards[i - 1], hazards[i]] = [hazards[i], hazards[i - 1]]; render(); };
+    down.onclick = () => { [points[i + 1], points[i]] = [points[i], points[i + 1]]; [hazards[i + 1], hazards[i]] = [hazards[i], hazards[i + 1]]; render(); };
+    del.onclick = () => { points.splice(i, 1); hazards.splice(i, 1); pointsChanged(); };
     list.appendChild(li);
   });
   if (!points.length) list.innerHTML = '<li class="muted">No points yet. Click the map to place the start.</li>';
-  const g = grid(), box = $('grid'), problems = [];
+  const g = grid(), box = $('grid'), problems = [], hazardNotes = [];
   if (g) {
     if (g.span > D.maxSpan) problems.push(`points span more than ${D.maxSpan / 1000} km; split the trip`);
     if (points.length > D.maxPoints) problems.push(`at most ${D.maxPoints} points`);
@@ -1605,6 +1786,19 @@ function drawPanel() {
     box.textContent = `New terrain grid: about ${g.w} × ${g.h} cells (${(g.w * g.h / 1e6).toFixed(1)} M), dashed box on the map.`
       + (problems.length ? ' Problem: ' + problems.join('; ') + '.' : '');
   } else box.textContent = 'Place at least a start and a destination.';
+  points.forEach((_, i) => {
+    const h = hazards[i];
+    if (!h || h === 'checking') return;
+    if (h === 'error') { hazardNotes.push(`${role(i)}: could not check NVE (network?)`); return; }
+    if (h.steep) problems.push(`${role(i)} is on NVE steep terrain (optimize will reject it)`);
+    if (h.runout) problems.push(`${role(i)} is on NVE runout (default --runout avoid will reject it; move the point or use --runout penalize)`);
+  });
+  if (hazards.some(h => h === 'checking')) hazardNotes.push('Checking NVE steep/runout under each point…');
+  const hazBox = $('hazards');
+  hazBox.textContent = [...hazardNotes, ...problems.filter(p => /NVE /.test(p))].join(' ') ||
+    (points.length ? 'NVE steep/runout under points: none detected (still unverified; unmarked is not clearance).' : '');
+  hazBox.classList.toggle('bad', problems.some(p => /NVE /.test(p)));
+  hazBox.style.color = problems.some(p => /NVE /.test(p)) ? 'var(--warn)' : '';
   box.classList.toggle('bad', problems.length > 0);
   const ok = points.length >= 2 && !problems.length;
   $('save').disabled = $('copy').disabled = !ok;
@@ -1613,6 +1807,12 @@ function drawPanel() {
   $('focusLabel').textContent = focus ? `${focus.label} · ${focus.radiusKm} km` : '';
 }
 function render() { drawTiles(); drawOverlay(); drawPanel(); }
+function pointsChanged() {
+  hazards.length = points.length;
+  for (let i = 0; i < hazards.length; i++) if (hazards[i] === undefined) hazards[i] = null;
+  render();
+  scheduleHazardCheck();
+}
 
 function gpx() {
   const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
@@ -1635,9 +1835,9 @@ $('copy').onclick = () => {
   const manual = () => { getSelection().selectAllChildren($('cmd')); done('Selected: copy it'); };
   if (navigator.clipboard) navigator.clipboard.writeText(command()).then(() => done('Copied'), manual); else manual();
 };
-$('undo').onclick = () => { points.pop(); render(); };
-$('clear').onclick = () => { if (confirm('Remove all points?')) { points = []; render(); } };
-$('reverse').onclick = () => { points.reverse(); render(); };
+$('undo').onclick = () => { points.pop(); hazards.pop(); pointsChanged(); };
+$('clear').onclick = () => { if (confirm('Remove all points?')) { points = []; hazards = []; pointsChanged(); } };
+$('reverse').onclick = () => { points.reverse(); hazards.reverse(); render(); };
 for (const id of ['corridor', 'resolution', 'name']) $(id).oninput = () => { drawOverlay(); drawPanel(); };
 $('nve').onchange = drawTiles;
 const zoomAt = (z, sx, sy) => {
@@ -1646,19 +1846,45 @@ const zoomAt = (z, sx, sy) => {
   const ll = toLatLon(sx, sy), [w, h] = size();
   zoom = z; const [x, y] = project(ll, zoom); cx = x - sx + w / 2; cy = y - sy + h / 2; render();
 };
-$('zin').onclick = () => zoomAt(zoom + 1, ...size().map(v => v / 2));
-$('zout').onclick = () => zoomAt(zoom - 1, ...size().map(v => v / 2));
-// Trackpads send many small wheel events; zoom one level per 100 px of scrolling.
+const zoomBy = (steps, sx, sy) => {
+  const [x, y] = sx == null ? size().map(v => v / 2) : [sx, sy];
+  zoomAt(zoom + steps, x, y);
+};
+const zoomStep = (e, direction) => (e && (e.shiftKey || e.altKey || e.metaKey) ? 3 : 1) * direction;
+$('zin').onclick = e => zoomBy(zoomStep(e, 1));
+$('zout').onclick = e => zoomBy(zoomStep(e, -1));
+$('zinFast').onclick = () => zoomBy(3);
+$('zoutFast').onclick = () => zoomBy(-3);
+// Trackpads send many small wheel events; zoom one level per ~40 px (Shift: three levels).
 // A pause or a change of direction starts a new gesture.
 let wheel = 0, wheelAt = 0;
 map.addEventListener('wheel', e => {
   e.preventDefault();
   const delta = e.deltaY * (e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 400 : 1);
-  if (e.timeStamp - wheelAt > 300 || delta * wheel < 0) wheel = 0;
+  const step = zoomStep(e, delta < 0 ? 1 : -1);
+  if (e.timeStamp - wheelAt > 250 || Math.sign(delta) !== Math.sign(wheel)) wheel = 0;
   wheelAt = e.timeStamp; wheel += delta;
-  if (Math.abs(wheel) < 100) return;
-  zoomAt(zoom + (wheel < 0 ? 1 : -1), ...local(e)); wheel = 0;
+  if (Math.abs(wheel) < 40) return;
+  zoomBy(step, ...local(e)); wheel = 0;
 }, {passive: false});
+map.addEventListener('dblclick', e => {
+  e.preventDefault();
+  // pointerup already ran twice for the double-click and may have added points; drop those.
+  const ll = toLatLon(...local(e));
+  let dropped = false;
+  while (points.length && Math.hypot(points[points.length - 1][0] - ll[0], points[points.length - 1][1] - ll[1]) < 1e-4) {
+    points.pop(); hazards.pop(); dropped = true;
+  }
+  zoomBy(zoomStep(e, e.shiftKey ? -1 : 1), ...local(e));
+  if (dropped) { drawPanel(); scheduleHazardCheck(); }
+});
+addEventListener('keydown', e => {
+  if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+  const tag = (e.target && e.target.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea' || tag === 'select' || (e.target && e.target.isContentEditable)) return;
+  if (e.key === '+' || e.key === '=') { e.preventDefault(); zoomBy(zoomStep(e, 1)); }
+  else if (e.key === '-' || e.key === '_') { e.preventDefault(); zoomBy(zoomStep(e, -1)); }
+});
 
 function placeLabel(hit) {
   const names = (hit.stedsnavn || []).map(n => n.skrivemåte).filter(Boolean);
@@ -1744,29 +1970,33 @@ map.addEventListener('pointermove', e => {
   if (Math.hypot(dx, dy) > 4) drag.moved = true;
   if (!drag.moved) return;
   if (drag.i === null) { cx = drag.cx - dx; cy = drag.cy - dy; drawTiles(); drawOverlay(); }
-  else { points[drag.i] = toLatLon(x, y); drawOverlay(); }
+  else { points[drag.i] = toLatLon(x, y); hazards[drag.i] = null; drawOverlay(); }
 });
 map.addEventListener('pointerup', e => {
   if (!drag) return;
   const d = drag; drag = null;
-  if (!d.moved && d.i === null) points.push(toLatLon(...local(e)));
-  render();
+  if (!d.moved && d.i === null) { points.push(toLatLon(...local(e))); hazards.push(null); }
+  if (d.moved && d.i !== null || !d.moved && d.i === null) pointsChanged();
+  else render();
 });
 map.addEventListener('pointercancel', () => { drag = null; render(); });
 map.addEventListener('contextmenu', e => {
   const i = e.target.dataset && e.target.dataset.i;
   if (i === undefined) return;
-  e.preventDefault(); points.splice(+i, 1); render();
+  e.preventDefault(); points.splice(+i, 1); hazards.splice(+i, 1); pointsChanged();
 });
 addEventListener('resize', render);
 
-if (points.length >= 2) {
+if (D.focus) {
+  setFocus([D.focus.lat, D.focus.lon], D.focus.radiusKm, D.focus.label || '');
+} else if (points.length >= 2) {
   // Fit the given points into view.
   const fit = z => { const xy = points.map(p => project(p, z)), [w, h] = size();
     return Math.max(...xy.map(p => p[0])) - Math.min(...xy.map(p => p[0])) < w * .8 && Math.max(...xy.map(p => p[1])) - Math.min(...xy.map(p => p[1])) < h * .8; };
   let z = MAXZ; while (z > MINZ && !fit(z)) z--;
   centerOn(D.center, Math.min(z, 15));
 } else centerOn(D.center, zoom);
+if (points.length) scheduleHazardCheck();
 </script></body></html>"""
 
 
@@ -1791,8 +2021,8 @@ def optimize(args):
         raise ValueError('Use --angle-window-m 5–500; route angles are sampled every 5 m.')
     if not 0 < args.max_uphill_deg < 45 or not 0 < args.max_downhill_deg < 45 or not 0 < args.max_terrain_deg < 80:
         raise ValueError('Invalid angle limit.')
-    if min(args.keep_first_m,args.steep_buffer_m,args.runout_buffer_m,args.runout_cost,args.side_tolerance_m,args.turn_cost_m,
-           args.gully_cost,args.ridge_cost) < 0:
+    if min(args.keep_first_m,args.steep_buffer_m,args.runout_buffer_m,args.runout_cost,args.runout_cost_short,
+           args.runout_cost_long,args.side_tolerance_m,args.turn_cost_m,args.gully_cost,args.ridge_cost) < 0:
         raise ValueError('Distances, buffers and cost must be nonnegative.')
     if args.points:
         if args.input or args.start or args.end or args.via:
@@ -2012,7 +2242,10 @@ def parser():
     push.set_defaults(handler=push_garmin)
     picker = sub.add_parser('pick',help='Write a map page for clicking start, vias and end; it saves a points GPX for optimize --points')
     picker.add_argument('-o','--output',type=Path,default=Path('pick.html'),help='HTML file to create; must not exist (default: %(default)s)')
-    picker.add_argument('--center',type=latlon,metavar='LAT,LON',help='Where the map opens (or UTM ZONE:EASTING,NORTHING); default: the --points, else all of Norway')
+    picker.add_argument('--center',metavar='PLACE|LAT,LON',
+                        help='Where the map opens: Norwegian place name (Kartverket Stedsnavn), LAT,LON, or UTM ZONE:EASTING,NORTHING; default: the --points, else all of Norway')
+    picker.add_argument('--radius-km',type=float,default=20,metavar='KM',
+                        help='With --center: draw a navigation circle and zoom to fit it (default: %(default)g; 1–200)')
     picker.add_argument('--points',type=Path,metavar='GPX',help='Points GPX to load for editing (waypoints or one route)')
     picker.add_argument('--corridor-m',type=float,default=600,help='Corridor shown on the map and put in the command (default: %(default)s)')
     picker.add_argument('--resolution-m',type=float,default=2,help='Cell size for the grid estimate and the command (default: %(default)s)')
@@ -2051,14 +2284,20 @@ def parser():
     opt.add_argument('--pitch-terrain-deg',type=float,help='With --pitch-deg: exclude cells whose unsmoothed terrain slope exceeds this (default: 45, or --max-terrain-deg if higher)')
     opt.add_argument('--pitch-cost',type=float,default=4,help='With --pitch-deg: added distance-cost multiplier for the part of an edge steeper than --max-uphill-deg (default %(default)g)')
     opt.add_argument('--max-downhill-deg',type=float,default=10,help='Limit for small descending sections during the ascent')
+    opt.add_argument('--descent-cost',type=float,default=10,help='Soft weight against losing elevation: each metre down ≈ this many cost-metres (default %(default)g); prefer continuous ascent over ups and downs')
     opt.add_argument('--max-terrain-deg',type=float,default=35,help='Exclude cells whose terrain-model slope exceeds this')
     opt.add_argument('--steep-buffer-m',type=float,default=6,help='Buffer around NVE steep-slope pixels (m)')
     opt.add_argument('--runout-buffer-m',type=float,default=10,help='Buffer around NVE runout pixels (m)')
-    opt.add_argument('--runout',choices=['avoid','penalize'],default='avoid',help='Exclude mapped runout, or explicitly allow it with a cost')
+    opt.add_argument('--runout',choices=['avoid','penalize'],default='avoid',help='Exclude mapped runout, or explicitly allow it with a graded cost (short/medium/long)')
     opt.add_argument('--landforms',choices=['on','off'],default='on',help='Detect ridges and gullies from the terrain model and use them in the search cost; off reproduces 0.2 routes')
     opt.add_argument('--gully-cost',type=float,default=3.0,help='Added distance-cost multiplier inside detected gullies')
     opt.add_argument('--ridge-cost',type=float,default=0.5,help='Added distance-cost multiplier everywhere except detected ridges (prefers ridges)')
-    opt.add_argument('--runout-cost',type=float,default=12,help='Added distance-cost multiplier inside runout with --runout penalize (not a risk score)')
+    opt.add_argument('--roughness-cost',type=float,default=2.0,help='Soft cost for broken micro-terrain (local DEM roughness); 0 disables (default %(default)g)')
+    opt.add_argument('--roughness-radius-m',type=float,default=15,help='Window for micro-terrain stddev (default %(default)g)')
+    opt.add_argument('--roughness-threshold-m',type=float,default=0.45,help='Stddev (m) above which micro-terrain cost starts (default %(default)g)')
+    opt.add_argument('--runout-cost-short',type=float,default=4,help='With --runout penalize: added cost multiplier in NVE short (dark blue) runout (default %(default)g)')
+    opt.add_argument('--runout-cost',type=float,default=12,help='With --runout penalize: added cost multiplier in NVE medium (blue) runout (default %(default)g; not a risk score)')
+    opt.add_argument('--runout-cost-long',type=float,default=24,help='With --runout penalize: added cost multiplier in NVE long (light blue) runout (default %(default)g)')
     opt.set_defaults(handler=optimize)
     return p
 

@@ -20,6 +20,16 @@ way unless a change clearly needs more.
 
 ## Set up
 
+One command (Make + Python 3.11+):
+
+```sh
+make install                 # .venv + locked deps + editable install
+make install-garmin          # same, plus optional Garmin upload extra
+.venv/bin/slakk --help       # or: source .venv/bin/activate  then  slakk --help
+```
+
+Or by hand:
+
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate              # Windows: .venv\Scripts\activate
@@ -30,8 +40,10 @@ python -m pip install --no-deps -e .
 ## Check your change
 
 ```sh
-python -m unittest -v                  # offline unit tests
-python scripts/smoke_test.py           # end-to-end run on synthetic terrain
+make check                             # unit tests + smoke test
+# or:
+make test                              # offline unit tests
+make smoke                             # end-to-end run on synthetic terrain
 uvx ruff check .                       # lint
 ```
 

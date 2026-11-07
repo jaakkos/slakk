@@ -4,6 +4,10 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+target/
+web/node_modules/
+web/dist/
+web/src/pkg/
 
 # Private tracks, terrain caches and run outputs: never commit these.
 temp/

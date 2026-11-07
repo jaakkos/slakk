@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>slakk — unverified ascent planner</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <header>
+    <h1>slakk <span class="warn">UNVERIFIED</span></h1>
+    <p class="tagline">Desktop browser planner for Norway. Bare-ground model — not a safe route.
+      <a href="how-it-works.html">How the route is chosen</a>
+    </p>
+  </header>
+  <main>
+    <aside id="panel">
+      <div class="panel-top">
+        <ol id="checklist" class="checklist" aria-label="Planning steps">
+          <li id="stepPlace" data-step="place">Find area</li>
+          <li id="stepPoints" data-step="points">Set start → end</li>
+          <li id="stepPlan" data-step="plan">Plan route</li>
+        </ol>
+        <p id="planHint" class="plan-hint" role="status">Add at least two map points (or a GPX) to enable Plan.</p>
+        <p id="staleBanner" class="stale-banner" hidden role="status">
+          Settings changed since the last plan — the drawn route may no longer match. Click <strong>Plan route</strong> again.
+        </p>
+      </div>
+
+      <div class="panel-scroll" id="panelScroll">
+        <div class="section-toolbar">
+          <button type="button" id="expandAllSections" class="text-btn">Expand all</button>
+          <button type="button" id="collapseAllSections" class="text-btn">Collapse all</button>
+          <button type="button" id="resetSettings" class="text-btn" title="Clear saved settings and restore built-in defaults">Reset settings</button>
+        </div>
+
+        <details class="panel-section" data-section="start" open>
+          <summary>
+            <span class="section-title">1. Start &amp; end</span>
+            <span class="section-hint">Points, place, GPX</span>
+          </summary>
+          <div class="section-body">
+            <p class="section-lead">Where the candidate must go. Map clicks add points; Remove edits the list.</p>
+            <label class="field">
+              <span class="field-head"><span class="field-label">Place</span><span class="field-meta"><span class="tag tag-setup">Setup</span><button type="button" class="info-btn" aria-expanded="false" title="What this does">?</button></span></span>
+              <span class="place-input-row">
+                <input id="place" type="text" placeholder="Bardufoss" />
+                <button type="button" id="goPlace">Go</button>
+              </span>
+              <span class="field-help" hidden>Centers the map on a Norwegian place name. Does not add route points.</span>
+            </label>
+            <div id="pointListWrap">
+              <div class="point-list-head"><span class="field-label">Points</span><span class="field-meta"><span class="tag tag-hard">Must visit</span></span></div>
+              <ul id="pointList" class="point-list"></ul>
+              <p id="pointListEmpty" class="hint">No points yet — click the map: start → vias → end.</p>
+            </div>
+            <label class="field">
+              <span class="field-head"><span class="field-label">Recorded GPX</span><span class="field-meta"><span class="tag tag-setup">Setup</span><button type="button" class="info-btn" aria-expanded="false" title="What this does">?</button></span></span>
+              <input id="gpxFile" type="file" accept=".gpx,application/gpx+xml,text/xml" />
+              <span class="field-help" hidden>Uses your track as the corridor reference. Search may leave the track within Corridor&nbsp;m unless Keep first locks the start.</span>
+            </label>
+            <div class="row">
+              <label class="field">
+                <span class="field-head"><span class="field-label">GPX goal</span><span class="field-meta"><span class="tag tag-setup">Setup</span><button type="button" class="info-btn" aria-expanded="false" title="What this does">?</button></span></span>
+                <select id="gpxGoal">
+                  <option value="highest" selected>highest</option>
+                  <option value="last">last</option>
+                </select>
+                <span class="field-help" hidden><em>highest</em> cuts the track at the peak elevation; <em>last</em> keeps the full file end.</span>
+              </label>
+              <label class="field">
+                <span class="field-head"><span class="field-label">Keep first m</span><span class="field-meta"><span class="tag tag-hard">Hard</span><button type="button" class="info-btn" aria-expanded="false" title="What this does">?</button></span></span>
+                <input id="keepFirst" type="number" value="0" min="0" max="5000" />
+                <span class="field-help" hidden>Preserve the first N metres of the GPX exactly; planning starts after that. 0 = free to replan from the start.</span>
+              </label>
+            </div>
+          </div>
+        </details>
+
+        <details class="panel-section" data-section="search">
+          <summary>
+            <span class="section-title">2. Search area</span>
+            <span class="section-hint">Corridor, resolution</span>
+          </summary>
+          <div class="section-body">
+            <p class="section-lead">How wide and fine the grid is. Affects options and speed, not “safety”.</p>
+            <div class="row">
+              <label class="field">
+                <span class="field-head"><span class="field-label">Corridor m</span><span class="field-meta"><span class="tag tag-hard">Hard</span><button type="button" class="info-btn" aria-expanded="false" title="What this does">?</button></span></span>
+                <input id="corridor" type="number" value="600" min="20" max="3000" />
+                <span class="field-help" hidden>Hard limit: cells farther than this from the reference line are blocked. Wider = more room to dodge hazards, slower search.</span>
+              </label>
+              <label class="field">
+                <span class="field-head"><span class="field-label">Resolution m</span><span class="field-meta"><span class="tag tag-setup">Setup</span><button type="button" class="info-btn" aria-expanded="false" title="What this does">?</button></span></span>
+                <input id="resolution" type="number" value="4" min="1" max="30" step="1" />
+                <span class="field-help" hidden>Grid cell size. Finer (1–2&nbsp;m) follows terrain better but downloads more DEM and searches longer.</span>
+              </label>
+            </div>
+            <div class="row">
+              <label class="field">
+                <span class="field-head"><span class="field-label">Hierarchical</span><span class="field-meta"><span class="tag tag-setup">Setup</span><button type="button" class="info-btn" aria-expanded="false" title="What this does">?</button></span></span>
+                <select id="hierarchical">
+                  <option value="on" selected>on (10→fine)</option>
+                  <option value="off">off</option>
+                </select>
+                <span class="field-help" hidden><em>on</em> finds a rough line at ~10&nbsp;m then refines at your resolution (faster). <em>off</em> searches only at full resolution.</span>
+              </label>
+              <label class="field">
+                <span class="field-head"><span class="field-label">Alternatives</span><span class="field-meta"><span class="tag tag-soft">Soft</span><button type="button" class="info-btn" aria-expanded="false" title="What this does">?</button></span></span>
+                <input id="alternatives" type="number" value="1" min="1" max="5" />
+                <span class="field-help" hidden>1 = one best-cost line. 2–5 also search other lines pushed ~50&nbsp;m away from earlier ones (same hard rules).</span>
+              </label>
+            </div>
+          </div>
+        </details>
+
+        <details class="panel-section" data-section="climb">
+          <summary>
+            <span class="section-title">3. Climb limits</span>
+            <span class="section-hint">Uphill, downhill, pitch</span>
+          </summary>
+          <div class="section-body">
+            <p class="section-lead"><span class="tag tag-hard">Hard</span> blocks illegal steps. <span class="tag tag-soft">Soft</span> only changes which legal line wins.</p>
+            <div class="row">
+              <label class="field">
+                <span class="field-head"><span class="field-label">Max uphill °</span><span class="field-meta"><span class="tag tag-hard">Hard</span><button type="button" class="info-btn" aria-expanded="false" title="What this does">?</button></span></span>
+                <input id="maxUp" type="number" value="15" min="1" max="44" />
+                <span class="field-help" hidden>Hard along-route climb limit on each search step. Lower = gentler line or no route if the terrain is steeper.</span>
+              </label>
+              <label class="field">
+                <span class="field-head"><span class="field-label">Max downhill °</span><span class="field-meta"><span class="tag tag-hard">Hard</span><button type="button" class="info-btn" aria-expanded="false" title="What this does">?</button></span></span>
+                <input id="maxDown" type="number" value="10" min="1" max="44" />
+                <span class="field-help" hidden>Hard cap on descending during the ascent. Lower forbids dips; too low can make the search fail.</span>
+              </label>
+            </div>
+            <div class="row">
+              <label class="field">
+                <span class="field-head"><span class="field-label">Pitch °</span><span class="field-meta"><span class="tag tag-hard">Hard</span><button type="button" class="info-btn" aria-expanded="false" title="What this does">?</button></span></span>
+                <input id="pitchDeg" type="number" value="25" min="0" max="44" step="1" />
+                <span class="field-help" hidden>0 = off (strict). Otherwise short pitches up to this angle are allowed on raw DEM (with extra cost); sustained climb still respects Max uphill on smoothed terrain.</span>
+              </label>
+              <label class="field">
+                <span class="field-head"><span class="field-label">Descent cost</span><span class="field-meta"><span class="tag tag-soft">Soft</span><button type="button" class="info-btn" aria-expanded="false" title="What this does">?</button></span></span>
+                <input id="descentCost" type="number" value="10" min="0" max="50" step="1" />
+                <span class="field-help" hidden>Soft weight: each metre of elevation lost ≈ this many cost-metres. Raise to avoid ups-and-downs even when a short dip is allowed.</span>
+              </label>
+            </div>
+          </div>
+        </details>
+
+        <details class="panel-section" data-section="hazards">
+          <summary>
+            <span class="section-title">4. Hazards &amp; shape</span>
+            <span class="section-hint">Runout, buffers, landforms</span>
+          </summary>
+          <div class="section-body">
+            <p class="section-lead">Tied to map layers (top-right). Toggle layers to see what the search is reacting to.</p>
+            <div class="row">
+              <label class="field">
+                <span class="field-head"><span class="field-label">Runout</span><span class="field-meta"><span class="tag tag-mixed">Hard/Soft</span><button type="button" class="info-btn" aria-expanded="false" title="What this does">?</button></span></span>
+                <select id="runout">
+                  <option value="avoid">avoid (block)</option>
+                  <option value="penalize" selected>penalize (cost)</option>
+                </select>
+                <span class="field-help" hidden><em>avoid</em> = Hard block of NVE runout (blue). <em>penalize</em> = Soft cost (short &lt; medium &lt; long) — not a risk score. Map layer: NVE runout.</span>
+              </label>
+              <label class="field">
+                <span class="field-head"><span class="field-label">Landforms</span><span class="field-meta"><span class="tag tag-soft">Soft</span><button type="button" class="info-btn" aria-expanded="false" title="What this does">?</button></span></span>
+                <select id="landforms">
+                  <option value="on" selected>on</option>
+                  <option value="off">off</option>
+                </select>
+                <span class="field-help" hidden><em>on</em> prefers ridges and charges gullies. Enable map layer “Ridges &amp; gullies” after planning to see them. <em>off</em> ignores shape.</span>
+              </label>
+            </div>
+            <div class="row">
+              <label class="field">
+                <span class="field-head"><span class="field-label">Steep buf m</span><span class="field-meta"><span class="tag tag-hard">Hard</span><button type="button" class="info-btn" aria-expanded="false" title="What this does">?</button></span></span>
+                <input id="steepBuf" type="number" value="0" min="0" max="100" />
+                <span class="field-help" hidden>Extra exclusion margin around NVE steep (red). Higher keeps you farther from mapped steep faces. Map layer: NVE steep.</span>
+              </label>
+              <label class="field">
+                <span class="field-head"><span class="field-label">Runout buf m</span><span class="field-meta"><span class="tag tag-hard">Hard</span><button type="button" class="info-btn" aria-expanded="false" title="What this does">?</button></span></span>
+                <input id="runoutBuf" type="number" value="10" min="0" max="200" />
+                <span class="field-help" hidden>Extra margin around NVE runout. With avoid = blocked; with penalize = still in the costed zone. Map layer: NVE runout.</span>
+              </label>
+            </div>
+            <div class="row">
+              <label class="field">
+                <span class="field-head"><span class="field-label">Micro-terrain</span><span class="field-meta"><span class="tag tag-soft">Soft</span><button type="button" class="info-btn" aria-expanded="false" title="What this does">?</button></span></span>
+                <input id="roughnessCost" type="number" value="2" min="0" max="20" step="0.5" />
+                <span class="field-help" hidden>Soft cost for broken / bumpy ground (local DEM roughness ≈ mikromaasto). Higher prefers smoother slopes that are easier to climb. 0 = off. Uses ~15&nbsp;m windows; not a rock/vegetation map.</span>
+              </label>
+              <label class="field">
+                <span class="field-head"><span class="field-label">Rough thr m</span><span class="field-meta"><span class="tag tag-setup">Setup</span><button type="button" class="info-btn" aria-expanded="false" title="What this does">?</button></span></span>
+                <input id="roughnessThr" type="number" value="0.45" min="0.1" max="3" step="0.05" />
+                <span class="field-help" hidden>Elevation stddev (m) in the micro-terrain window before Soft cost starts. Lower = more ground treated as rough.</span>
+              </label>
+            </div>
+          </div>
+        </details>
+
+        <p class="key-line" aria-hidden="true">
+          <span class="tag tag-hard">Hard</span> never crossed ·
+          <span class="tag tag-soft">Soft</span> preferred by cost ·
+          <span class="tag tag-setup">Setup</span> grid / input only
+        </p>
+      </div>
+
+      <div class="panel-footer">
+        <div class="panel-footer-actions">
+          <label class="field">
+            <span class="field-head"><span class="field-label">Smooth export m</span><span class="field-meta"><span class="tag tag-setup">Display</span><button type="button" class="info-btn" aria-expanded="false" title="What this does">?</button></span></span>
+            <input id="smoothM" type="number" value="8" min="0" max="50" step="1" />
+            <span class="field-help" hidden>Post-process only: simplifies zigzags for the map and GPX (Ramer–Douglas–Peucker). 0 = raw search path. Does not re-run A*; smoothed chords may look gentler than the validated grid steps. Metrics stay on the raw candidate.</span>
+          </label>
+          <label class="field export-route-field" id="exportRouteField" hidden>
+            <span class="field-head"><span class="field-label">Export route</span><span class="field-meta"><span class="tag tag-setup">GPX</span></span></span>
+            <select id="exportRoute" title="Which candidate to download as GPX"></select>
+          </label>
+          <div class="actions">
+            <button type="button" id="clearPts" title="Remove all points, GPX, and the drawn route">Clear</button>
+            <button type="button" id="plan" class="primary" disabled title="Run A* with the settings above">Plan route</button>
+            <button type="button" id="downloadGpx" disabled title="Download the selected candidate as GPX">Download GPX</button>
+            <button type="button" id="shareLink" disabled title="Copy a link with settings, waypoints, and the selected route">Copy share link</button>
+          </div>
+          <p class="hint">Full model: <a href="how-it-works.html">How the route is chosen</a></p>
+        </div>
+        <div class="panel-footer-results">
+          <pre id="status" role="status">Loading Wasm…</pre>
+          <div id="planError" class="plan-error" hidden role="alert"></div>
+          <div id="metrics" hidden></div>
+        </div>
+      </div>
+    </aside>
+    <div
+      id="panelResize"
+      class="panel-resize"
+      role="separator"
+      aria-orientation="vertical"
+      aria-controls="panel"
+      aria-label="Resize input panel"
+      tabindex="0"
+      title="Drag to resize panel"
+    ></div>
+    <div id="mapColumn" class="map-column">
+      <div id="map"></div>
+      <section id="profilePanel" class="profile-panel" hidden aria-label="Elevation profile">
+        <div class="profile-panel-head">
+          <strong>Elevation profile</strong>
+          <span class="profile-legend">
+            <i class="swatch" style="background:#2e7d32"></i>gentle
+            <i class="swatch" style="background:#c47a00"></i>steep
+            <i class="swatch" style="background:#c44300"></i>over max uphill
+            <i class="swatch" style="background:#2b59c3"></i>down
+          </span>
+        </div>
+        <div id="profileHost"></div>
+      </section>
+    </div>
+  </main>
+  <footer>
+    Map: Kartverket CC BY 4.0 · Hazards: NVE ·
+    <a href="how-it-works.html">How the route is chosen</a> ·
+    <a href="https://github.com/jaakkos/slakk">github.com/jaakkos/slakk</a>
+  </footer>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
