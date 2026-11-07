@@ -11,12 +11,13 @@
 
 export const SETTINGS_KEY = 'slakk.settings';
 /** Bump when a breaking reshape of the blob is needed (not for adding keys). */
-export const SETTINGS_VERSION = 1;
+export const SETTINGS_VERSION = 4;
 
 /**
  * @typedef {{ type: 'number', min?: number, max?: number }
  *   | { type: 'enum', values: string[] }
- *   | { type: 'string', maxLen?: number }} SettingSpec
+ *   | { type: 'string', maxLen?: number }
+ *   | { type: 'checkbox' }} SettingSpec
  */
 
 /** @type {Record<string, SettingSpec>} */
@@ -29,11 +30,27 @@ export const SETTINGS_SCHEMA = {
   hierarchical: { type: 'enum', values: ['on', 'off'] },
   alternatives: { type: 'number', min: 1, max: 5 },
   maxUp: { type: 'number', min: 1, max: 44 },
+  maxTerrain: { type: 'number', min: 10, max: 60 },
   maxDown: { type: 'number', min: 1, max: 44 },
   pitchDeg: { type: 'number', min: 0, max: 44 },
   descentCost: { type: 'number', min: 0, max: 50 },
-  runout: { type: 'enum', values: ['avoid', 'penalize'] },
+  runoutShort: { type: 'enum', values: ['avoid', 'penalize', 'ignore'] },
+  runoutMedium: { type: 'enum', values: ['avoid', 'penalize', 'ignore'] },
+  runoutLong: { type: 'enum', values: ['avoid', 'penalize', 'ignore'] },
+  /** Legacy share/storage keys — no longer in the form; kept for sanitize of old links. */
+  runoutCostShort: { type: 'number', min: 0, max: 100 },
+  runoutCostMedium: { type: 'number', min: 0, max: 100 },
+  runoutCostLong: { type: 'number', min: 0, max: 100 },
   landforms: { type: 'enum', values: ['on', 'off'] },
+  steep27: { type: 'enum', values: ['avoid', 'penalize', 'ignore'] },
+  steep30: { type: 'enum', values: ['avoid', 'penalize', 'ignore'] },
+  steep35: { type: 'enum', values: ['avoid', 'penalize', 'ignore'] },
+  steep40: { type: 'enum', values: ['avoid', 'penalize', 'ignore'] },
+  steep45: { type: 'enum', values: ['avoid', 'penalize', 'ignore'] },
+  /** Legacy single steep toggle — migrated into per-band modes. */
+  steepMode: { type: 'enum', values: ['ignore', 'avoid', 'penalize'] },
+  hazardBuf: { type: 'number', min: 0, max: 200 },
+  /** Legacy margins — migrated into hazardBuf. */
   steepBuf: { type: 'number', min: 0, max: 100 },
   runoutBuf: { type: 'number', min: 0, max: 200 },
   roughnessCost: { type: 'number', min: 0, max: 20 },
@@ -60,6 +77,12 @@ export function sanitizeValue(spec, raw) {
     if (spec.maxLen != null && s.length > spec.maxLen) s = s.slice(0, spec.maxLen);
     return s;
   }
+  if (spec.type === 'checkbox') {
+    if (typeof raw === 'boolean') return raw;
+    if (raw === 1 || raw === '1' || raw === 'true' || raw === 'on') return true;
+    if (raw === 0 || raw === '0' || raw === 'false' || raw === 'off') return false;
+    return null;
+  }
   return null;
 }
 
@@ -80,16 +103,94 @@ export function sanitizeSettingsMap(raw) {
 export function migrate(parsed) {
   if (!parsed || typeof parsed !== 'object') return null;
 
+  let v;
+  let settings;
+
   // Pre-version: plain map of id → value
   if (!('v' in parsed) && !('settings' in parsed)) {
-    return { v: 1, settings: { ...parsed } };
+    v = 1;
+    settings = { ...parsed };
+  } else {
+    v = Number(parsed.v) || 1;
+    settings =
+      parsed.settings && typeof parsed.settings === 'object' ? { ...parsed.settings } : {};
   }
 
-  let v = Number(parsed.v) || 1;
-  let settings =
-    parsed.settings && typeof parsed.settings === 'object' ? { ...parsed.settings } : {};
+  // v1 → v2: global runout + zone checkboxes → per-zone avoid|penalize|ignore
+  if (v < 2) {
+    const global = settings.runout === 'avoid' ? 'avoid' : 'penalize';
+    const asMode = (raw) => {
+      if (raw === 'avoid' || raw === 'penalize' || raw === 'ignore') return raw;
+      if (raw === false || raw === 0 || raw === '0' || raw === 'false' || raw === 'off') {
+        return 'ignore';
+      }
+      if (raw === true || raw === 1 || raw === '1' || raw === 'true' || raw === 'on') {
+        return global;
+      }
+      // Missing zone keys: inherit former global mode (all zones were on).
+      return global;
+    };
+    settings = {
+      ...settings,
+      runoutShort: asMode(settings.runoutShort),
+      runoutMedium: asMode(settings.runoutMedium),
+      runoutLong: asMode(settings.runoutLong),
+    };
+    delete settings.runout;
+    v = 2;
+  }
 
-  // Future: if (v < 2) { ...; v = 2; }
+  // v2 → v3: steepMode + single hazardBuf; NVE steep defaults Off (angles decide).
+  if (v < 3) {
+    const steep =
+      settings.steepMode === 'avoid' ||
+      settings.steepMode === 'ignore' ||
+      settings.steepMode === 'penalize'
+        ? settings.steepMode
+        : 'ignore';
+    const steepBuf = Number(settings.steepBuf);
+    const runoutBuf = Number(settings.runoutBuf);
+    const hazardExisting = Number(settings.hazardBuf);
+    let hazardBuf = 10;
+    if (Number.isFinite(hazardExisting)) {
+      hazardBuf = hazardExisting;
+    } else if (Number.isFinite(runoutBuf) || Number.isFinite(steepBuf)) {
+      hazardBuf = Math.max(
+        Number.isFinite(runoutBuf) ? runoutBuf : 0,
+        Number.isFinite(steepBuf) ? steepBuf : 0,
+      );
+    }
+    settings = {
+      ...settings,
+      steepMode: steep,
+      hazardBuf,
+    };
+    v = 3;
+  }
+
+  // v3 → v4: single steepMode → per-band Block/Prefer/Off (default Off).
+  if (v < 4) {
+    const global =
+      settings.steepMode === 'avoid' || settings.steepMode === 'penalize'
+        ? settings.steepMode
+        : 'ignore';
+    const band = (key) => {
+      const raw = settings[key];
+      if (raw === 'avoid' || raw === 'penalize' || raw === 'ignore') return raw;
+      return global;
+    };
+    settings = {
+      ...settings,
+      steep27: band('steep27'),
+      steep30: band('steep30'),
+      steep35: band('steep35'),
+      steep40: band('steep40'),
+      steep45: band('steep45'),
+    };
+    delete settings.steepMode;
+    v = 4;
+  }
+
   // Unknown newer version: still return settings map; apply() only uses known keys.
   if (v > SETTINGS_VERSION) {
     // Keep going — newer writers may have added keys we ignore safely.
@@ -118,10 +219,32 @@ export function collectSettingsFromDom(root = document) {
   for (const [id, spec] of Object.entries(SETTINGS_SCHEMA)) {
     const el = root.getElementById?.(id) || document.getElementById(id);
     if (!el) continue;
-    const cleaned = sanitizeValue(spec, el.value);
-    if (cleaned != null) out[id] = cleaned;
+    const raw = spec.type === 'checkbox' ? el.checked : el.value;
+    const cleaned = sanitizeValue(spec, raw);
+    if (cleaned == null) continue;
+    out[id] = cleaned;
+    // Keep the live input in range (browsers allow typing 0 even with min="1").
+    if (spec.type === 'checkbox') {
+      if (el.checked !== cleaned) el.checked = cleaned;
+    } else if (String(el.value) !== String(cleaned)) {
+      el.value = String(cleaned);
+    }
   }
   return out;
+}
+
+/** Schema-clamped number from an input id; falls back if missing/invalid. */
+export function clampedNumber(id, fallback, root = document) {
+  const spec = SETTINGS_SCHEMA[id];
+  const el = root.getElementById?.(id) || document.getElementById(id);
+  if (!spec || spec.type !== 'number' || !el) {
+    const n = Number(el?.value);
+    return Number.isFinite(n) ? n : fallback;
+  }
+  const cleaned = sanitizeValue(spec, el.value);
+  if (cleaned == null) return fallback;
+  if (String(el.value) !== String(cleaned)) el.value = String(cleaned);
+  return cleaned;
 }
 
 export function applySettingsToDom(settings, root = document) {
@@ -144,7 +267,8 @@ export function applySettingsToDom(settings, root = document) {
       skipped += 1;
       continue;
     }
-    el.value = String(cleaned);
+    if (spec.type === 'checkbox') el.checked = cleaned;
+    else el.value = String(cleaned);
     applied += 1;
   }
   return { applied, skipped };
@@ -179,10 +303,12 @@ export function resetSettingsToHtmlDefaults() {
   } catch {
     /* ignore */
   }
-  for (const id of Object.keys(SETTINGS_SCHEMA)) {
+  for (const [id, spec] of Object.entries(SETTINGS_SCHEMA)) {
     const el = document.getElementById(id);
     if (!el) continue;
-    if (el.tagName === 'SELECT') {
+    if (spec.type === 'checkbox') {
+      el.checked = el.defaultChecked;
+    } else if (el.tagName === 'SELECT') {
       const def = [...el.options].find((o) => o.defaultSelected) || el.options[0];
       if (def) el.value = def.value;
     } else if (el.defaultValue != null) {

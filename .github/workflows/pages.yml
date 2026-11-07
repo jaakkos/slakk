@@ -1,5 +1,7 @@
 name: Pages
 
+# Every push to main rebuilds Wasm + the static site and deploys to GitHub Pages
+# (https://jaakkos.github.io/slakk/). Manual runs via workflow_dispatch also work.
 on:
   push:
     branches: [main]
@@ -29,10 +31,11 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - name: Build Wasm + static site
+      - name: Install, test, build Wasm + static site
         working-directory: web
         run: |
           npm ci
+          npm test
           npm run wasm
           npm run build
       - uses: actions/upload-pages-artifact@v3

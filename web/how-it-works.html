@@ -44,14 +44,15 @@
     <p>Cells are blocked before search. A* cannot enter them:</p>
     <ul>
       <li><strong>Outside the corridor</strong> — farther than Corridor&nbsp;m from the straight/GPX reference line.</li>
-      <li><strong>Steep terrain</strong> — DEM slope above the terrain limit, plus NVE “steep” pixels (and their buffer).</li>
-      <li><strong>Runout (avoid mode)</strong> — NVE avalanche runout pixels (and buffer). In <em>penalize</em> mode these stay open but expensive.</li>
+      <li><strong>Steep terrain</strong> — DEM hillside slope above Ground slope max&nbsp;° (default 35). This is the hillside angle, not the Skin track max&nbsp;°. Optional NVE steep colour bands (27–30° … ≥45°) can each be <em>Block</em>, <em>Prefer around</em>, or <em>Off</em> (default Off so your angle limits decide).</li>
+      <li><strong>Avalanche runout (blue)</strong> — each NVE class (Short / Medium / Long) can be <em>Block</em> (Hard), <em>Prefer around</em> (Soft cost), or <em>Off</em>. Mix freely (e.g. Block Long, Prefer around Short). Cushion applies around Block / Prefer-around zones.</li>
       <li><strong>Invalid elevation</strong> — missing DEM, dilated by one cell so routes cannot clip corners.</li>
-      <li><strong>Pitch hard ceiling</strong> (when Pitch&nbsp;° &gt; 0) — raw along-edge grades above the pitch limit, and extreme raw slopes.</li>
+      <li><strong>Kick-turn hard ceiling</strong> (when Kick-turn max&nbsp;° &gt; 0) — raw along-edge grades above that kick-turn limit, and extreme raw slopes.</li>
     </ul>
     <p>
-      Each allowed step is also profile-checked along the edge so the climb/descent
-      cannot exceed Max uphill&nbsp;° (and downhill limit) on the elevations used for grades.
+      Each allowed step is also profile-checked along the edge so sustained climbing
+      respects Skin track max&nbsp;°, brief steeper bits stay under Kick-turn max&nbsp;° (if
+      enabled), and height loss on the ascent cannot exceed Allowed drop max&nbsp;°.
     </p>
 
     <h2>3. Soft cost (what “best” means)</h2>
@@ -64,22 +65,24 @@
   + descent_cost × downhill grade
   + distance from the corridor / corridor width
   + NVE runout class weight (if penalize)
-  + ridge / gully terms (if Landforms on)
-  + pitch-overage term (if Pitch ° &gt; 0)
+  + ridge / gully terms (if Ridges on)
+  + kick-turn overage term (if Kick-turn max ° &gt; 0)
   + diversity penalty (alternatives only))</pre>
     <ul>
-      <li><strong>Preserve ascent (avoid ups and downs)</strong> — any downhill step is charged
-        <code>Descent cost × (metres lost)</code> (default Descent cost&nbsp;=&nbsp;10), so losing
-        elevation is expensive compared with a longer traverse that keeps height.
-        <strong>Max downhill&nbsp;°</strong> is a hard cap: steeper descents are blocked entirely.
-        Together these push the search toward a continuous climb instead of dipping into
-        a valley and climbing back out.</li>
+      <li><strong>Preserve ascent (avoid ups and downs)</strong> — this tool plans a climb, not a
+        descent line. Any step that <em>loses</em> height is charged
+        <code>Drop penalty × (metres lost)</code> (default&nbsp;10), so dropping into a valley and
+        climbing out is expensive compared with a longer traverse that keeps height.
+        <strong>Allowed drop max&nbsp;°</strong> is a hard cap: steeper height-loss steps are blocked entirely.
+        Together these push the search toward a continuous climb.</li>
       <li><strong>Steepness</strong> — climbs steeper than about 12% grade get a quadratic extra, so gentle grades beat short brutal rises when both are legal.</li>
       <li><strong>Corridor pull</strong> — cells farther from the reference line cost more, so the route stays near your sketched/GPX corridor unless a detour is worth it.</li>
-      <li><strong>Runout penalize</strong> — NVE short / medium / long blues add increasing per-metre weights (defaults favour short runout over long). These are planning weights, not avalanche risk scores.</li>
-      <li><strong>Landforms</strong> — ridges (locally high) are slightly preferred; gullies (locally low) are heavily charged, so the search tends to stay out of drainage lines when a ridge or open slope exists.</li>
-      <li><strong>Micro-terrain</strong> — local DEM roughness (elevation stddev in ~15&nbsp;m). Bumpy / broken ground costs extra so the line prefers smoother slopes that are easier to climb with skins. Soft only; 0 turns it off. This is not a rock or vegetation layer — only what the bare DEM resolves.</li>
-      <li><strong>Pitch</strong> — grades between Max uphill&nbsp;° and Pitch&nbsp;° are allowed on raw DEM but charged extra, encouraging short steep pitches rather than long ones.</li>
+      <li><strong>Runout Prefer around</strong> — NVE short / medium / long blues set to Prefer around add a built-in Soft weight per metre (4 / 12 / 24, favouring short over long). Block is Hard instead. Off adds nothing. Planning weights, not avalanche risk scores.</li>
+      <li><strong>Ridges</strong> — ridges (locally high) are slightly preferred; gullies (locally low) are heavily charged, so the search tends to stay out of drainage lines when a ridge or open slope exists.</li>
+      <li><strong>Bump cost</strong> — local DEM roughness (elevation stddev in ~15&nbsp;m). Bumpy / broken ground costs extra so the line prefers smoother slopes that are easier to climb with skins. Soft only; 0 turns it off. This is not a rock or vegetation layer — only what the bare DEM resolves.</li>
+      <li><strong>Kick-turn max</strong> — grades between Skin track max&nbsp;° and Kick-turn max&nbsp;°
+        are allowed on the raw DEM but charged extra, so brief kick-turns / walls
+        can appear without letting the whole climb stay that steep. 0 turns kick-turns off.</li>
     </ul>
     <p>
       Optional turn cost (CLI; web defaults keep it modest) charges heading changes so micro-zigzags are replaced by longer traverses when that is cheaper.
@@ -90,13 +93,13 @@
       <li>Each cell can step to 16 neighbours (cardinal, diagonal, and knight-like offsets) so headings are not locked to 45°.</li>
       <li>Edge costs are precomputed for every allowed step.</li>
       <li>A* expands cells in order of <em>cost so far + straight-line estimate to the goal</em> (an admissible heuristic), so the first complete path it accepts is optimal for that cost model.</li>
-      <li>With vias, it solves leg by leg (start→via₁→…→end). With Keep first&nbsp;m on a GPX, the start of the recorded track is preserved and search begins after that distance.</li>
+      <li>With vias, it solves leg by leg (start→via₁→…→end). With Lock start&nbsp;m on a GPX, the start of the recorded track is preserved and search begins after that distance.</li>
       <li>After search, collinear points are dropped and the dense line is validated again at ~1&nbsp;m spacing. Failures here reject the candidate rather than silently loosening limits.</li>
     </ol>
 
     <h2>5. Alternatives</h2>
     <p>
-      If Alternatives &gt; 1, the planner runs again with an extra cost band (~50&nbsp;m)
+      If Alt. routes &gt; 1, the planner runs again with an extra cost band (~50&nbsp;m)
       around earlier lines so later searches find a different corridor. Every
       alternative still obeys the same hard masks. Compare metrics (distance,
       runout metres, pitch), not raw search cost — diversity cost is baked into
@@ -106,8 +109,8 @@
     <h2>6. Display / GPX smoothing</h2>
     <p>
       On steep ground the search often uses short zigzags so each grid step stays
-      under Max uphill&nbsp;°. That is correct for the model, but annoying on a GPS.
-      <strong>Smooth export m</strong> (default 8) runs Ramer–Douglas–Peucker on the
+      under Skin track max&nbsp;°. That is correct for the model, but annoying on a GPS.
+      <strong>Smooth GPX m</strong> (default 8) runs Ramer–Douglas–Peucker on the
       finished path for the map line and the downloaded GPX only. Set it to 0 for the
       raw search geometry. Metrics stay on the raw candidate; smoothed chords are
       <em>not</em> re-checked against Hard climb limits.
@@ -116,12 +119,15 @@
     <h2>7. Share links</h2>
     <p>
       <strong>Copy share link</strong> puts a URL in the clipboard whose hash carries your
-      current settings, waypoints, and the <em>selected</em> candidate line (smoothed for
-      size). Opening the link restores those controls and draws that geometry immediately —
-      it does not re-download DEM or re-run A* until you click Plan. Re-planning may differ
-      slightly if Kartverket/NVE data or the model change. Uploaded GPX corridors are not
-      embedded (too large); re-plan uses the shared waypoints as a point-to-point corridor
-      unless the recipient uploads a GPX again. Shared candidates remain unverified drafts.
+      current settings and waypoints. When a candidate exists, the <em>selected</em> line is
+      included too (smoothed for size). If planning failed, the link is still available as
+      <em>setup-only</em> (settings + points, plus a short note of the last error) so someone
+      else can open the same problem and Plan again. Opening a link with geometry draws it
+      immediately without re-running A*; setup-only links restore controls and points only.
+      Re-planning may differ if Kartverket/NVE data or the model change. Uploaded GPX
+      corridors are not embedded (too large); re-plan uses the shared waypoints as a
+      point-to-point corridor unless the recipient uploads a GPX again. Shared candidates
+      remain unverified drafts.
     </p>
 
     <h2>8. What this never models</h2>

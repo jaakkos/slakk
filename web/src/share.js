@@ -1,6 +1,9 @@
 /**
- * Versioned share links: settings + waypoints + selected candidate path in the URL hash.
+ * Versioned share links: settings + waypoints + optional candidate path in the URL hash.
  * Format: #s=<base64url(gzip|raw JSON)>
+ *
+ * Route geometry is optional — setup-only links (failed plans) restore controls + points
+ * so someone else can debug / Plan again.
  */
 
 import { sanitizeSettingsMap, collectSettingsFromDom } from './settingsStore.js';
@@ -54,7 +57,27 @@ function sanitizeRoute(route) {
   return { label, path, elev };
 }
 
-/** Build a shareable blob object (not yet encoded). */
+/** Compact failure snapshot for setup-only share links (optional). */
+export function sanitizeFailInfo(fail) {
+  if (!fail || typeof fail !== 'object') return null;
+  const out = {};
+  if (typeof fail.kind === 'string' && fail.kind) out.kind = fail.kind.slice(0, 40);
+  if (typeof fail.title === 'string' && fail.title) out.title = fail.title.slice(0, 80);
+  if (typeof fail.summary === 'string' && fail.summary) {
+    out.summary = fail.summary.slice(0, 400);
+  }
+  if (typeof fail.detail === 'string' && fail.detail) {
+    out.detail = fail.detail.slice(0, 500);
+  }
+  if (typeof fail.label === 'string' && fail.label) out.label = fail.label.slice(0, 40);
+  if (Number.isFinite(Number(fail.nodes))) out.nodes = Number(fail.nodes);
+  return Object.keys(out).length ? out : null;
+}
+
+/**
+ * Build a shareable blob object (not yet encoded).
+ * Pass a path for a candidate share; omit path (or pass empty) for setup-only.
+ */
 export function buildShareBlob({
   points,
   settings = collectSettingsFromDom(),
@@ -62,6 +85,7 @@ export function buildShareBlob({
   elevationsM,
   label = 'Route 1',
   smoothM = 8,
+  fail = null,
 } = {}) {
   const pts = sanitizePoints(
     (points || []).map((p) => (Array.isArray(p) ? p : [p.lat, p.lon])),
@@ -69,21 +93,29 @@ export function buildShareBlob({
   if (pts.length < 2) {
     throw new Error('Need at least two waypoints to share.');
   }
-  let sm = smoothPath(pathLatLon || [], elevationsM || [], Number(smoothM) || 0);
-  let route = sanitizeRoute({
-    label,
-    path: sm.path_latlon,
-    elev: sm.elevations_m,
-  });
-  if (!route) {
-    throw new Error('Shared route needs a path with at least two points.');
+  const hasPath = Array.isArray(pathLatLon) && pathLatLon.length >= 2;
+  let route = null;
+  let meta = { smooth_m: 0, kept: 0, raw: 0 };
+  if (hasPath) {
+    const sm = smoothPath(pathLatLon, elevationsM || [], Number(smoothM) || 0);
+    route = sanitizeRoute({
+      label,
+      path: sm.path_latlon,
+      elev: sm.elevations_m,
+    });
+    if (!route) {
+      throw new Error('Shared route needs a path with at least two points.');
+    }
+    meta = { smooth_m: sm.tolerance_m, kept: sm.kept, raw: sm.raw };
   }
+  const failInfo = sanitizeFailInfo(fail);
   return {
     v: SHARE_VERSION,
     pts,
     set: sanitizeSettingsMap(settings),
     route,
-    _meta: { smooth_m: sm.tolerance_m, kept: sm.kept, raw: sm.raw },
+    fail: failInfo,
+    _meta: meta,
   };
 }
 
@@ -123,17 +155,19 @@ async function gunzipBytes(bytes) {
 
 /**
  * Encode blob to hash payload string (no leading #s=).
- * Retries with stronger RDP if over soft max.
- * @returns {{ payload: string, warned: boolean, kept: number, raw: number }}
+ * Retries with stronger RDP if over soft max (route shares only).
+ * @returns {{ payload: string, warned: boolean, kept: number, raw: number, hasRoute: boolean }}
  */
 export async function encodeSharePayload(blob) {
   const encodeOnce = async (b) => {
-    const json = JSON.stringify({
+    const body = {
       v: b.v,
       pts: b.pts,
       set: b.set,
-      route: b.route,
-    });
+    };
+    if (b.route) body.route = b.route;
+    if (b.fail) body.fail = b.fail;
+    const json = JSON.stringify(body);
     const rawBytes = new TextEncoder().encode(json);
     const gz = await gzipBytes(rawBytes);
     if (gz && gz.length < rawBytes.length) {
@@ -145,10 +179,10 @@ export async function encodeSharePayload(blob) {
 
   let payload = await encodeOnce(blob);
   let warned = false;
-  let kept = blob._meta?.kept ?? blob.route.path.length;
-  let raw = blob._meta?.raw ?? blob.route.path.length;
+  let kept = blob._meta?.kept ?? (blob.route?.path?.length || 0);
+  let raw = blob._meta?.raw ?? (blob.route?.path?.length || 0);
 
-  if (payload.length > SHARE_SOFT_MAX_CHARS) {
+  if (blob.route && payload.length > SHARE_SOFT_MAX_CHARS) {
     const harder = smoothPath(blob.route.path, blob.route.elev, 25);
     const slim = {
       v: blob.v,
@@ -159,6 +193,7 @@ export async function encodeSharePayload(blob) {
         path: harder.path_latlon,
         elev: harder.elevations_m,
       }),
+      fail: blob.fail || null,
     };
     if (slim.route) {
       payload = await encodeOnce(slim);
@@ -170,11 +205,14 @@ export async function encodeSharePayload(blob) {
 
   if (payload.length > SHARE_SOFT_MAX_CHARS * 2) {
     throw new Error(
-      `Share link is too large (${Math.round(payload.length / 1000)} k chars). Lower Alternatives noise or raise Smooth export m, then try again.`,
+      `Share link is too large (${Math.round(payload.length / 1000)} k chars). ` +
+        (blob.route
+          ? 'Lower Alt. routes or raise Smooth GPX m, then try again.'
+          : 'Simplify settings or remove waypoints, then try again.'),
     );
   }
 
-  return { payload, warned, kept, raw };
+  return { payload, warned, kept, raw, hasRoute: !!blob.route };
 }
 
 export async function decodeSharePayload(payload) {
@@ -210,10 +248,8 @@ export function normalizeShareBlob(parsed) {
   }
   const set = sanitizeSettingsMap(parsed.set || {});
   const route = sanitizeRoute(parsed.route);
-  if (!route) {
-    throw new Error('Share link is missing a usable route path.');
-  }
-  return { v, pts, set, route };
+  const fail = sanitizeFailInfo(parsed.fail);
+  return { v, pts, set, route, fail };
 }
 
 export function sharePayloadFromLocation(loc = window.location) {
@@ -238,6 +274,9 @@ export function stripShareHash(loc = window.location) {
 
 /** Turn a normalized share blob into a minimal plan-result-like object for the UI. */
 export function sharedResultFromBlob(blob, disclaimer) {
+  if (!blob?.route?.path?.length) {
+    throw new Error('Share link has no route geometry.');
+  }
   const path = blob.route.path;
   const elev = blob.route.elev.map((z) => (z == null ? NaN : z));
   let distance_m = 0;

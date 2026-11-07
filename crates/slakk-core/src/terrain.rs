@@ -9,12 +9,17 @@ pub const RUNOUT_CLASS_SHORT: u8 = 1;
 pub const RUNOUT_CLASS_MEDIUM: u8 = 2;
 pub const RUNOUT_CLASS_LONG: u8 = 3;
 
+/// NVE bratthet colour bands → class 1..=5 (yellow → dark red).
+pub const STEEP_CLASS_COUNT: u8 = 5;
+/// Sentinel OR'd in by the web UI for runout-avoid cells merged into the steep raster.
+pub const STEEP_CLASS_FORCE_HARD: u8 = 6;
+
 const STEEP_COLORS: &[[u8; 3]] = &[
-    [255, 255, 0],
-    [255, 170, 0],
-    [255, 85, 0],
-    [255, 0, 0],
-    [115, 0, 0],
+    [255, 255, 0],   // 1 — ~27–30°
+    [255, 170, 0],   // 2 — ~30–35°
+    [255, 85, 0],    // 3 — ~35–40°
+    [255, 0, 0],     // 4 — ~40–45°
+    [115, 0, 0],     // 5 — ≥45°
 ];
 const RUNOUT_SHORT: [u8; 3] = [0, 77, 168];
 const RUNOUT_MEDIUM: [u8; 3] = [76, 155, 255];
@@ -29,7 +34,8 @@ pub struct TerrainGrid {
     pub z: Vec<f32>,
     pub slope: Vec<f32>,
     pub invalid: Vec<bool>,
-    pub steep: Vec<bool>,
+    /// NVE steep class per cell: 0 none, 1..=5 bratthet bands, 6 = force Hard.
+    pub steep: Vec<u8>,
     pub runout_class: Vec<u8>,
 }
 
@@ -86,7 +92,6 @@ impl TerrainGrid {
             Some(s) if s.len() == n => s,
             _ => slope_degrees(&elevations, &invalid, width, height, ground_resolution),
         };
-        let steep: Vec<bool> = steep_u8.iter().map(|&v| v != 0).collect();
         Ok(Self {
             width,
             height,
@@ -96,7 +101,7 @@ impl TerrainGrid {
             z: elevations,
             slope,
             invalid,
-            steep,
+            steep: steep_u8.to_vec(),
             runout_class,
         })
     }
@@ -261,9 +266,9 @@ pub fn decode_hazards_rgba(rgba: &[u8], width: usize, height: usize) -> Result<(
         }
         let rgb = [r, g, b];
         let mut known = false;
-        for color in STEEP_COLORS {
+        for (idx, color) in STEEP_COLORS.iter().enumerate() {
             if rgb == *color {
-                steep[i] = 1;
+                steep[i] = (idx + 1) as u8;
                 known = true;
                 break;
             }
@@ -355,5 +360,72 @@ mod tests {
         m[4] = true;
         let d = dilate(&m, 3, 3, 1);
         assert_eq!(d.iter().filter(|&&v| v).count(), 9);
+    }
+
+    #[test]
+    fn dilate_max_expands_class_without_collapsing() {
+        let mut v = vec![0u8; 9];
+        v[4] = 5; // centre class 5
+        let d = dilate_max(&v, 3, 3, 1);
+        assert_eq!(d.iter().copied().max(), Some(5));
+        assert_eq!(d.iter().filter(|&&c| c == 5).count(), 9);
+        // A neighbouring class-2 seed must not wipe class 5 when both expand.
+        let mut mixed = vec![0u8; 25];
+        mixed[12] = 5; // centre
+        mixed[0] = 2; // corner
+        let d2 = dilate_max(&mixed, 5, 5, 1);
+        assert!(d2.contains(&5));
+        assert!(d2.contains(&2));
+        assert_eq!(d2[12], 5);
+    }
+
+    #[test]
+    fn decode_hazards_maps_steep_bands_and_rejects_unknown() {
+        let w = 3usize;
+        let h = 1usize;
+        let mut rgba = vec![0u8; w * h * 4];
+        // pixel 0: yellow → class 1
+        rgba[0..4].copy_from_slice(&[255, 255, 0, 255]);
+        // pixel 1: dark red → class 5
+        rgba[4..8].copy_from_slice(&[115, 0, 0, 255]);
+        // pixel 2: transparent
+        rgba[8..12].copy_from_slice(&[0, 0, 0, 0]);
+        let (steep, runout) = decode_hazards_rgba(&rgba, w, h).expect("palette");
+        assert_eq!(steep, vec![1, 5, 0]);
+        assert_eq!(runout, vec![0, 0, 0]);
+
+        // All five steep colours
+        let colors = [
+            [255u8, 255, 0],
+            [255, 170, 0],
+            [255, 85, 0],
+            [255, 0, 0],
+            [115, 0, 0],
+        ];
+        let mut rgba5 = vec![0u8; 5 * 4];
+        for (i, c) in colors.iter().enumerate() {
+            rgba5[i * 4] = c[0];
+            rgba5[i * 4 + 1] = c[1];
+            rgba5[i * 4 + 2] = c[2];
+            rgba5[i * 4 + 3] = 255;
+        }
+        let (steep5, _) = decode_hazards_rgba(&rgba5, 5, 1).unwrap();
+        assert_eq!(steep5, vec![1, 2, 3, 4, 5]);
+
+        // Unknown opaque colour
+        let bad = [1u8, 2, 3, 255];
+        let err = decode_hazards_rgba(&bad, 1, 1).unwrap_err();
+        assert!(err.contains("unknown colours"));
+    }
+
+    #[test]
+    fn decode_hazards_maps_runout_blues() {
+        let mut rgba = vec![0u8; 12];
+        rgba[0..4].copy_from_slice(&[0, 77, 168, 255]); // short
+        rgba[4..8].copy_from_slice(&[76, 155, 255, 255]); // medium
+        rgba[8..12].copy_from_slice(&[154, 177, 230, 255]); // long
+        let (steep, runout) = decode_hazards_rgba(&rgba, 3, 1).unwrap();
+        assert_eq!(steep, vec![0, 0, 0]);
+        assert_eq!(runout, vec![1, 2, 3]);
     }
 }

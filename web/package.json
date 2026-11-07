@@ -7,6 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "wasm": "RUSTFLAGS='-C target-feature=+simd128' wasm-pack build ../crates/slakk-core --target web --out-dir ../../web/src/pkg --release"
   },
   "dependencies": {
@@ -14,6 +16,7 @@
     "leaflet": "^1.9.4"
   },
   "devDependencies": {
-    "vite": "^6.3.5"
+    "vite": "^6.3.5",
+    "vitest": "^3.2.4"
   }
 }

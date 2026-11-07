@@ -6,16 +6,45 @@ import init, {
   landform_classes,
   version as wasmVersion,
 } from './pkg/slakk_core.js';
-import { TOPO, NVE, lookupPlace, fetchTerrain } from './terrain.js';
+import {
+  TOPO,
+  NVE,
+  lookupPlace,
+  fetchTerrain,
+  MAX_DEM_SIDE,
+  MAX_DEM_CELLS,
+} from './terrain.js';
 import { buildGpx, downloadText } from './gpx.js';
 import { parseGpxTrack, truncateToGoal, trackToFlat } from './gpxParse.js';
-import { prepTerrainRasters, getGpuDevice } from './webgpuPrep.js';
+import { prepTerrainRasters, dilateBinary, dilateMax, getGpuDevice } from './webgpuPrep.js';
 import { PlanWorkerPool } from './workerPool.js';
 import { smoothPath } from './smooth.js';
 import { buildProfileSeries, renderProfile, ROUTE_COLORS } from './profile.js';
 import { aspectsAlongPath, aspectLegendItems } from './aspect.js';
 import { classifyPlanError } from './planErrors.js';
-import { diagnosePoints, formatDiagnosis } from './diagnose.js';
+import {
+  diagnosePoints,
+  formatDiagnosis,
+  parseFailedLeg,
+  diagnoseClosedLeg,
+} from './diagnose.js';
+import { buildDebugText, corridorClosedHint } from './debugReport.js';
+import {
+  runoutModesFromForm,
+  formatRunoutModes,
+  runoutOverlayLayerIds,
+  splitRunoutClass,
+  planRunoutStrategy,
+} from './runoutZones.js';
+import {
+  steepModesFromForm,
+  steepModesList,
+  formatSteepModes,
+  anySteepActive,
+  splitSteepClass,
+  STEEP_COST_DEFAULTS,
+  STEEP_FORCE_HARD,
+} from './steepZones.js';
 import {
   restoreSettings,
   resetSettingsToHtmlDefaults,
@@ -23,6 +52,7 @@ import {
   saveSettings,
   applySettingsToDom,
   collectSettingsFromDom,
+  clampedNumber,
 } from './settingsStore.js';
 import {
   buildShareBlob,
@@ -46,10 +76,20 @@ const gpxBtn = document.getElementById('downloadGpx');
 const shareBtn = document.getElementById('shareLink');
 const exportRouteEl = document.getElementById('exportRoute');
 const exportRouteFieldEl = document.getElementById('exportRouteField');
+const debugPanelEl = document.getElementById('debugPanel');
+const debugBodyEl = document.getElementById('debugBody');
+const debugSummaryEl = document.getElementById('debugSummary');
+const debugDiagnoseBtn = document.getElementById('debugDiagnose');
+const debugCopyBtn = document.getElementById('debugCopy');
 
 function setResultActionsEnabled(on) {
   gpxBtn.disabled = !on;
-  shareBtn.disabled = !on;
+  updateShareEnabled();
+}
+
+/** Share works with a candidate or with setup-only (settings + ≥2 waypoints). */
+function updateShareEnabled() {
+  shareBtn.disabled = !(lastResult || canPlan());
 }
 const planHintEl = document.getElementById('planHint');
 const staleBannerEl = document.getElementById('staleBanner');
@@ -71,20 +111,28 @@ function settingsFingerprint() {
     'resolution',
     'hierarchical',
     'alternatives',
-    'runout',
-    'steepBuf',
-    'runoutBuf',
+    'runoutShort',
+    'runoutMedium',
+    'runoutLong',
+    'steep27',
+    'steep30',
+    'steep35',
+    'steep40',
+    'steep45',
+    'hazardBuf',
     'maxUp',
+    'maxTerrain',
     'maxDown',
     'descentCost',
     'pitchDeg',
     'landforms',
     'roughnessCost',
-    'roughnessThr',
     'keepFirst',
     'gpxGoal',
   ];
-  return ids.map((id) => `${id}=${document.getElementById(id).value}`).join('|');
+  return ids
+    .map((id) => `${id}=${document.getElementById(id)?.value ?? ''}`)
+    .join('|');
 }
 
 function markResultFresh() {
@@ -175,13 +223,6 @@ function setAllSections(open) {
   saveSectionState();
 }
 
-function collapseParamsForResults() {
-  for (const el of sectionNodes()) {
-    if (el.dataset.section !== 'start') el.open = false;
-  }
-  saveSectionState();
-}
-
 restoreSectionState();
 for (const el of sectionNodes()) {
   el.addEventListener('toggle', saveSectionState);
@@ -201,6 +242,7 @@ document.getElementById('resetSettings').onclick = () => {
   saveSettings();
   markResultStaleIfNeeded();
   updatePlanEnabled();
+  updateHazardLegend();
   setStatus('Settings reset to defaults (saved).');
 };
 
@@ -397,7 +439,12 @@ function refreshNve() {
   const steep = nveExportUrl('1');
   nveSteepLayer.setUrl(steep.url);
   nveSteepLayer.setBounds(steep.bounds);
-  const runout = nveExportUrl('2,3,4');
+  const layerIds = runoutOverlayLayerIds();
+  if (!layerIds.length) {
+    nveRunoutLayer.setUrl(EMPTY_GIF);
+    return;
+  }
+  const runout = nveExportUrl(layerIds.join(','));
   nveRunoutLayer.setUrl(runout.url);
   nveRunoutLayer.setBounds(runout.bounds);
 }
@@ -408,6 +455,36 @@ map.on('moveend zoomend', () => {
   nveTimer = setTimeout(refreshNve, 250);
 });
 refreshNve();
+
+function updateHazardLegend() {
+  const el = document.getElementById('legendSteep');
+  if (!el) return;
+  const modes = steepModesFromForm();
+  const active = ['steep27', 'steep30', 'steep35', 'steep40', 'steep45'].filter(
+    (k) => modes[k] !== 'ignore',
+  );
+  el.textContent = active.length
+    ? `NVE steep map (${active.length} band${active.length > 1 ? 's' : ''} on)`
+    : 'NVE steep map (Off)';
+}
+
+document.getElementById('panel')?.addEventListener('change', (e) => {
+  const id = e.target?.id;
+  if (
+    id === 'runoutShort' ||
+    id === 'runoutMedium' ||
+    id === 'runoutLong' ||
+    id === 'steep27' ||
+    id === 'steep30' ||
+    id === 'steep35' ||
+    id === 'steep40' ||
+    id === 'steep45'
+  ) {
+    refreshNve();
+    updateHazardLegend();
+  }
+});
+updateHazardLegend();
 
 /** Clicked planning points (start/vias/end). */
 const points = [];
@@ -425,6 +502,46 @@ let profileCtl = null;
 let profileMarker = null;
 let profileSeries = null;
 let lastDiagnosis = null;
+/** Last plan/diagnose snapshot for the Debug panel. */
+let lastDebugCtx = null;
+/** Hazards from last DEM fetch — Diagnose without a full re-plan. */
+let lastHazards = null;
+
+function updateDebugPanel(ctx, { open = false, isError = false } = {}) {
+  lastDebugCtx = ctx;
+  debugBodyEl.textContent = buildDebugText(ctx);
+  debugPanelEl.classList.toggle('is-error', !!isError);
+  if (ctx?.error) {
+    debugSummaryEl.textContent = ctx.error.title || 'error';
+  } else if (ctx?.diagnosis && !ctx.diagnosis.allClear) {
+    debugSummaryEl.textContent = `${ctx.diagnosis.blocked?.length || 0} blocked point(s)`;
+  } else if (ctx?.result) {
+    debugSummaryEl.textContent = `ok · ${Math.round(ctx.result.distance_m || 0)} m · ${ctx.result.visited_nodes ?? '—'} nodes`;
+  } else if (ctx?.diagnosis?.allClear) {
+    debugSummaryEl.textContent = 'points OK';
+  } else {
+    debugSummaryEl.textContent = ctx ? 'updated' : 'no data yet';
+  }
+  if (open) debugPanelEl.open = true;
+}
+
+function resultDebugSlice(result) {
+  if (!result) return null;
+  const series = buildProfileSeries(result.path_latlon, result.elevations_m);
+  return {
+    status: result.status || 'ok',
+    shared: !!result.shared,
+    distance_m: result.distance_m,
+    cost: result.cost,
+    visited_nodes: result.visited_nodes,
+    max_sampled_uphill_deg: result.max_sampled_uphill_deg,
+    waypoints: result.waypoints,
+    path_points: result.path_latlon?.length,
+    alternatives: result.alternatives?.length || 0,
+    ascent_m: series.ascent_m,
+    descent_m: series.descent_m,
+  };
+}
 
 function clearPlanError() {
   planErrorEl.hidden = true;
@@ -456,6 +573,27 @@ function drawErrorMap(info) {
       dashArray: '8 6',
     })
       .bindTooltip('Reference line (search tries near this)', { sticky: true })
+      .addTo(errorLayer);
+  }
+
+  const failedLeg = info.failedLeg;
+  if (failedLeg && points[failedLeg.fromIdx] && points[failedLeg.toIdx]) {
+    const a = points[failedLeg.fromIdx];
+    const b = points[failedLeg.toIdx];
+    L.polyline(
+      [
+        [a.lat, a.lon],
+        [b.lat, b.lon],
+      ],
+      { color: '#c44300', weight: 6, opacity: 0.95 },
+    )
+      .bindTooltip(
+        `Failed leg: ${failedLeg.fromLabel} → ${failedLeg.toLabel}` +
+          (info.closedLeg?.blocked_pct != null
+            ? ` (${info.closedLeg.blocked_pct}% Hard-blocked on straight line)`
+            : ''),
+        { permanent: true, direction: 'center' },
+      )
       .addTo(errorLayer);
   }
 
@@ -547,9 +685,48 @@ function focusPlanFix(fix) {
   }
 }
 
+function buildClosedLegFromError(raw, opts = optionsFromForm()) {
+  const planPts = currentPlanPoints();
+  const failedLeg = parseFailedLeg(String(raw || ''), planPts);
+  if (!failedLeg || !lastDem || !lastHazards) return { failedLeg, closedLeg: null };
+  const from = planPts[failedLeg.fromIdx];
+  const to = planPts[failedLeg.toIdx];
+  const closedLeg = diagnoseClosedLeg({
+    from,
+    to,
+    fromLabel: failedLeg.fromLabel,
+    toLabel: failedLeg.toLabel,
+    bbox: lastDem.bbox,
+    width: lastDem.width,
+    height: lastDem.height,
+    elevations: lastDem.elevations,
+    steep: lastHazards.steep,
+    steepModes: lastHazards.steepModes || steepModesFromForm(),
+    runoutClass: lastHazards.runoutActive || lastHazards.runoutClass,
+    runoutModes: lastHazards.runoutModes || opts.runout_modes,
+    slope: lastHazards.slope,
+    maxTerrainDeg: opts.max_terrain_deg,
+  });
+  return { failedLeg, closedLeg };
+}
+
 function showPlanError(raw, extras = {}) {
-  const diagnosis = extras.diagnosis || lastDiagnosis;
-  const info = classifyPlanError(raw, { ...extras, diagnosis });
+  const opts = extras.options || optionsFromForm();
+  const { failedLeg, closedLeg } =
+    extras.closedLeg || extras.failedLeg
+      ? { failedLeg: extras.failedLeg || null, closedLeg: extras.closedLeg || null }
+      : buildClosedLegFromError(raw, opts);
+  const info = classifyPlanError(raw, {
+    ...extras,
+    options: opts,
+    failedLeg,
+    closedLeg,
+  });
+  // Terrain failures must not inherit a previous "points OK" diagnosis.
+  const diagnosis =
+    info.kind === 'terrain_fetch'
+      ? null
+      : extras.diagnosis || lastDiagnosis;
   clearPlanError();
   lastDiagnosis = diagnosis;
   metricsEl.hidden = true;
@@ -560,10 +737,26 @@ function showPlanError(raw, extras = {}) {
   const summary = document.createElement('p');
   summary.className = 'plan-error-summary';
   summary.textContent = info.summary;
+  planErrorEl.append(title, summary);
+
+  if (closedLeg?.reasons?.length) {
+    const list = document.createElement('ul');
+    list.className = 'plan-error-points';
+    const head = document.createElement('li');
+    head.innerHTML = `<strong>Why ${closedLeg.fromLabel} → ${closedLeg.toLabel} is closed</strong>`;
+    list.appendChild(head);
+    for (const r of closedLeg.reasons) {
+      const li = document.createElement('li');
+      li.textContent = `${r.label}: ${r.pct}% of straight-line samples (${r.count})`;
+      list.appendChild(li);
+    }
+    planErrorEl.appendChild(list);
+  }
+
   const detail = document.createElement('p');
   detail.className = 'plan-error-detail';
   detail.textContent = info.detail;
-  planErrorEl.append(title, summary, detail);
+  planErrorEl.appendChild(detail);
 
   if (diagnosis?.blocked?.length) {
     const list = document.createElement('ul');
@@ -574,7 +767,7 @@ function showPlanError(raw, extras = {}) {
       list.appendChild(li);
     }
     planErrorEl.appendChild(list);
-  } else if (diagnosis?.allClear) {
+  } else if (diagnosis?.allClear && !closedLeg) {
     const meta = document.createElement('p');
     meta.className = 'plan-error-meta';
     meta.textContent = diagnosis.summary;
@@ -614,6 +807,13 @@ function showPlanError(raw, extras = {}) {
   } else if (diagnosis?.blocked?.length) {
     note.textContent =
       'Map: bright red markers are the blocked points (tooltips list the Hard mask). Peach circles = Corridor radius.';
+  } else if (closedLeg) {
+    const steepNote = anySteepActive(steepModesFromForm())
+      ? 'NVE steep bands are on — turn on the red layer to inspect Block / Prefer around.'
+      : 'Ground slope / runout Block likely seal the stretch — turn on NVE layers to inspect.';
+    note.textContent =
+      `Map: thick orange line = failed leg (${closedLeg.fromLabel} → ${closedLeg.toLabel}). ` +
+      steepNote;
   } else {
     note.textContent = info.map.corridor
       ? `Map: dashed reference + peach circles = Corridor ${document.getElementById('corridor').value} m. Enable NVE steep/runout layers to see masks between points.`
@@ -621,10 +821,52 @@ function showPlanError(raw, extras = {}) {
   }
   planErrorEl.appendChild(note);
 
-  drawErrorMap({ ...info, diagnosis });
-  collapseParamsForResults();
+  drawErrorMap({ ...info, diagnosis, failedLeg, closedLeg });
   planErrorEl.scrollIntoView({ block: 'nearest' });
   setStatus(`Error: ${info.title} — ${info.summary}`, { error: true });
+
+  const terrainFail = info.kind === 'terrain_fetch';
+  const hint = terrainFail
+    ? 'Terrain failed before routing. Large grids are tiled automatically — retry Plan, or shrink Corridor / raise Resolution if it keeps failing.'
+    : closedLeg?.summary || corridorClosedHint(diagnosis, opts);
+  updateDebugPanel(
+    {
+      at: new Date().toISOString(),
+      phase: 'error',
+      label: extras.label || lastDebugCtx?.label,
+      options: { ...collectSettingsFromDom(), ...opts },
+      grid: extras.grid || (terrainFail ? null : lastDebugCtx?.grid) || null,
+      // Don't keep a previous "points OK" diagnosis when DEM never loaded for this attempt.
+      points: terrainFail
+        ? currentPlanPoints().map((p, idx, arr) => ({
+            label:
+              idx === 0
+                ? 'Start'
+                : idx === arr.length - 1
+                  ? 'End'
+                  : `Via ${idx}`,
+            lat: p.lat,
+            lon: p.lon,
+            ok: true,
+            issues: [],
+            index: idx,
+          }))
+        : extras.pointReports || lastDebugCtx?.points || [],
+      diagnosis: terrainFail ? null : diagnosis,
+      closedLeg: closedLeg || null,
+      error: {
+        kind: info.kind,
+        title: info.title,
+        summary: info.summary,
+        detail: info.detail,
+        nodes: info.nodes,
+        fixes: info.fixes,
+      },
+      result: null,
+      hint,
+    },
+    { open: true, isError: true },
+  );
 }
 
 function clearProfile() {
@@ -827,7 +1069,7 @@ L.control
       'NVE runout': nveRunoutLayer,
       'Ridges & gullies': landformLayer,
       'Planning points': markers,
-      'Recorded GPX': trackLayer,
+      'GPX track': trackLayer,
       'Candidate route': routeLayer,
     },
     { collapsed: true, position: 'topright' },
@@ -841,8 +1083,10 @@ const Legend = L.Control.extend({
     div.innerHTML = `
       <strong>Map key</strong>
       <div><span class="swatch" style="background:#c44300"></span>Candidate route</div>
-      <div><span class="swatch" style="background:#6d1b1b"></span>NVE steep (Hard)</div>
-      <div><span class="swatch" style="background:#2b6cd8"></span>NVE runout</div>
+      <div><span class="swatch" style="background:#6d1b1b"></span><span id="legendSteep">NVE steep map (Off)</span></div>
+      <div><span class="swatch" style="background:#004d98"></span>Runout short</div>
+      <div><span class="swatch" style="background:#4c9bff"></span>Runout medium</div>
+      <div><span class="swatch" style="background:#9ab1e6"></span>Runout long</div>
       <div><span class="swatch" style="background:#e69600"></span>Ridge (Soft)</div>
       <div><span class="swatch" style="background:#8228be"></span>Gully (Soft)</div>
       <div><span class="swatch" style="background:#2e7d32"></span>Start · <span class="swatch" style="background:#c44300"></span>End</div>
@@ -928,6 +1172,7 @@ function updatePlanEnabled() {
     planHintEl.textContent =
       'Ready. Plan uses Hard limits to block cells and Soft costs to pick among legal lines.';
   }
+  updateShareEnabled();
   updateChecklist();
 }
 
@@ -1033,6 +1278,8 @@ document.getElementById('clearPts').onclick = () => {
   recordedTrack = null;
   lastResult = null;
   lastDem = null;
+  lastHazards = null;
+  lastDebugCtx = null;
   syncExportRouteSelect(null);
   lastPlanFingerprint = null;
   resultStale = false;
@@ -1044,6 +1291,7 @@ document.getElementById('clearPts').onclick = () => {
   clearProfile();
   clearPlanError();
   lastDiagnosis = null;
+  updateDebugPanel(null);
   setResultActionsEnabled(false);
   metricsEl.hidden = true;
   redrawPoints();
@@ -1155,6 +1403,8 @@ async function applyIncomingShare() {
   try {
     const blob = await decodeSharePayload(payload);
     applySettingsToDom(blob.set);
+    refreshNve();
+    updateHazardLegend();
     saveSettings();
     recordedTrack = null;
     document.getElementById('gpxFile').value = '';
@@ -1162,28 +1412,69 @@ async function applyIncomingShare() {
     for (const [lat, lon] of blob.pts) points.push({ lat, lon });
     redrawPoints();
     redrawTrack();
+    if (points.length) {
+      const ll = points.map((p) => [p.lat, p.lon]);
+      map.fitBounds(L.latLngBounds(ll).pad(0.2));
+    }
     selectedExportIndex = 0;
-    lastResult = sharedResultFromBlob(blob, DISCLAIMER);
-    // Attach a friendly label for export/share via synthetic single route.
-    lastResult._shareLabel = blob.route.label;
-    markResultFresh();
     clearPlanError();
-    collapseParamsForResults();
-    syncExportRouteSelect(lastResult);
-    drawRoute(lastResult);
-    showProfile(lastResult);
-    showMetrics(lastResult);
-    setResultActionsEnabled(true);
     placedArea = true;
+
+    if (blob.route) {
+      lastResult = sharedResultFromBlob(blob, DISCLAIMER);
+      lastResult._shareLabel = blob.route.label;
+      markResultFresh();
+      syncExportRouteSelect(lastResult);
+      drawRoute(lastResult);
+      showProfile(lastResult);
+      showMetrics(lastResult);
+      setResultActionsEnabled(true);
+      const { up, down } = elevGainLoss(lastResult.elevations_m);
+      setStatus(
+        `Opened shared candidate (${blob.route.label}): ${lastResult.distance_m.toFixed(0)} m · ascent ${up.toFixed(0)} m · descent ${down.toFixed(0)} m. ` +
+          `Settings and waypoints restored. Plan again to recompute on current DEM (re-plan uses point-to-point corridor unless you upload a GPX). ` +
+          `\n${lastResult.disclaimer}`,
+      );
+    } else {
+      lastResult = null;
+      syncExportRouteSelect(null);
+      routeLayer.clearLayers();
+      clearProfile();
+      metricsEl.hidden = true;
+      setResultActionsEnabled(false);
+      lastPlanFingerprint = null;
+      resultStale = false;
+      staleBannerEl.hidden = true;
+      if (blob.fail?.detail || blob.fail?.summary) {
+        showPlanError(blob.fail.detail || blob.fail.summary, {
+          label: blob.fail.label || 'Shared setup',
+          options: optionsFromForm(),
+          diagnosis: {
+            allClear: true,
+            summary: 'Opened from a share link (no route). Loading terrain to explain the closed leg…',
+            blocked: [],
+          },
+        });
+        setStatus(
+          `Opened shared setup (${blob.pts.length} waypoints). Explaining last failure — then you can Plan again.`,
+        );
+        // Load DEM + sample the failed leg so the error panel names the Hard mask.
+        queueMicrotask(() => {
+          explainSharedFailure(blob.fail).catch((err) => {
+            console.warn('explainSharedFailure', err);
+          });
+        });
+      } else {
+        setStatus(
+          `Opened shared setup (${blob.pts.length} waypoints, no route). Settings restored. ` +
+            `Click Plan to search (point-to-point corridor unless you upload a GPX).`,
+        );
+      }
+    }
+
     updateChecklist();
     updatePlanEnabled();
     stripShareHash();
-    const { up, down } = elevGainLoss(lastResult.elevations_m);
-    setStatus(
-      `Opened shared candidate (${blob.route.label}): ${lastResult.distance_m.toFixed(0)} m · ascent ${up.toFixed(0)} m · descent ${down.toFixed(0)} m. ` +
-        `Settings and waypoints restored. Plan again to recompute on current DEM (re-plan uses point-to-point corridor unless you upload a GPX). ` +
-        `\n${lastResult.disclaimer}`,
-    );
     return true;
   } catch (err) {
     stripShareHash();
@@ -1213,33 +1504,106 @@ async function boot() {
   }
 }
 
-function optionsFromForm() {
+/**
+ * Dilate + split NVE steep bands and runout into Hard Block / Soft Prefer for Wasm.
+ * Steep bands default Off — Skin track / Ground slope remain the angle Hard gates.
+ */
+async function prepHazardsWithRunoutModes(
+  elevations,
+  steep0,
+  runRaw,
+  width,
+  height,
+  gs,
+  steepBufM,
+  runoutBufM,
+  modes = runoutModesFromForm(),
+  steepModes = steepModesFromForm(),
+) {
+  const steepOn = anySteepActive(steepModes);
+  const steepCells = steepOn ? Math.ceil((steepBufM || 0) / gs) : 0;
+  const runoutCells = Math.ceil((runoutBufM || 0) / gs);
+  const steepSplit = splitSteepClass(steep0, steepModes);
+  const split = splitRunoutClass(runRaw, modes);
+  const strategy = planRunoutStrategy(modes);
+  const runForPrep =
+    strategy.classSource === 'cost' ? split.costClass : split.activeClass;
+  const { slope, backend, runoutClass } = await prepTerrainRasters(
+    elevations,
+    // Binary dilate unused when we pass class via dilateMax below; keep API happy.
+    new Uint8Array(steep0.length),
+    runForPrep,
+    width,
+    height,
+    gs,
+    0,
+    runoutCells,
+  );
+  const steepDil = await dilateMax(steepSplit.activeClass, width, height, steepCells);
+  let steepForPlan = steepDil.values.slice();
+  if (strategy.mergeAvoidIntoSteep) {
+    const avoidDil = await dilateBinary(split.avoidMask, width, height, runoutCells);
+    for (let i = 0; i < steepForPlan.length; i++) {
+      if (avoidDil.mask[i]) steepForPlan[i] = STEEP_FORCE_HARD;
+    }
+  }
+  const activeDil = await dilateMax(split.activeClass, width, height, runoutCells);
+  const steepRaw =
+    steep0 instanceof Uint8Array ? steep0.slice() : new Uint8Array(steep0);
   return {
-    corridor_m: Number(document.getElementById('corridor').value),
-    runout: document.getElementById('runout').value,
-    steep_buffer_m: Number(document.getElementById('steepBuf').value),
-    runout_buffer_m: Number(document.getElementById('runoutBuf').value),
-    max_uphill_deg: Number(document.getElementById('maxUp').value),
-    max_downhill_deg: Number(document.getElementById('maxDown').value),
-    max_terrain_deg: 35,
-    runout_cost_short: 4,
-    runout_cost: 12,
-    runout_cost_long: 24,
+    slope,
+    steep: steepDil.values,
+    steepRaw,
+    steepForPlan,
+    steepModes,
+    runoutClass,
+    runoutActive: activeDil.values,
+    runoutRaw: runRaw instanceof Uint8Array ? runRaw : new Uint8Array(runRaw),
+    runoutModes: modes,
+    runout: strategy.runout,
+    backend,
+  };
+}
+
+/** Built-in Soft weights when runout is Prefer around (Short < Medium < Long). */
+const RUNOUT_COST_DEFAULTS = { short: 4, medium: 12, long: 24 };
+const BUMP_THRESHOLD_DEFAULT = 0.45;
+
+function optionsFromForm() {
+  const modes = runoutModesFromForm();
+  const strategy = planRunoutStrategy(modes);
+  const steepModes = steepModesFromForm();
+  const cushion = clampedNumber('hazardBuf', 10);
+  return {
+    corridor_m: clampedNumber('corridor', 600),
+    runout: strategy.runout,
+    runout_modes: modes,
+    steep_modes: steepModesList(steepModes),
+    steep_costs: STEEP_COST_DEFAULTS.slice(),
+    steep_buffer_m: anySteepActive(steepModes) ? cushion : 0,
+    runout_buffer_m: cushion,
+    max_uphill_deg: clampedNumber('maxUp', 15),
+    max_downhill_deg: clampedNumber('maxDown', 10),
+    max_terrain_deg: clampedNumber('maxTerrain', 35),
+    runout_cost_short: RUNOUT_COST_DEFAULTS.short,
+    runout_cost: RUNOUT_COST_DEFAULTS.medium,
+    runout_cost_long: RUNOUT_COST_DEFAULTS.long,
     turn_cost_m: 0,
-    descent_cost: Number(document.getElementById('descentCost').value),
+    descent_cost: clampedNumber('descentCost', 10),
     angle_window_m: 50,
-    pitch_deg: Number(document.getElementById('pitchDeg').value),
+    pitch_deg: clampedNumber('pitchDeg', 0),
     pitch_window_m: 15,
     pitch_cost: 4,
-    pitch_terrain_deg: 45,
+    // Match CLI: unsmoothed cliff cut-off is at least 45°, or Ground slope max if higher.
+    pitch_terrain_deg: Math.max(45, clampedNumber('maxTerrain', 35)),
     landforms: document.getElementById('landforms').value,
     gully_cost: 3,
     ridge_cost: 0.5,
-    roughness_cost: Number(document.getElementById('roughnessCost').value),
+    roughness_cost: clampedNumber('roughnessCost', 2),
     roughness_radius_m: 15,
-    roughness_threshold_m: Number(document.getElementById('roughnessThr').value),
-    alternatives: Number(document.getElementById('alternatives').value),
-    keep_first_m: Number(document.getElementById('keepFirst').value),
+    roughness_threshold_m: BUMP_THRESHOLD_DEFAULT,
+    alternatives: clampedNumber('alternatives', 1),
+    keep_first_m: clampedNumber('keepFirst', 0),
   };
 }
 
@@ -1261,20 +1625,76 @@ function planningFlats() {
   return { pointsLatLon: flat, corridorLatLon: new Float64Array(0) };
 }
 
+/** Raise cell size until the DEM grid fits Wasm/browser caps. */
+function fitGridMeta(metaPoints, preferredRes, corridor_m) {
+  let res = Math.max(1, Number(preferredRes) || 4);
+  let meta = grid_meta(metaPoints, res, corridor_m);
+  const fits = (m) =>
+    m.width <= MAX_DEM_SIDE &&
+    m.height <= MAX_DEM_SIDE &&
+    m.width * m.height <= MAX_DEM_CELLS;
+  if (fits(meta)) return { meta, resolution_m: res, bumped: false };
+  for (let i = 0; i < 48; i++) {
+    res = Math.max(res + 1, Math.ceil(res * 1.2));
+    meta = grid_meta(metaPoints, res, corridor_m);
+    if (fits(meta)) return { meta, resolution_m: res, bumped: true };
+  }
+  return { meta, resolution_m: res, bumped: true };
+}
+
+function currentPlanPoints() {
+  if (recordedTrack?.length >= 2) {
+    return [recordedTrack[0], recordedTrack.at(-1)];
+  }
+  return points.slice();
+}
+
 async function planOnce(resolution_m, corridor_m, opts, label) {
   const { pointsLatLon, corridorLatLon } = planningFlats();
   const metaPoints =
     corridorLatLon.length >= 4 ? corridorLatLon : pointsLatLon;
   setStatus(`${label}: sizing ${resolution_m} m grid…`);
-  const meta = grid_meta(metaPoints, resolution_m, corridor_m);
+  let meta;
+  let usedRes = resolution_m;
+  try {
+    const fitted = fitGridMeta(metaPoints, resolution_m, corridor_m);
+    meta = fitted.meta;
+    usedRes = fitted.resolution_m;
+    if (fitted.bumped) {
+      setStatus(
+        `${label}: Cell size ${resolution_m} m too fine for this span — using ${usedRes} m so DEM fits…`,
+      );
+    }
+  } catch (err) {
+    err.label = label;
+    throw err;
+  }
   const bbox = Array.from(meta.bbox);
   const width = meta.width;
   const height = meta.height;
   const gs = meta.groundResolution;
+  const gridInfo = {
+    width,
+    height,
+    gs,
+    resolution: meta.resolution,
+    preferred_resolution_m: resolution_m,
+    used_resolution_m: usedRes,
+    corridor_m,
+    bbox,
+  };
   setStatus(
     `${label}: grid ${width}×${height} @ ${gs.toFixed(2)} m. Fetching…`,
   );
-  const terrain = await fetchTerrain({ bbox, width, height }, setStatus);
+  let terrain;
+  try {
+    terrain = await fetchTerrain({ bbox, width, height }, setStatus);
+  } catch (err) {
+    err.label = label;
+    err.grid = gridInfo;
+    err.diagnosis = null;
+    throw err;
+  }
   lastDem = {
     elevations: terrain.elevations,
     width,
@@ -1288,22 +1708,34 @@ async function planOnce(resolution_m, corridor_m, opts, label) {
   const bytes = new Uint8Array(decoded);
   const n = width * height;
   const steep0 = bytes.subarray(0, n);
-  const run0 = bytes.subarray(n, n * 2);
+  const runRaw = new Uint8Array(bytes.subarray(n, n * 2));
 
-  const steepCells = Math.ceil((opts.steep_buffer_m || 0) / gs);
-  const runoutCells = Math.ceil((opts.runout_buffer_m || 0) / gs);
   setStatus(`${label}: raster prep (${gpuLabel})…`);
-  const prep = await prepTerrainRasters(
+  const prep = await prepHazardsWithRunoutModes(
     terrain.elevations,
     steep0,
-    run0,
+    runRaw,
     width,
     height,
     gs,
-    steepCells,
-    runoutCells,
+    opts.steep_buffer_m,
+    opts.runout_buffer_m,
+    opts.runout_modes || runoutModesFromForm(),
+    steepModesFromForm(),
   );
   gpuLabel = prep.backend;
+  opts.runout = prep.runout;
+  lastHazards = {
+    steep: prep.steep,
+    steepRaw: prep.steepRaw,
+    steepForPlan: prep.steepForPlan,
+    steepModes: prep.steepModes,
+    runoutClass: prep.runoutClass,
+    runoutActive: prep.runoutActive,
+    runoutRaw: prep.runoutRaw,
+    runoutModes: prep.runoutModes,
+    slope: prep.slope,
+  };
 
   const planPts =
     recordedTrack?.length >= 2
@@ -1324,17 +1756,36 @@ async function planOnce(resolution_m, corridor_m, opts, label) {
     height,
     elevations: terrain.elevations,
     steep: prep.steep,
-    runoutClass: prep.runoutClass,
-    runoutMode: opts.runout,
+    steepModes: prep.steepModes,
+    runoutClass: prep.runoutActive,
+    runoutModes: prep.runoutModes,
     corridorM: corridor_m,
     corridorLatLon: corridorPts,
+    slope: prep.slope,
   });
   const diagnosis = formatDiagnosis(reports);
   lastDiagnosis = diagnosis;
+  updateDebugPanel({
+    at: new Date().toISOString(),
+    phase: 'diagnose',
+    label,
+    options: { ...collectSettingsFromDom(), ...opts },
+    grid: gridInfo,
+    points: reports,
+    diagnosis,
+    error: null,
+    result: null,
+    hint: diagnosis.allClear
+      ? null
+      : corridorClosedHint(diagnosis, opts),
+  });
   if (!diagnosis.allClear) {
     const err = new Error(diagnosis.summary);
     err.diagnosis = diagnosis;
     err.pointBlocked = true;
+    err.pointReports = reports;
+    err.grid = gridInfo;
+    err.label = label;
     throw err;
   }
 
@@ -1359,7 +1810,7 @@ async function planOnce(resolution_m, corridor_m, opts, label) {
       bbox,
       elevations: terrain.elevations,
       slope: prep.slope,
-      steep: prep.steep,
+      steep: prep.steepForPlan,
       runoutClass: prep.runoutClass,
       pointsLatLon,
       corridorLatLon,
@@ -1367,6 +1818,9 @@ async function planOnce(resolution_m, corridor_m, opts, label) {
     });
   } catch (err) {
     err.diagnosis = diagnosis;
+    err.pointReports = reports;
+    err.grid = gridInfo;
+    err.label = label;
     throw err;
   }
 }
@@ -1384,7 +1838,22 @@ document.getElementById('plan').onclick = async () => {
     const hierarchical = document.getElementById('hierarchical').value === 'on';
     let result;
     if (hierarchical && fine < 10) {
-      const coarse = await planOnce(10, opts.corridor_m, { ...opts, alternatives: 1 }, 'Coarse');
+      // Coarse 10 m grids need short-steep allowance; pitch 0 often finds no alpine path
+      // even when the fine pass would. Borrow a temporary pitch floor for the scout only.
+      const coarseOpts = { ...opts, alternatives: 1 };
+      if (!(opts.pitch_deg > 0)) {
+        const floor = Math.min(40, Math.max(30, opts.max_uphill_deg + 10));
+        coarseOpts.pitch_deg = floor;
+        coarseOpts.pitch_terrain_deg = Math.max(
+          opts.pitch_terrain_deg || 45,
+          opts.max_terrain_deg || 35,
+          45,
+        );
+        setStatus(
+          `Coarse scout: Kick-turn max is 0 — using ${floor}° only for the 10 m pass, then refining at ${fine} m with your settings…`,
+        );
+      }
+      const coarse = await planOnce(10, opts.corridor_m, coarseOpts, 'Coarse');
       setStatus(
         `Coarse done (${coarse.distance_m.toFixed(0)} m). Refining at ${fine} m…`,
       );
@@ -1419,12 +1888,23 @@ document.getElementById('plan').onclick = async () => {
     selectedExportIndex = 0;
     markResultFresh();
     clearPlanError();
-    collapseParamsForResults();
     syncExportRouteSelect(result);
     drawRoute(result);
     showProfile(result);
     showMetrics(result);
     setResultActionsEnabled(true);
+    updateDebugPanel(
+      {
+        ...(lastDebugCtx || {}),
+        at: new Date().toISOString(),
+        phase: 'ok',
+        options: { ...collectSettingsFromDom(), ...opts },
+        result: resultDebugSlice(result),
+        error: null,
+        hint: null,
+      },
+      { open: false, isError: false },
+    );
     document.getElementById('metrics')?.scrollIntoView({ block: 'nearest' });
     const { up, down } = elevGainLoss(result.elevations_m);
     setStatus(
@@ -1440,6 +1920,10 @@ document.getElementById('plan').onclick = async () => {
     showPlanError(err.message || err, {
       diagnosis: err.diagnosis || lastDiagnosis,
       pointBlocked: !!err.pointBlocked,
+      pointReports: err.pointReports,
+      grid: err.grid,
+      label: err.label,
+      options: optionsFromForm(),
     });
   } finally {
     planBusy = false;
@@ -1528,10 +2012,10 @@ function showMetrics(result) {
   const series = buildProfileSeries(result.path_latlon, result.elevations_m);
   const descentNote =
     series.descent_m < 5
-      ? 'Almost no elevation given back — Descent cost / Max downhill are doing their job.'
+      ? 'Almost no elevation given back — Drop penalty / Allowed drop max are doing their job.'
       : series.descent_m > series.ascent_m * 0.25
-        ? 'Notable descent on an “ascent” — raise Descent cost or tighten Max downhill °, then Plan again.'
-        : 'Some descent remains; raise Descent cost if you want flatter continuous climbing.';
+        ? 'Notable height loss on an ascent — raise Drop penalty or tighten Allowed drop max, then Plan again.'
+        : 'Some dips remain; raise Drop penalty if you want flatter continuous climbing.';
   const sharedNote = result.shared
     ? '<br/><em>Opened from a share link — geometry from the URL. Plan again to recompute.</em>'
     : '';
@@ -1549,8 +2033,8 @@ function showMetrics(result) {
     ${alt ? `<br/>${alt}` : ''}
     <div class="shaped-by">
       <strong>Shaped by these settings</strong><br/>
-      Hard: corridor ${opts.corridor_m} m · uphill ≤ ${opts.max_uphill_deg}° · downhill ≤ ${opts.max_downhill_deg}° · pitch ${opts.pitch_deg || 0}° · runout <em>${opts.runout}</em> · steep buf ${document.getElementById('steepBuf').value} m · runout buf ${document.getElementById('runoutBuf').value} m<br/>
-      Soft: descent cost ${opts.descent_cost ?? document.getElementById('descentCost').value} · landforms <em>${opts.landforms}</em> · micro-terrain ${opts.roughness_cost ?? document.getElementById('roughnessCost').value} · alternatives ${opts.alternatives}
+      Hard: corridor ${opts.corridor_m} m · skin track ≤ ${opts.max_uphill_deg}° · ground ≤ ${opts.max_terrain_deg}° · drop ≤ ${opts.max_downhill_deg}° · kick-turn ≤ ${opts.pitch_deg || 0}° · NVE steep ${formatSteepModes(steepModesFromForm())} · runout ${formatRunoutModes(opts.runout_modes || runoutModesFromForm())} · cushion ${opts.runout_buffer_m ?? clampedNumber('hazardBuf', 10)} m<br/>
+      Soft: drop penalty ${opts.descent_cost ?? document.getElementById('descentCost').value} · ridges <em>${opts.landforms}</em> · bump ${opts.roughness_cost ?? document.getElementById('roughnessCost').value} · alt. routes ${opts.alternatives}
     </div>
     <div class="readout">${descentNote}</div>
   `;
@@ -1599,36 +2083,301 @@ gpxBtn.onclick = () => {
   downloadText(fileName, buildGpx(payload, { smoothNote, trackName }));
 };
 
+/** After a setup-only share: fetch DEM and rewrite the error with a clear closed-leg report. */
+async function explainSharedFailure(fail) {
+  if (!canPlan()) return;
+  await diagnoseCurrentPoints({ quietOk: true });
+  if (!fail?.detail && !fail?.summary) return;
+  showPlanError(fail.detail || fail.summary, {
+    label: fail.label || 'Shared setup',
+    options: optionsFromForm(),
+    diagnosis: lastDiagnosis,
+    pointReports: lastDebugCtx?.points,
+    grid: lastDebugCtx?.grid,
+  });
+}
+
+async function diagnoseCurrentPoints({ quietOk = false } = {}) {
+  if (!canPlan()) {
+    setStatus('Add start and end (or a GPX) before Diagnose.', { error: true });
+    return;
+  }
+  const opts = optionsFromForm();
+  const preferred = Number(document.getElementById('resolution').value) || 4;
+  try {
+    debugDiagnoseBtn.disabled = true;
+    setStatus('Diagnose: loading terrain for point checks…');
+    // Reuse last DEM when grid settings match; otherwise fetch like Plan.
+    let dem = lastDem;
+    let hazards = lastHazards;
+    const { pointsLatLon, corridorLatLon } = planningFlats();
+    const metaPoints = corridorLatLon.length >= 4 ? corridorLatLon : pointsLatLon;
+    const fitted = fitGridMeta(metaPoints, preferred, opts.corridor_m);
+    const meta = fitted.meta;
+    const fine = fitted.resolution_m;
+    if (fitted.bumped) {
+      setStatus(
+        `Diagnose: Cell size ${preferred} m is too fine for this span — using ${fine} m so the DEM fits…`,
+      );
+    }
+    const bbox = Array.from(meta.bbox);
+    const width = meta.width;
+    const height = meta.height;
+    const gs = meta.groundResolution;
+    const sameGrid =
+      dem &&
+      hazards &&
+      dem.width === width &&
+      dem.height === height &&
+      Math.abs(dem.gs - gs) < 1e-6 &&
+      dem.bbox?.every((v, i) => Math.abs(v - bbox[i]) < 1e-3);
+    if (!sameGrid) {
+      const terrain = await fetchTerrain({ bbox, width, height }, setStatus);
+      dem = { elevations: terrain.elevations, width, height, gs, bbox };
+      lastDem = dem;
+      const decoded = decode_hazards(terrain.rgba, width, height);
+      const bytes = new Uint8Array(decoded);
+      const n = width * height;
+      const prep = await prepHazardsWithRunoutModes(
+        terrain.elevations,
+        bytes.subarray(0, n),
+        new Uint8Array(bytes.subarray(n, n * 2)),
+        width,
+        height,
+        gs,
+        opts.steep_buffer_m,
+        opts.runout_buffer_m,
+        opts.runout_modes,
+        steepModesFromForm(),
+      );
+      hazards = {
+        steep: prep.steep,
+        steepRaw: prep.steepRaw,
+        steepForPlan: prep.steepForPlan,
+        steepModes: prep.steepModes,
+        runoutClass: prep.runoutClass,
+        runoutActive: prep.runoutActive,
+        runoutRaw: prep.runoutRaw,
+        runoutModes: prep.runoutModes,
+        slope: prep.slope,
+      };
+      lastHazards = hazards;
+    } else if (hazards?.runoutRaw && hazards?.steepRaw) {
+      // Re-apply steep / runout modes on cached rasters (cushion / Block toggles).
+      const prep = await prepHazardsWithRunoutModes(
+        dem.elevations,
+        hazards.steepRaw,
+        hazards.runoutRaw,
+        dem.width,
+        dem.height,
+        dem.gs,
+        opts.steep_buffer_m,
+        opts.runout_buffer_m,
+        opts.runout_modes || runoutModesFromForm(),
+        steepModesFromForm(),
+      );
+      hazards = {
+        steep: prep.steep,
+        steepRaw: prep.steepRaw,
+        steepForPlan: prep.steepForPlan,
+        steepModes: prep.steepModes,
+        runoutClass: prep.runoutClass,
+        runoutActive: prep.runoutActive,
+        runoutRaw: prep.runoutRaw,
+        runoutModes: prep.runoutModes,
+        slope: prep.slope,
+      };
+      lastHazards = hazards;
+    }
+    const planPts = currentPlanPoints();
+    const corridorPts =
+      corridorLatLon.length >= 4
+        ? Array.from({ length: corridorLatLon.length / 2 }, (_, i) => [
+            corridorLatLon[i * 2],
+            corridorLatLon[i * 2 + 1],
+          ])
+        : planPts.map((p) => [p.lat, p.lon]);
+    const reports = diagnosePoints({
+      points: planPts,
+      bbox: dem.bbox,
+      width: dem.width,
+      height: dem.height,
+      elevations: dem.elevations,
+      steep: hazards.steep,
+      steepModes: hazards.steepModes || steepModesFromForm(),
+      runoutClass: hazards.runoutActive || hazards.runoutClass,
+      runoutModes: hazards.runoutModes || opts.runout_modes,
+      corridorM: opts.corridor_m,
+      corridorLatLon: corridorPts,
+      slope: hazards.slope,
+    });
+    const diagnosis = formatDiagnosis(reports);
+    lastDiagnosis = diagnosis;
+    const blocked = !diagnosis.allClear;
+    updateDebugPanel(
+      {
+        at: new Date().toISOString(),
+        phase: 'diagnose',
+        label: 'Diagnose',
+        options: { ...collectSettingsFromDom(), ...opts },
+        grid: {
+          width: dem.width,
+          height: dem.height,
+          gs: dem.gs,
+          resolution: meta.resolution,
+          corridor_m: opts.corridor_m,
+          bbox: dem.bbox,
+          diagnose_cell_m: fine,
+          preferred_cell_m: preferred,
+        },
+        points: reports,
+        diagnosis,
+        error: blocked
+          ? {
+              kind: 'point_blocked',
+              title: 'Planning points are blocked',
+              summary: diagnosis.summary,
+              detail: diagnosis.summary,
+              fixes: [],
+            }
+          : null,
+        result: lastResult ? resultDebugSlice(lastResult) : null,
+        hint: corridorClosedHint(diagnosis, opts),
+      },
+      { open: true, isError: blocked },
+    );
+    if (blocked) {
+      drawErrorMap({
+        kind: 'point_blocked',
+        map: { corridor: true, endpoints: true, reference: true },
+        diagnosis,
+      });
+      setStatus(`Diagnose: ${diagnosis.summary}`, { error: true });
+    } else if (!quietOk) {
+      errorLayer.clearLayers();
+      const bumpNote = fitted.bumped
+        ? ` (checked on ${fine} m cells; preferred ${preferred} m was too fine for this span)`
+        : '';
+      setStatus(
+        `Diagnose: start/vias/end are free of Hard masks${bumpNote}. If Plan still fails, the corridor between them is closed — see Debug hint.`,
+      );
+    }
+  } catch (err) {
+    setStatus('Diagnose failed: ' + (err.message || err), { error: true });
+    const stubPts = currentPlanPoints().map((p, idx, arr) => {
+      const label =
+        idx === 0
+          ? 'Start'
+          : idx === arr.length - 1 && arr.length > 1
+            ? 'End'
+            : `Via ${idx}`;
+      return {
+        label,
+        lat: p.lat,
+        lon: p.lon,
+        ok: false,
+        issues: ['terrain not loaded — point not checked'],
+        index: idx,
+      };
+    });
+    updateDebugPanel(
+      {
+        at: new Date().toISOString(),
+        phase: 'diagnose',
+        options: { ...collectSettingsFromDom(), ...optionsFromForm() },
+        points: stubPts,
+        error: {
+          kind: 'terrain_fetch',
+          title: 'Diagnose failed',
+          summary: String(err.message || err),
+          detail: String(err.message || err),
+        },
+        hint: 'Shrink Cell size m / Corridor, or Diagnose will auto-coarsen next time. Then try again.',
+      },
+      { open: true, isError: true },
+    );
+  } finally {
+    debugDiagnoseBtn.disabled = false;
+  }
+}
+
+debugDiagnoseBtn.onclick = () => {
+  diagnoseCurrentPoints();
+};
+debugCopyBtn.onclick = async () => {
+  const text = buildDebugText(lastDebugCtx);
+  try {
+    await navigator.clipboard.writeText(text);
+    setStatus('Debug dump copied to clipboard.');
+  } catch {
+    window.prompt('Copy debug dump:', text);
+  }
+};
+
 shareBtn.onclick = async () => {
-  if (!lastResult) return;
+  // Map points, or GPX track ends when planning from an uploaded track.
+  const ptsForShare =
+    points.length >= 2
+      ? points
+      : recordedTrack?.length >= 2
+        ? [recordedTrack[0], recordedTrack.at(-1)]
+        : [];
+  if (ptsForShare.length < 2) return;
   try {
     shareBtn.disabled = true;
-    const chosen = routePayload(lastResult, selectedExportIndex) || routePayload(lastResult, 0);
-    if (!chosen?.path_latlon?.length) throw new Error('No route selected to share.');
-    const blob = buildShareBlob({
-      points,
-      settings: collectSettingsFromDom(),
-      pathLatLon: chosen.path_latlon,
-      elevationsM: chosen.elevations_m,
-      label: chosen.label || lastResult._shareLabel || routeLabel(selectedExportIndex),
-      smoothM: smoothToleranceM() || 8,
-    });
-    const { payload, warned, kept, raw } = await encodeSharePayload(blob);
+    const fail =
+      lastDebugCtx?.error &&
+      (lastDebugCtx.phase === 'error' || lastDebugCtx.phase === 'shared-setup')
+        ? {
+            ...lastDebugCtx.error,
+            label: lastDebugCtx.label,
+          }
+        : null;
+    let blob;
+    if (lastResult) {
+      const chosen =
+        routePayload(lastResult, selectedExportIndex) || routePayload(lastResult, 0);
+      if (!chosen?.path_latlon?.length) throw new Error('No route selected to share.');
+      blob = buildShareBlob({
+        points: ptsForShare,
+        settings: collectSettingsFromDom(),
+        pathLatLon: chosen.path_latlon,
+        elevationsM: chosen.elevations_m,
+        label: chosen.label || lastResult._shareLabel || routeLabel(selectedExportIndex),
+        smoothM: smoothToleranceM() || 8,
+        fail,
+      });
+    } else {
+      blob = buildShareBlob({
+        points: ptsForShare,
+        settings: collectSettingsFromDom(),
+        fail,
+      });
+    }
+    const { payload, warned, kept, raw, hasRoute } = await encodeSharePayload(blob);
     const url = buildShareUrl(payload);
     try {
       await navigator.clipboard.writeText(url);
     } catch {
       window.prompt('Copy this share link:', url);
     }
-    setStatus(
-      `Share link copied (${chosen.label || 'route'}; ${kept}/${raw} path pts` +
-        (warned ? '; path simplified further for URL size' : '') +
-        '). Recipient sees this line + your settings; they can Plan again to recompute.',
-    );
+    if (hasRoute) {
+      setStatus(
+        `Share link copied (route + settings; ${kept}/${raw} path pts` +
+          (warned ? '; path simplified further for URL size' : '') +
+          '). Recipient sees this line + your settings; they can Plan again to recompute.',
+      );
+    } else {
+      setStatus(
+        `Share link copied (setup only: ${blob.pts.length} waypoints + settings` +
+          (fail ? ' + last error note' : '') +
+          '). No route geometry — recipient can Plan to search.',
+      );
+    }
   } catch (err) {
     setStatus('Share failed: ' + (err.message || err), { error: true });
   } finally {
-    shareBtn.disabled = !lastResult;
+    updateShareEnabled();
   }
 };
 

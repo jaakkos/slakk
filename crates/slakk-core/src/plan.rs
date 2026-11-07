@@ -19,6 +19,13 @@ pub struct PlanOptions {
     pub max_terrain_deg: f64,
     #[serde(default = "default_steep_buffer")]
     pub steep_buffer_m: f64,
+    /// Per NVE steep band (classes 1..=5): "avoid" | "penalize" | "ignore".
+    /// Default all avoid (CLI / legacy). Web sends explicit modes (often all ignore).
+    #[serde(default = "default_steep_modes")]
+    pub steep_modes: Vec<String>,
+    /// Soft per-metre costs for steep bands 1..=5 when mode is penalize.
+    #[serde(default = "default_steep_costs")]
+    pub steep_costs: Vec<f64>,
     #[serde(default = "default_runout_buffer")]
     pub runout_buffer_m: f64,
     #[serde(default = "default_runout")]
@@ -81,8 +88,44 @@ fn default_max_terrain() -> f64 {
 fn default_steep_buffer() -> f64 {
     6.0
 }
+fn default_steep_modes() -> Vec<String> {
+    vec![
+        "avoid".into(),
+        "avoid".into(),
+        "avoid".into(),
+        "avoid".into(),
+        "avoid".into(),
+    ]
+}
+fn default_steep_costs() -> Vec<f64> {
+    vec![4.0, 8.0, 12.0, 16.0, 24.0]
+}
 fn default_runout_buffer() -> f64 {
     10.0
+}
+
+fn steep_mode_for(opts: &PlanOptions, class: u8) -> &str {
+    if class == 0 {
+        return "ignore";
+    }
+    if class >= crate::terrain::STEEP_CLASS_FORCE_HARD {
+        return "avoid";
+    }
+    let idx = (class - 1) as usize;
+    opts.steep_modes
+        .get(idx)
+        .map(|s| s.as_str())
+        .unwrap_or("avoid")
+}
+
+fn steep_cost_for(opts: &PlanOptions, class: u8) -> f64 {
+    if !(1..=5).contains(&class) {
+        return 0.0;
+    }
+    opts.steep_costs
+        .get((class - 1) as usize)
+        .copied()
+        .unwrap_or(0.0)
 }
 fn default_runout() -> String {
     "avoid".into()
@@ -147,6 +190,8 @@ impl Default for PlanOptions {
             max_downhill_deg: default_max_downhill(),
             max_terrain_deg: default_max_terrain(),
             steep_buffer_m: default_steep_buffer(),
+            steep_modes: default_steep_modes(),
+            steep_costs: default_steep_costs(),
             runout_buffer_m: default_runout_buffer(),
             runout: default_runout(),
             runout_cost_short: default_runout_short(),
@@ -413,7 +458,22 @@ pub fn plan_route(input: &PlanInput) -> Result<PlanResult, PlanError> {
     } else {
         (opts.steep_buffer_m / terrain.gs()).ceil() as usize
     };
-    add(&dilate(&terrain.steep, w, h, steep_radius));
+    let steep_class = if steep_radius > 0 {
+        dilate_max(&terrain.steep, w, h, steep_radius)
+    } else {
+        terrain.steep.clone()
+    };
+    let mut steep_hard = vec![false; n];
+    let mut steep_soft = false;
+    for i in 0..n {
+        let c = steep_class[i];
+        match steep_mode_for(opts, c) {
+            "avoid" => steep_hard[i] = true,
+            "penalize" => steep_soft = true,
+            _ => {}
+        }
+    }
+    add(&steep_hard);
     let mut outside = vec![false; n];
     for i in 0..n {
         if nearest[i] > opts.corridor_m {
@@ -479,7 +539,15 @@ pub fn plan_route(input: &PlanInput) -> Result<PlanResult, PlanError> {
             land[i] += rough[i];
         }
     }
-    let land = if opts.landforms != "off" || opts.roughness_cost > 0.0 {
+    if steep_soft {
+        for i in 0..n {
+            let c = steep_class[i];
+            if steep_mode_for(opts, c) == "penalize" {
+                land[i] += steep_cost_for(opts, c);
+            }
+        }
+    }
+    let land = if opts.landforms != "off" || opts.roughness_cost > 0.0 || steep_soft {
         Some(land)
     } else {
         None
@@ -755,44 +823,82 @@ fn check_in_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terrain::STEEP_CLASS_FORCE_HARD;
 
-    fn flat_input() -> PlanInput {
-        let w = 40usize;
-        let h = 40usize;
-        let n = w * h;
+    const W: usize = 40;
+    const H: usize = 40;
+
+    fn base_opts() -> PlanOptions {
+        PlanOptions {
+            corridor_m: 500.0,
+            steep_buffer_m: 0.0,
+            runout_buffer_m: 0.0,
+            pitch_deg: 0.0,
+            landforms: "off".into(),
+            roughness_cost: 0.0,
+            max_terrain_deg: 60.0,
+            max_uphill_deg: 25.0,
+            max_downhill_deg: 25.0,
+            steep_modes: vec!["ignore".into(); 5],
+            ..PlanOptions::default()
+        }
+    }
+
+    fn grid_input(elevations: Vec<f32>, steep: Vec<u8>, runout: Vec<u8>) -> PlanInput {
+        let n = W * H;
+        assert_eq!(elevations.len(), n);
+        assert_eq!(steep.len(), n);
+        assert_eq!(runout.len(), n);
         let t = TerrainGrid::from_arrays(
-            w,
-            h,
+            W,
+            H,
             10.0,
             10.0,
             [0.0, 0.0, 400.0, 400.0],
-            vec![100.0; n],
-            &vec![0; n],
-            vec![0; n],
+            elevations.clone(),
+            &steep,
+            runout.clone(),
         )
         .unwrap();
-        let (lon0, lat0) = t.lonlat(7.3, 20.1);
-        let (lon1, lat1) = t.lonlat(31.2, 20.4);
+        // North → south along mid-column (clear of EDGE_CELLS=3). lonlat(row, col).
+        let (lon0, lat0) = t.lonlat(6.0, 20.0);
+        let (lon1, lat1) = t.lonlat(33.0, 20.0);
         PlanInput {
-            width: w,
-            height: h,
+            width: W,
+            height: H,
             resolution: 10.0,
             ground_resolution: 10.0,
             bbox: [0.0, 0.0, 400.0, 400.0],
-            elevations: vec![100.0f32; n],
-            steep: vec![0u8; n],
-            runout_class: vec![0u8; n],
+            elevations,
+            steep,
+            runout_class: runout,
             slope: vec![],
             points: vec![(lat0, lon0), (lat1, lon1)],
             corridor: vec![],
-            options: PlanOptions {
-                corridor_m: 500.0,
-                steep_buffer_m: 0.0,
-                runout_buffer_m: 0.0,
-                pitch_deg: 0.0,
-                landforms: "off".into(),
-                ..PlanOptions::default()
-            },
+            options: base_opts(),
+        }
+    }
+
+    fn flat_input() -> PlanInput {
+        let n = W * H;
+        grid_input(vec![100.0f32; n], vec![0u8; n], vec![0u8; n])
+    }
+
+    /// Horizontal band sealing the N→S corridor (constant rows, all columns).
+    fn paint_horizontal_band(buf: &mut [u8], row0: usize, row1: usize, value: u8) {
+        for r in row0..row1.min(H) {
+            for c in 0..W {
+                buf[r * W + c] = value;
+            }
+        }
+    }
+
+    /// Opening in a horizontal band (overwrite a column range).
+    fn paint_gate(buf: &mut [u8], row0: usize, row1: usize, col0: usize, col1: usize, value: u8) {
+        for r in row0..row1.min(H) {
+            for c in col0..col1.min(W) {
+                buf[r * W + c] = value;
+            }
         }
     }
 
@@ -805,13 +911,152 @@ mod tests {
     }
 
     #[test]
-    fn steep_wall_blocks() {
+    fn steep_wall_blocks_when_avoid() {
         let mut input = flat_input();
-        for c in 0..40 {
-            input.steep[20 * 40 + c] = 1;
-        }
+        paint_horizontal_band(&mut input.steep, 20, 21, 1);
+        input.options.steep_modes = vec!["avoid".into(); 5];
         let err = plan_route(&input).unwrap_err();
-        assert!(err.to_string().contains("No feasible") || err.to_string().contains("masked"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("No feasible") || msg.contains("masked"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn steep_wall_ignored_when_modes_off() {
+        let mut input = flat_input();
+        paint_horizontal_band(&mut input.steep, 20, 21, 1);
+        input.options.steep_modes = vec!["ignore".into(); 5];
+        plan_route(&input).expect("ignore should not Hard-block NVE steep");
+    }
+
+    #[test]
+    fn steep_penalize_finds_route_costlier_than_clear() {
+        let clear = plan_route(&flat_input()).expect("clear");
+        let mut soft = flat_input();
+        paint_horizontal_band(&mut soft.steep, 18, 22, 1);
+        soft.options.steep_modes = vec!["penalize".into(); 5];
+        soft.options.steep_costs = vec![50.0, 50.0, 50.0, 50.0, 50.0];
+        let soft_res = plan_route(&soft).expect("penalize still finds a path");
+        assert!(
+            soft_res.cost > clear.cost + 10.0,
+            "soft cost {} should exceed clear {}",
+            soft_res.cost,
+            clear.cost
+        );
+    }
+
+    #[test]
+    fn steep_only_dark_band_blocks_when_others_off() {
+        let mut input = flat_input();
+        paint_horizontal_band(&mut input.steep, 20, 21, 1);
+        input.options.steep_modes = vec![
+            "ignore".into(),
+            "ignore".into(),
+            "ignore".into(),
+            "ignore".into(),
+            "avoid".into(),
+        ];
+        plan_route(&input).expect("class-1 ignored while only class-5 is Block");
+
+        let mut dark = flat_input();
+        paint_horizontal_band(&mut dark.steep, 20, 21, 5);
+        dark.options.steep_modes = input.options.steep_modes.clone();
+        let err = plan_route(&dark).unwrap_err();
+        assert!(
+            err.to_string().contains("No feasible") || err.to_string().contains("masked"),
+            "class-5 Block should seal: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn steep_force_hard_blocks_even_when_modes_ignore() {
+        let mut input = flat_input();
+        paint_horizontal_band(&mut input.steep, 20, 21, STEEP_CLASS_FORCE_HARD);
+        input.options.steep_modes = vec!["ignore".into(); 5];
+        let err = plan_route(&input).unwrap_err();
+        assert!(
+            err.to_string().contains("No feasible") || err.to_string().contains("masked"),
+            "force-hard sentinel must block: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn runout_penalize_prefers_short_gate_over_long_wall() {
+        let mut input = flat_input();
+        // Long-runout wall across the N→S corridor; western gate is short runout.
+        paint_horizontal_band(&mut input.runout_class, 18, 22, 3);
+        paint_gate(&mut input.runout_class, 18, 22, 4, 12, 1);
+        input.options.runout = "penalize".into();
+        input.options.runout_cost_short = 1.0;
+        input.options.runout_cost = 12.0;
+        input.options.runout_cost_long = 200.0;
+        input.options.corridor_m = 500.0;
+        let with_gate = plan_route(&input).expect("route through short gate");
+
+        let mut no_gate = flat_input();
+        paint_horizontal_band(&mut no_gate.runout_class, 18, 22, 3);
+        no_gate.options = input.options.clone();
+        let through_long = plan_route(&no_gate).expect("Soft long still traversable");
+        assert!(
+            with_gate.cost + 50.0 < through_long.cost,
+            "short gate should beat crossing long wall (gate={} long={})",
+            with_gate.cost,
+            through_long.cost
+        );
+    }
+
+    #[test]
+    fn ground_slope_hard_blocks_then_raising_limit_opens() {
+        let n = W * H;
+        let mut slope = vec![10.0f32; n];
+        // Horizontal band of extreme DEM slope across the N→S route.
+        for c in 0..W {
+            slope[20 * W + c] = 50.0;
+        }
+        let mut input = flat_input();
+        input.slope = slope;
+        input.options.max_terrain_deg = 35.0;
+        let err = plan_route(&input).unwrap_err();
+        assert!(
+            err.to_string().contains("No feasible") || err.to_string().contains("masked"),
+            "50° band vs 35° limit should fail: {}",
+            err
+        );
+
+        input.options.max_terrain_deg = 55.0;
+        plan_route(&input).expect("raising Ground slope max should open the band");
+    }
+
+    #[test]
+    fn skin_track_blocks_steep_climb_unless_kick_turn_allows() {
+        // N→S climb: elevation rises sharply across one row so along-track grade
+        // exceeds Skin track max without Kick-turn allowance.
+        let n = W * H;
+        let mut elev = vec![100.0f32; n];
+        for r in 0..H {
+            for c in 0..W {
+                // ~45° step across one 10 m cell around row 20.
+                elev[r * W + c] = if r >= 20 { 110.0 } else { 100.0 };
+            }
+        }
+        let mut input = grid_input(elev, vec![0u8; n], vec![0u8; n]);
+        input.options.max_uphill_deg = 12.0;
+        input.options.pitch_deg = 0.0;
+        input.options.max_terrain_deg = 60.0;
+        let err = plan_route(&input).unwrap_err();
+        assert!(
+            err.to_string().contains("No feasible") || err.to_string().contains("masked"),
+            "steep climb should fail without kick-turn: {}",
+            err
+        );
+
+        input.options.pitch_deg = 40.0;
+        input.options.pitch_terrain_deg = 60.0;
+        plan_route(&input).expect("Kick-turn max should allow the short rise");
     }
 
     #[test]
@@ -819,7 +1064,6 @@ mod tests {
         let mut input = flat_input();
         input.options.alternatives = 2;
         let result = plan_route(&input).expect("route");
-        // flat grid may share paths; at least primary exists
         assert!(!result.path_latlon.is_empty());
     }
 }

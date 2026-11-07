@@ -12,6 +12,7 @@ pub use search::DIRECTIONS;
 pub use terrain::{
     decode_hazards_rgba, dilate, dilate_max, slope_degrees, TerrainGrid, EDGE_CELLS, MAX_CELLS,
     MAX_SIDE, MAX_SPAN_M, RUNOUT_CLASS_LONG, RUNOUT_CLASS_MEDIUM, RUNOUT_CLASS_SHORT,
+    STEEP_CLASS_COUNT, STEEP_CLASS_FORCE_HARD,
 };
 
 use wasm_bindgen::prelude::*;
