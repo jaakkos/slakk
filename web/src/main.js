@@ -63,6 +63,15 @@ import {
   stripShareHash,
   sharedResultFromBlob,
 } from './share.js';
+import {
+  buildSavedEntry,
+  defaultSavedName,
+  deleteSavedRoute,
+  getSavedRoute,
+  listSavedRoutes,
+  savedEntryAsShareBlob,
+  upsertSavedRoute,
+} from './savedRoutes.js';
 
 const DISCLAIMER =
   'UNVERIFIED WINTER PLANNING DRAFT. Bare-ground model only; no snow or forecast assessment.';
@@ -74,6 +83,10 @@ const metricsEl = document.getElementById('metrics');
 const planBtn = document.getElementById('plan');
 const gpxBtn = document.getElementById('downloadGpx');
 const shareBtn = document.getElementById('shareLink');
+const saveRouteBtn = document.getElementById('saveRoute');
+const savedRoutesPanelEl = document.getElementById('savedRoutesPanel');
+const savedRoutesCountEl = document.getElementById('savedRoutesCount');
+const savedRoutesListEl = document.getElementById('savedRoutesList');
 const exportRouteEl = document.getElementById('exportRoute');
 const exportRouteFieldEl = document.getElementById('exportRouteField');
 const debugPanelEl = document.getElementById('debugPanel');
@@ -85,11 +98,17 @@ const debugCopyBtn = document.getElementById('debugCopy');
 function setResultActionsEnabled(on) {
   gpxBtn.disabled = !on;
   updateShareEnabled();
+  updateSaveEnabled();
 }
 
 /** Share works with a candidate or with setup-only (settings + ≥2 waypoints). */
 function updateShareEnabled() {
   shareBtn.disabled = !(lastResult || canPlan());
+}
+
+/** Save needs at least two waypoints (route geometry optional). */
+function updateSaveEnabled() {
+  saveRouteBtn.disabled = !(lastResult || canPlan());
 }
 const planHintEl = document.getElementById('planHint');
 const staleBannerEl = document.getElementById('staleBanner');
@@ -896,6 +915,7 @@ function routePayload(result, index) {
     return {
       path_latlon: result.path_latlon,
       elevations_m: result.elevations_m,
+      aspects_deg: result.aspects_deg,
       distance_m: result.distance_m,
       cost: result.cost,
       label: result._shareLabel || routeLabel(0),
@@ -906,6 +926,7 @@ function routePayload(result, index) {
   return {
     path_latlon: alt.path_latlon,
     elevations_m: alt.elevations_m,
+    aspects_deg: alt.aspects_deg,
     distance_m: alt.distance_m,
     cost: alt.cost,
     label: routeLabel(index),
@@ -956,8 +977,15 @@ function markProfileSelection() {
   });
 }
 
-function pathWithAspect(pathLatLon, elevationsM) {
-  const aspectsRaw = lastDem ? aspectsAlongPath(pathLatLon, lastDem) : null;
+/** Terrain aspect along a path: prefer cached samples, else sample lastDem. */
+function aspectsForPath(pathLatLon, cached = null) {
+  if (cached?.length === pathLatLon?.length) return cached;
+  if (!lastDem || !pathLatLon?.length) return cached || null;
+  return aspectsAlongPath(pathLatLon, lastDem);
+}
+
+function pathWithAspect(pathLatLon, elevationsM, cachedAspects = null) {
+  const aspectsRaw = aspectsForPath(pathLatLon, cachedAspects);
   const sm = smoothPath(pathLatLon, elevationsM, smoothToleranceM(), {
     aspects_deg: aspectsRaw || undefined,
   });
@@ -968,7 +996,21 @@ function showProfile(result) {
   clearProfile();
   if (!result?.path_latlon?.length || !result?.elevations_m?.length) return;
 
-  const primary = pathWithAspect(result.path_latlon, result.elevations_m);
+  // Cache DEM samples on the result so share / resize / smooth keep aspect without re-fetch.
+  if (!result.aspects_deg && lastDem) {
+    result.aspects_deg = aspectsAlongPath(result.path_latlon, lastDem);
+  }
+  (result.alternatives || []).forEach((a) => {
+    if (a && !a.aspects_deg && lastDem && a.path_latlon?.length) {
+      a.aspects_deg = aspectsAlongPath(a.path_latlon, lastDem);
+    }
+  });
+
+  const primary = pathWithAspect(
+    result.path_latlon,
+    result.elevations_m,
+    result.aspects_deg,
+  );
   const tracks = [
     {
       series: buildProfileSeries(
@@ -983,7 +1025,7 @@ function showProfile(result) {
   ];
   (result.alternatives || []).forEach((a, i) => {
     if (!a?.path_latlon?.length || !a?.elevations_m?.length) return;
-    const sm = pathWithAspect(a.path_latlon, a.elevations_m);
+    const sm = pathWithAspect(a.path_latlon, a.elevations_m, a.aspects_deg);
     tracks.push({
       series: buildProfileSeries(sm.path_latlon, sm.elevations_m, sm.aspects_deg),
       label: routeLabel(i + 1),
@@ -1173,6 +1215,7 @@ function updatePlanEnabled() {
       'Ready. Plan uses Hard limits to block cells and Soft costs to pick among legal lines.';
   }
   updateShareEnabled();
+  updateSaveEnabled();
   updateChecklist();
 }
 
@@ -1185,7 +1228,7 @@ function pointLabel(i) {
 function removePoint(index) {
   if (index < 0 || index >= points.length) return;
   if (recordedTrack) {
-    setStatus('Clear the uploaded GPX (Clear) before editing map points.');
+    setStatus('Clear the uploaded GPX (New draft) before editing map points.');
     return;
   }
   points.splice(index, 1);
@@ -1273,7 +1316,7 @@ map.on('contextmenu', (e) => {
   redrawPoints();
 });
 
-document.getElementById('clearPts').onclick = () => {
+function clearCurrentDraft({ statusMessage = 'New draft — map start → end when ready. Saved routes kept.' } = {}) {
   points.length = 0;
   recordedTrack = null;
   lastResult = null;
@@ -1295,9 +1338,208 @@ document.getElementById('clearPts').onclick = () => {
   setResultActionsEnabled(false);
   metricsEl.hidden = true;
   redrawPoints();
-  setStatus('Cleared.');
+  setStatus(statusMessage);
   updatePlanEnabled();
+}
+
+document.getElementById('clearPts').onclick = () => {
+  clearCurrentDraft();
 };
+
+function formatSavedWhen(iso) {
+  try {
+    const d = new Date(iso);
+    if (!Number.isFinite(d.getTime())) return '';
+    return d.toLocaleString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  } catch {
+    return '';
+  }
+}
+
+function formatSavedSummary(entry) {
+  const bits = [];
+  if (entry.summary?.distance_m != null) {
+    bits.push(`${(entry.summary.distance_m / 1000).toFixed(2)} km`);
+  }
+  if (entry.summary?.ascent_m != null) bits.push(`${entry.summary.ascent_m} m↑`);
+  if (!bits.length) bits.push(`${entry.pts.length} pts`);
+  if (entry.route) bits.push('path');
+  const when = formatSavedWhen(entry.savedAt);
+  if (when) bits.push(when);
+  return bits.join(' · ');
+}
+
+function refreshSavedRoutesList() {
+  const items = listSavedRoutes();
+  savedRoutesCountEl.textContent = String(items.length);
+  savedRoutesListEl.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement('p');
+    empty.className = 'saved-routes-empty';
+    empty.textContent = 'No saved drafts yet. Plan or place waypoints, then Save.';
+    savedRoutesListEl.appendChild(empty);
+    return;
+  }
+  for (const entry of items) {
+    const li = document.createElement('li');
+    const meta = document.createElement('div');
+    meta.className = 'saved-routes-meta';
+    const title = document.createElement('strong');
+    title.textContent = entry.name;
+    title.title = entry.name;
+    const sub = document.createElement('span');
+    sub.textContent = formatSavedSummary(entry);
+    meta.append(title, sub);
+    const actions = document.createElement('div');
+    actions.className = 'saved-routes-actions';
+    const loadBtn = document.createElement('button');
+    loadBtn.type = 'button';
+    loadBtn.textContent = 'Load';
+    loadBtn.title = 'Replace the current draft with this saved one';
+    loadBtn.onclick = () => loadSavedRoute(entry.id);
+    const delBtn = document.createElement('button');
+    delBtn.type = 'button';
+    delBtn.textContent = 'Delete';
+    delBtn.title = 'Remove from this browser';
+    delBtn.onclick = () => {
+      if (!window.confirm(`Delete saved “${entry.name}”?`)) return;
+      deleteSavedRoute(entry.id);
+      refreshSavedRoutesList();
+      setStatus(`Deleted saved “${entry.name}”.`);
+    };
+    actions.append(loadBtn, delBtn);
+    li.append(meta, actions);
+    savedRoutesListEl.appendChild(li);
+  }
+}
+
+function saveCurrentDraft() {
+  if (!(lastResult || canPlan())) {
+    setStatus('Need at least two waypoints to save.', { error: true });
+    return;
+  }
+  const place = document.getElementById('place')?.value || '';
+  const suggested = defaultSavedName(points, place);
+  const name = window.prompt('Name for this saved draft:', suggested);
+  if (name == null) return;
+  try {
+    const settings = collectSettingsFromDom();
+    let pathLatLon = null;
+    let elevationsM = null;
+    let aspectsDeg = null;
+    let label = 'Route 1';
+    let summary = null;
+    if (lastResult) {
+      const chosen =
+        routePayload(lastResult, selectedExportIndex) || routePayload(lastResult, 0);
+      if (chosen?.path_latlon?.length) {
+        if (!chosen.aspects_deg && lastDem) {
+          chosen.aspects_deg = aspectsAlongPath(chosen.path_latlon, lastDem);
+        }
+        pathLatLon = chosen.path_latlon;
+        elevationsM = chosen.elevations_m;
+        aspectsDeg = chosen.aspects_deg;
+        label = chosen.label || routeLabel(selectedExportIndex);
+        const series = buildProfileSeries(pathLatLon, elevationsM);
+        summary = {
+          distance_m: series.total_m,
+          ascent_m: series.ascent_m,
+          descent_m: series.descent_m,
+        };
+      }
+    }
+    const entry = buildSavedEntry({
+      name: name.trim() || suggested,
+      points,
+      settings,
+      pathLatLon,
+      elevationsM,
+      aspectsDeg,
+      label,
+      smoothM: smoothToleranceM() || 8,
+      summary,
+    });
+    upsertSavedRoute(entry);
+    refreshSavedRoutesList();
+    savedRoutesPanelEl.open = true;
+    setStatus(
+      `Saved “${entry.name}” locally${entry.route ? ' (with path)' : ' (waypoints only)'}. ` +
+        `Click New draft to map another, or keep editing.`,
+    );
+  } catch (err) {
+    setStatus(`Save failed: ${err.message || err}`, { error: true });
+  }
+}
+
+function loadSavedRoute(id) {
+  const entry = getSavedRoute(id);
+  if (!entry) {
+    setStatus('Saved draft not found.', { error: true });
+    refreshSavedRoutesList();
+    return;
+  }
+  try {
+    const blob = savedEntryAsShareBlob(entry);
+    applySettingsToDom(blob.set);
+    refreshNve();
+    updateHazardLegend();
+    saveSettings();
+    recordedTrack = null;
+    document.getElementById('gpxFile').value = '';
+    points.length = 0;
+    for (const [lat, lon] of blob.pts) points.push({ lat, lon });
+    redrawPoints();
+    redrawTrack();
+    if (points.length) {
+      const ll = points.map((p) => [p.lat, p.lon]);
+      map.fitBounds(L.latLngBounds(ll).pad(0.2));
+    }
+    selectedExportIndex = 0;
+    clearPlanError();
+    placedArea = true;
+    lastDem = null;
+    lastHazards = null;
+
+    if (blob.route) {
+      lastResult = sharedResultFromBlob(blob, DISCLAIMER);
+      lastResult._shareLabel = blob.route.label || entry.name;
+      markResultFresh();
+      syncExportRouteSelect(lastResult);
+      drawRoute(lastResult);
+      showProfile(lastResult);
+      showMetrics(lastResult);
+      setResultActionsEnabled(true);
+      const { up, down } = elevGainLoss(lastResult.elevations_m);
+      setStatus(
+        `Loaded “${entry.name}”: ${lastResult.distance_m.toFixed(0)} m · ascent ${up.toFixed(0)} m · descent ${down.toFixed(0)} m. ` +
+          `Plan again to recompute on current DEM.`,
+      );
+    } else {
+      lastResult = null;
+      syncExportRouteSelect(null);
+      routeLayer.clearLayers();
+      clearProfile();
+      metricsEl.hidden = true;
+      setResultActionsEnabled(false);
+      lastPlanFingerprint = null;
+      resultStale = false;
+      staleBannerEl.hidden = true;
+      setStatus(
+        `Loaded “${entry.name}” (${blob.pts.length} waypoints, no path). Click Plan to search.`,
+      );
+    }
+    updatePlanEnabled();
+  } catch (err) {
+    setStatus(`Load failed: ${err.message || err}`, { error: true });
+  }
+}
+
+saveRouteBtn.onclick = () => saveCurrentDraft();
 
 document.getElementById('goPlace').onclick = async () => {
   const name = document.getElementById('place').value.trim();
@@ -1490,11 +1732,14 @@ async function boot() {
     gpuLabel = gpu ? 'webgpu' : 'cpu';
     const ver = await pool.init();
     wasmReady = true;
+    refreshSavedRoutesList();
     const shared = await applyIncomingShare();
     if (!shared) {
+      const nSaved = listSavedRoutes().length;
       setStatus(
         `Wasm ${ver || wasmVersion()} + ${pool.size} workers; raster prep=${gpuLabel}` +
           (settingsRestore.restored ? `; restored ${settingsRestore.applied} saved setting(s)` : '') +
+          (nSaved ? `; ${nSaved} saved draft(s)` : '') +
           `. ${DISCLAIMER}`,
       );
     }
@@ -2338,11 +2583,15 @@ shareBtn.onclick = async () => {
       const chosen =
         routePayload(lastResult, selectedExportIndex) || routePayload(lastResult, 0);
       if (!chosen?.path_latlon?.length) throw new Error('No route selected to share.');
+      if (!chosen.aspects_deg && lastDem) {
+        chosen.aspects_deg = aspectsAlongPath(chosen.path_latlon, lastDem);
+      }
       blob = buildShareBlob({
         points: ptsForShare,
         settings: collectSettingsFromDom(),
         pathLatLon: chosen.path_latlon,
         elevationsM: chosen.elevations_m,
+        aspectsDeg: chosen.aspects_deg,
         label: chosen.label || lastResult._shareLabel || routeLabel(selectedExportIndex),
         smoothM: smoothToleranceM() || 8,
         fail,

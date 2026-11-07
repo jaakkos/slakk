@@ -131,12 +131,15 @@ export function renderProfile(host, tracks, {
 
   const showAspect = list.some((t) => t.series.hasAspect);
   const W = Math.max(320, host.clientWidth || 480);
-  const ASPECT_H = showAspect ? 12 : 0;
-  const H = (multi ? 180 : 160) + ASPECT_H;
+  // Aspect strip needs its own band — previously ~10px in the axis margin and easy to miss.
+  const ASPECT_H = showAspect ? 18 : 0;
+  const AXIS_H = 14;
+  const ASPECT_GAP = showAspect ? 4 : 0;
+  const H = (multi ? 180 : 160) + ASPECT_H + ASPECT_GAP;
   const L = 44;
   const R = 12;
   const T = 10;
-  const B = 24 + ASPECT_H;
+  const B = AXIS_H + ASPECT_GAP + ASPECT_H + 2;
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
   svg.setAttribute('preserveAspectRatio', 'none');
 
@@ -151,7 +154,9 @@ export function renderProfile(host, tracks, {
   zMin -= pad;
   zMax += pad;
 
-  const plotBottom = H - B + ASPECT_H;
+  const plotBottom = H - B;
+  const axisY = plotBottom + AXIS_H - 2;
+  const stripY = showAspect ? H - ASPECT_H - 1 : plotBottom;
   const X = (d) => L + ((W - L - R) * d) / dMax;
   const Y = (z) => T + ((plotBottom - T) * (1 - (z - zMin) / (zMax - zMin)));
 
@@ -181,25 +186,32 @@ export function renderProfile(host, tracks, {
     el('line', { x1: x, x2: x, y1: T, y2: plotBottom, stroke: 'currentColor', opacity: '0.08' }, svg);
     el('text', {
       x,
-      y: H - 4,
+      y: axisY,
       'text-anchor': 'middle',
       'font-size': '10',
       fill: 'currentColor',
     }, svg).textContent = t === 4 ? `${(d / 1000).toFixed(2)} km` : `${(d / 1000).toFixed(1)}`;
   }
 
-  // Aspect strip under the selected / primary track (terrain faces downhill).
+  // Aspect strip: own row under the distance labels (terrain faces downhill).
   if (showAspect) {
-    const stripY = plotBottom + 2;
     const primary = list[0].series;
+    el('rect', {
+      x: L,
+      y: stripY,
+      width: W - L - R,
+      height: ASPECT_H - 2,
+      fill: '#d5dde2',
+      opacity: '0.9',
+    }, svg);
     el('text', {
       x: L - 4,
-      y: stripY + ASPECT_H - 2,
+      y: stripY + ASPECT_H - 5,
       'text-anchor': 'end',
       'font-size': '9',
       fill: 'currentColor',
-      opacity: '0.7',
-    }, svg).textContent = 'asp';
+      opacity: '0.75',
+    }, svg).textContent = 'aspect';
     for (let i = 1; i < primary.dist.length; i++) {
       const a0 = primary.aspect[i - 1];
       const a1 = primary.aspect[i];
@@ -293,7 +305,7 @@ export function renderProfile(host, tracks, {
     x: L,
     y: T,
     width: W - L - R,
-    height: plotBottom - T + ASPECT_H,
+    height: Math.max(plotBottom - T, H - T - 2),
     fill: 'transparent',
   }, svg);
 

@@ -271,7 +271,7 @@ body.is-resizing-panel #map {
 .profile-svg {
   width: 100%;
   height: auto;
-  min-height: 160px;
+  min-height: 180px;
   display: block;
   color: var(--ink);
   background: #eef3f6;
@@ -593,6 +593,95 @@ fieldset.runout-zones {
 .actions { display: flex; flex-wrap: wrap; gap: 0.4rem; }
 .export-route-field { margin-bottom: 0.35rem; }
 .export-route-field[hidden] { display: none !important; }
+.saved-routes {
+  margin: 0.35rem 0 0;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #eef3f6;
+  font-size: 0.8rem;
+}
+.saved-routes > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.35rem 0.5rem;
+  cursor: pointer;
+  list-style: none;
+  font-weight: 600;
+  color: var(--ink);
+}
+.saved-routes > summary::-webkit-details-marker { display: none; }
+.saved-routes-count {
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: #5a6f78;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.05rem 0.45rem;
+  font-size: 0.72rem;
+}
+.saved-routes[open] > summary {
+  border-bottom: 1px solid var(--line);
+}
+.saved-routes-hint {
+  margin: 0.4rem 0.5rem 0.25rem;
+  font-size: 0.72rem;
+  color: #5a6f78;
+  line-height: 1.35;
+}
+.saved-routes-list {
+  list-style: none;
+  margin: 0;
+  padding: 0.25rem 0.35rem 0.4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  max-height: 11rem;
+  overflow: auto;
+}
+.saved-routes-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.35rem;
+  align-items: center;
+  padding: 0.35rem 0.4rem;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+}
+.saved-routes-meta {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+.saved-routes-meta strong {
+  font-size: 0.78rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.saved-routes-meta span {
+  font-size: 0.68rem;
+  color: #5a6f78;
+  font-variant-numeric: tabular-nums;
+}
+.saved-routes-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+.saved-routes-actions button {
+  padding: 0.15rem 0.4rem;
+  font-size: 0.72rem;
+}
+.saved-routes-empty {
+  margin: 0.35rem 0.5rem 0.5rem;
+  font-size: 0.72rem;
+  color: #5a6f78;
+}
 button.primary {
   background: var(--accent);
   color: #fff;
@@ -932,7 +1021,7 @@ body.doc-page { min-height: 100%; }
   .profile-panel {
     max-height: 38%;
   }
-  .profile-svg { height: 130px; }
+  .profile-svg { min-height: 160px; }
   .checklist {
     grid-template-columns: 1fr;
   }

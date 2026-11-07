@@ -284,11 +284,20 @@
             <select id="exportRoute" title="Which candidate to download as GPX"></select>
           </label>
           <div class="actions">
-            <button type="button" id="clearPts" title="Remove all points, GPX, and the drawn route">Clear</button>
+            <button type="button" id="saveRoute" disabled title="Stash this draft (waypoints + candidate if planned) in this browser">Save</button>
+            <button type="button" id="clearPts" title="Start a new draft: clear points, GPX, and the drawn route. Saved routes stay.">New draft</button>
             <button type="button" id="plan" class="primary" disabled title="Run A* with the settings above">Plan route</button>
             <button type="button" id="downloadGpx" disabled title="Download the selected candidate as GPX">Download GPX</button>
             <button type="button" id="shareLink" disabled title="Copy a link with settings and waypoints (and the selected route when one exists)">Copy share link</button>
           </div>
+          <details id="savedRoutesPanel" class="saved-routes">
+            <summary>
+              <span>Saved locally</span>
+              <span id="savedRoutesCount" class="saved-routes-count">0</span>
+            </summary>
+            <p class="saved-routes-hint">Save a draft, then New draft to map another. Load brings waypoints (and the candidate path) back.</p>
+            <ul id="savedRoutesList" class="saved-routes-list"></ul>
+          </details>
           <p class="hint">Full model: <a href="how-it-works.html">How the route is chosen</a></p>
         </div>
         <div class="panel-footer-results">

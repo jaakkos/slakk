@@ -45,16 +45,28 @@ function sanitizePoints(pts) {
   return out;
 }
 
+function roundAspect(n) {
+  if (n == null || n === '') return null;
+  const v = Number(n);
+  if (!Number.isFinite(v)) return null;
+  const a = ((v % 360) + 360) % 360;
+  return Math.round(a);
+}
+
 function sanitizeRoute(route) {
   if (!route || typeof route !== 'object') return null;
   const path = sanitizePoints(route.path || route.path_latlon);
   if (path.length < 2) return null;
   const elevRaw = route.elev || route.elevations_m || [];
   const elev = path.map((_, i) => roundElev(Number(elevRaw[i])));
+  const aspRaw = route.asp || route.aspects_deg || [];
+  const asp = path.map((_, i) => roundAspect(aspRaw[i]));
   const label = typeof route.label === 'string' && route.label.trim()
     ? route.label.trim().slice(0, 40)
     : 'Route 1';
-  return { label, path, elev };
+  const out = { label, path, elev };
+  if (asp.some((a) => a != null)) out.asp = asp;
+  return out;
 }
 
 /** Compact failure snapshot for setup-only share links (optional). */
@@ -83,6 +95,7 @@ export function buildShareBlob({
   settings = collectSettingsFromDom(),
   pathLatLon,
   elevationsM,
+  aspectsDeg = null,
   label = 'Route 1',
   smoothM = 8,
   fail = null,
@@ -97,11 +110,14 @@ export function buildShareBlob({
   let route = null;
   let meta = { smooth_m: 0, kept: 0, raw: 0 };
   if (hasPath) {
-    const sm = smoothPath(pathLatLon, elevationsM || [], Number(smoothM) || 0);
+    const sm = smoothPath(pathLatLon, elevationsM || [], Number(smoothM) || 0, {
+      aspects_deg: aspectsDeg || undefined,
+    });
     route = sanitizeRoute({
       label,
       path: sm.path_latlon,
       elev: sm.elevations_m,
+      asp: sm.aspects_deg,
     });
     if (!route) {
       throw new Error('Shared route needs a path with at least two points.');
@@ -183,7 +199,9 @@ export async function encodeSharePayload(blob) {
   let raw = blob._meta?.raw ?? (blob.route?.path?.length || 0);
 
   if (blob.route && payload.length > SHARE_SOFT_MAX_CHARS) {
-    const harder = smoothPath(blob.route.path, blob.route.elev, 25);
+    const harder = smoothPath(blob.route.path, blob.route.elev, 25, {
+      aspects_deg: blob.route.asp || undefined,
+    });
     const slim = {
       v: blob.v,
       pts: blob.pts,
@@ -192,6 +210,7 @@ export async function encodeSharePayload(blob) {
         label: blob.route.label,
         path: harder.path_latlon,
         elev: harder.elevations_m,
+        asp: harder.aspects_deg,
       }),
       fail: blob.fail || null,
     };
@@ -287,9 +306,15 @@ export function sharedResultFromBlob(blob, disclaimer) {
     const mx = 111320 * Math.cos(lat0);
     distance_m += Math.hypot((b[0] - a[0]) * 111320, (b[1] - a[1]) * mx);
   }
+  const aspRaw = blob.route.asp || [];
+  const aspects_deg = path.map((_, i) => {
+    const a = Number(aspRaw[i]);
+    return Number.isFinite(a) ? a : NaN;
+  });
   return {
     path_latlon: path,
     elevations_m: elev,
+    aspects_deg: aspects_deg.some((a) => Number.isFinite(a)) ? aspects_deg : undefined,
     distance_m,
     cost: 0,
     max_sampled_uphill_deg: 0,
