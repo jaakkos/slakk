@@ -1,51 +1,80 @@
 # slakk
 
 [![CI](https://github.com/jaakkos/slakk/actions/workflows/ci.yml/badge.svg)](https://github.com/jaakkos/slakk/actions/workflows/ci.yml)
+[![Pages](https://img.shields.io/badge/GitHub%20Pages-live-2e7d32)](https://jaakkos.github.io/slakk/)
 
 *Slak* is Norwegian for gentle, as in a gentle slope. slakk was called
 `route-cli` before 0.5.0.
 
-A small Python CLI for **unverified winter-ascent route planning in Norway**.
-It can import a Strava activity, read a local GPX, download terrain/map layers,
-search for a gentler ascent, and export a candidate GPX plus a comparison map
-and machine-readable report. No browser automation or LLM is required.
+**Unverified winter-ascent planning aid for Norway** — click start → vias → end
+on a map (or upload a GPX), download Kartverket elevations and NVE steep/runout
+layers in the browser, and search for a gentler climb with **Rust A\* compiled
+to WebAssembly**. No server. Settings persist locally; you can compare
+alternatives, inspect the elevation profile (grade + aspect), and share a link
+or export GPX.
+
+**Use it here:** https://jaakkos.github.io/slakk/
 
 > **Outputs are unverified planning candidates, not safe routes.** A candidate
-> is the best-cost path in a simplified terrain model. It does not assess
+> is the best-cost path in a simplified bare-ground model. It does not assess
 > avalanche conditions, weather, snow, ice, cornices, vegetation, water,
 > access or whether you will need to bootpack. A gentle line can still cross
 > avalanche terrain. Check every candidate against the current
 > [Varsom](https://www.varsom.no/) forecast, maps and the terrain itself, and
 > make your own decisions. See [Disclaimer](#disclaimer).
 
-## Data sources and libraries
+Desktop Chrome or Edge recommended (Firefox usually works). Phone is unsupported.
 
-| Task | Source or library |
+## Web app
+
+Source: [`web/`](web/) · planner core: [`crates/slakk-core/`](crates/slakk-core/)
+(Wasm). Deployed from [`main`](.github/workflows/pages.yml) to GitHub Pages.
+
+| | |
 |---|---|
-| Terrain elevations | Kartverket [DTM ImageServer](https://hoydedata.no/arcgis/rest/services/DTM/ImageServer), `exportImage`, float32 GeoTIFF |
-| Slope/runout shading | NVE [Bratthet_med_utlop_2024](https://gis3.nve.no/arcgis/rest/services/wmts/Bratthet_med_utlop_2024/MapServer), `export`, PNG |
-| Topographic background | Kartverket [Topografisk Norgeskart WMS](https://wms.geonorge.no/skwms1/wms.topo?service=WMS&request=GetCapabilities), `GetMap` |
-| Optional track import | Strava [activity-streams API](https://developers.strava.com/docs/reference/#api-Streams-getActivityStreams), or a GPX exported from Strava's website |
-| GPX parsing and output | Python standard library `xml.etree.ElementTree` |
-| Elevation, slope and distance calculations | NumPy |
-| Route search | A* over a raster grid, using Python `heapq` |
-| Raster reading and map export | Pillow |
+| Live | https://jaakkos.github.io/slakk/ |
+| Local | `make web-dev` → http://localhost:5173/slakk/ |
+| Build | `make web` → `web/dist/` |
 
-The CLI keeps the core dependencies to **NumPy + Pillow**. Its HTTP client is
-Python's `urllib`, and its argument parser is `argparse`. Map data is
-downloaded at run time from the providers above and is not included in this
-repository; see [Data licences](#data-licences).
+Needs [rustup](https://rustup.rs/) (not Homebrew `rust` alone), the
+`wasm32-unknown-unknown` target, [`wasm-pack`](https://rustwasm.github.io/wasm-pack/),
+and Node 20+. `make web-dev` puts `~/.cargo/bin` on `PATH` and runs
+`make wasm-tools`.
 
-## Setup
+Highlights: plan from map points or recorded GPX, corridor / climb limits /
+pitch / landforms / micro-terrain, hierarchical 10→fine refine, alternatives,
+IndexedDB DEM cache, WebGPU raster prep when available (CPU fallback), Worker
+pool planning without SharedArrayBuffer (so Kartverket tiles keep working).
+Share links carry settings + the selected line; re-plan may differ if DEM data
+changes. Strava and Garmin stay in the [legacy Python CLI](#legacy-python-cli).
+
+## Data sources
+
+| Task | Source |
+|---|---|
+| Elevations | Kartverket [DTM ImageServer](https://hoydedata.no/arcgis/rest/services/DTM/ImageServer) |
+| Steep / runout | NVE [Bratthet_med_utlop_2024](https://gis3.nve.no/arcgis/rest/services/wmts/Bratthet_med_utlop_2024/MapServer) |
+| Topo map | Kartverket [Topografisk Norgeskart WMS](https://wms.geonorge.no/skwms1/wms.topo?service=WMS&request=GetCapabilities) |
+
+Map data is fetched at run time and is not in this repository; see
+[Data licences](#data-licences).
+
+---
+
+## Legacy Python CLI
+
+The original **Python CLI** (`slakk.py` / `slakk`) remains for offline batch
+runs, Strava import, Garmin push, GeoJSON `--avoid`, HTML comparison maps, and
+standalone release binaries. Feature work focuses on the web app; treat the
+CLI as maintained but legacy.
 
 ### Download a binary
 
 Each [release](https://github.com/jaakkos/slakk/releases) has standalone
 executables that need no Python: `slakk-<version>-linux-x86_64`,
 `linux-arm64`, `macos-arm64`, `macos-x86_64` and `windows-x86_64.exe`. Each
-is about 30 MB because it bundles Python, NumPy and Pillow, and it takes
-about a second to start. Check the download against `SHA256SUMS`, or verify
-where it was built with
+is about 30 MB because it bundles Python, NumPy and Pillow. Check the download
+against `SHA256SUMS`, or verify with
 `gh attestation verify slakk-<version>-<platform> --repo jaakkos/slakk`.
 
 ```sh
@@ -53,21 +82,20 @@ chmod +x slakk-0.5.0-linux-x86_64
 ./slakk-0.5.0-linux-x86_64 --help
 ```
 
-The binaries are not signed. On macOS, remove the download quarantine with
-`xattr -d com.apple.quarantine slakk-<version>-macos-arm64`; on Windows,
-SmartScreen asks you to confirm the first run.
+The binaries are not signed. On macOS:
+`xattr -d com.apple.quarantine slakk-<version>-macos-arm64`.
 
 ### Install from source
 
-Use Python 3.11 or later. In this directory, either:
+Python 3.11+. Core deps are **NumPy + Pillow** (locked in `requirements.lock`).
 
 ```sh
-make install                 # creates .venv, installs locked deps, editable slakk
-# make install-garmin        # also installs the optional Garmin upload extra
-.venv/bin/slakk --help       # or: source .venv/bin/activate  then  slakk --help
+make install                 # .venv + locked deps + editable install
+# make install-garmin        # + optional Garmin upload extra
+.venv/bin/slakk --help
 ```
 
-or by hand:
+Or by hand:
 
 ```sh
 python3 -m venv .venv
@@ -77,46 +105,17 @@ python -m pip install --no-deps -e .
 slakk --help
 ```
 
-### Web app (GitHub Pages)
-
-A desktop browser planner lives in [`web/`](web/): click start/vias/end on the
-map, download Kartverket DEM + NVE hazards in the browser, and run the A*
-search in **Rust compiled to WebAssembly**. No server. Strava/Garmin stay in
-the CLI.
-
-- Live site (after Pages is enabled on `main`):
-  https://jaakkos.github.io/slakk/
-- Local: `make web-dev` then open http://localhost:5173/slakk/
-  (needs [rustup](https://rustup.rs/) — not Homebrew `rust` alone —
-  [`wasm-pack`](https://rustwasm.github.io/wasm-pack/), and Node 20+.
-  `make web-dev` puts `~/.cargo/bin` first and runs `make wasm-tools`.)
-- Production build: `make web` → `web/dist/`
-
-Use a recent **Chrome or Edge** (Firefox usually works). Phone is unsupported.
-
-Web vs CLI: plan-from-points and recorded-GPX upload with pitch, landforms,
-alternatives, keep-first, hierarchical 10→fine refine, and IndexedDB DEM
-cache. Raster prep uses **WebGPU** when available (CPU fallback); planning
-runs on a **Worker pool** without SharedArrayBuffer so Kartverket tiles keep
-working (no COEP). Strava/Garmin remain CLI-only. True Wasm threads stay
-deferred unless we add an isolated compute iframe later.
-
-`requirements.lock` pins the exact NumPy and Pillow versions, with hashes, for
-every platform. `pyproject.toml` holds the allowed version ranges. After changing
-those ranges, regenerate the lock with
-[uv](https://docs.astral.sh/uv/) and commit both files:
+After changing allowed ranges in `pyproject.toml`, regenerate the lock:
 
 ```sh
 uv pip compile pyproject.toml --universal --python-version 3.11 --generate-hashes -o requirements.lock
 ```
 
-`slakk` and `python slakk.py` are the same program; examples below use
-the command. `slakk optimize --help` lists every option with its default.
+`slakk` and `python slakk.py` are the same program. `slakk optimize --help`
+lists every option. Private tracks and terrain caches stay out of git
+(`.gitignore`).
 
-The `.gitignore` excludes `temp/`, terrain caches and virtual environments, so
-private tracks and downloaded map data stay out of version control.
-
-## Start with a GPX
+### Start with a GPX
 
 ```sh
 slakk optimize walk.gpx \
@@ -665,16 +664,21 @@ uses 8 bytes × 16 directions per unblocked cell, about 95 MB on that track.
 ## Checks
 
 ```sh
+# Legacy Python CLI
 python -m unittest -v test_slakk.py
 python scripts/smoke_test.py         # end-to-end run on synthetic terrain
 ruff check .
+
+# Web / Wasm (local)
+make web                             # Wasm + static site → web/dist/
 ```
 
-[CI](.github/workflows/ci.yml) runs the tests and the smoke test on Linux,
-macOS and Windows with Python 3.11 to 3.14. A
+[CI](.github/workflows/ci.yml) runs the Python tests and smoke test on Linux,
+macOS and Windows with Python 3.11 to 3.14. [Pages](.github/workflows/pages.yml)
+builds the Wasm site on every `main` push. A
 [weekly job](.github/workflows/dependencies.yml) checks the locked
 dependencies for known vulnerabilities with pip-audit and checks that the
-locks still match `pyproject.toml`. None of the checks use the network for
+locks still match `pyproject.toml`. None of the Python checks use the network for
 terrain data or need a real track. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 The tests exercise exact endpoints, steep barriers, non-jumpable elevation

@@ -699,7 +699,6 @@ def landform_cost(terrain, args):
     """Added per-metre cost by destination cell: gullies cost --gully-cost more, and everything that is
     not a ridge costs --ridge-cost more. Never negative, so it only adds cost and never relaxes a limit.
     Also adds --roughness-cost where local DEM stddev exceeds --roughness-threshold-m (micro-terrain)."""
-    n = terrain.z.size
     cost = np.zeros(terrain.z.shape, float)
     if args.landforms != 'off':
         land = landforms(terrain)
